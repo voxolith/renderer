@@ -48,3 +48,69 @@ export function makeRay(
   ];
   return { origin: [...frame.camPos] as Vec3, dir };
 }
+
+export interface VoxelHit {
+  /** Distance along `dir` (in units of |dir|) to the hit face. */
+  t: number;
+  /** The solid cell that was hit. */
+  cell: Vec3;
+  /** Outward face normal of the hit (axis-aligned unit vector). */
+  normal: Vec3;
+}
+
+/**
+ * CPU voxel raycast (Amanatides-Woo DDA), the same walk `shaders/trace.wesl`
+ * does on the GPU minus the coarse skip. `dir` need not be normalised; `t` is
+ * in units of `dir` (so `origin + dir * t` is the hit point). Cells count as
+ * solid when `data[i] !== 0` unless a `solid` predicate is given. Returns null
+ * when nothing is hit within `maxT`.
+ */
+export function voxelRaycast(
+  size: { x: number; y: number; z: number },
+  data: Uint8Array,
+  origin: Vec3,
+  dir: Vec3,
+  maxT: number,
+  solid: (value: number, x: number, y: number, z: number) => boolean = (v) => v !== 0,
+): VoxelHit | null {
+  const { x: sx, y: sy, z: sz } = size;
+  // Enter the grid first if we start outside it.
+  let t = 0;
+  const inside =
+    origin[0] >= 0 && origin[0] < sx && origin[1] >= 0 && origin[1] < sy && origin[2] >= 0 && origin[2] < sz;
+  if (!inside) {
+    const tEnter = rayAABB(origin, dir, [0, 0, 0], [sx, sy, sz]);
+    if (tEnter === null || tEnter > maxT) return null;
+    t = tEnter + 1e-6;
+  }
+  const px = origin[0] + dir[0] * t, py = origin[1] + dir[1] * t, pz = origin[2] + dir[2] * t;
+  let cx = Math.floor(px), cy = Math.floor(py), cz = Math.floor(pz);
+  const stepX = dir[0] > 0 ? 1 : dir[0] < 0 ? -1 : 0;
+  const stepY = dir[1] > 0 ? 1 : dir[1] < 0 ? -1 : 0;
+  const stepZ = dir[2] > 0 ? 1 : dir[2] < 0 ? -1 : 0;
+  const ddx = stepX ? Math.abs(1 / dir[0]) : Infinity;
+  const ddy = stepY ? Math.abs(1 / dir[1]) : Infinity;
+  const ddz = stepZ ? Math.abs(1 / dir[2]) : Infinity;
+  let tx = stepX ? t + ((stepX > 0 ? cx + 1 - px : px - cx) * ddx) : Infinity;
+  let ty = stepY ? t + ((stepY > 0 ? cy + 1 - py : py - cy) * ddy) : Infinity;
+  let tz = stepZ ? t + ((stepZ > 0 ? cz + 1 - pz : pz - cz) * ddz) : Infinity;
+  let nx = 0, ny = 0, nz = 0;
+  // Safety cap: no ray crosses more cells than the grid's Manhattan extent.
+  const cap = sx + sy + sz + 3;
+  for (let i = 0; i < cap; i++) {
+    if (cx < 0 || cy < 0 || cz < 0 || cx >= sx || cy >= sy || cz >= sz) return null;
+    const v = data[cx + cy * sx + cz * sx * sy];
+    if (v !== 0 && solid(v, cx, cy, cz)) {
+      return { t, cell: [cx, cy, cz], normal: [nx, ny, nz] };
+    }
+    if (tx <= ty && tx <= tz) {
+      t = tx; tx += ddx; cx += stepX; nx = -stepX; ny = 0; nz = 0;
+    } else if (ty <= tz) {
+      t = ty; ty += ddy; cy += stepY; nx = 0; ny = -stepY; nz = 0;
+    } else {
+      t = tz; tz += ddz; cz += stepZ; nx = 0; ny = 0; nz = -stepZ;
+    }
+    if (t > maxT) return null;
+  }
+  return null;
+}

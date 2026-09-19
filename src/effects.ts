@@ -6,6 +6,8 @@
 // fire dome sitting on the floor with debris streaks thrown up-and-out) and
 // `makeMuzzleFlash` (3 types — a brief directional gun flash that loops with a gap).
 
+import { seededRandom } from "./random";
+
 export type Vec3 = [number, number, number];
 
 export interface VoxEffect {
@@ -73,15 +75,7 @@ function vnoise(x: number, y: number, z: number, s: number): number {
 function fbm2(x: number, y: number, z: number): number {
   return (vnoise(x, y, z, 7) * 0.65 + vnoise(x * 2.1, y * 2.1, z * 2.1, 19) * 0.35);
 }
-function rng(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+const rng = seededRandom;
 
 const tempSlot = (h: number, n: number): number => {
   if (h > 0.72) return CORE;

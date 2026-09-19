@@ -98,10 +98,10 @@ Grouped as in `src/index.ts`:
 - **Frame loop**: `makeFrameLoop` (render on demand), `observeResize`
 - **Formats**: `parseVox`, `writeVox`, `parseVoxScene`, `decodeVoxRotation`, `voxSceneAnimator`,
   `packMaterials`, `buildMinecraftRegion`
-- **Acceleration**: `OccupancyGrid`, `COARSE_B`, `GridStamper`
+- **Acceleration**: `OccupancyGrid`, `COARSE_B`, `GridStamper` (`stamp` for movers, `writeBase` for permanent edits such as carving or rubble)
 - **Cameras and input**: `makeCamera`, `firstPersonFrame`, `chaseFrame`, `makeOrbitControl`, `makePanControl`
 - **Effects**: `makeExplosion`, `makeMuzzleFlash`
-- **Utilities**: `rayAABB`, `makeRay`, `makePerf` (adaptive render scale + overlay)
+- **Utilities**: `rayAABB`, `makeRay`, `voxelRaycast` (CPU DDA for hit tests), `seededRandom` / `hashSeed`, `makePerf` (adaptive render scale + overlay)
 
 `COARSE_B` is duplicated as a WGSL constant in `src/shaders/raymarch.wesl`. Keep them in sync.
 

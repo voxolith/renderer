@@ -38,6 +38,37 @@ export class GridStamper {
     this.prev = null;
   }
 
+  /** Read the base plate (static geometry) at a cell; 0 outside the grid. */
+  baseAt(x: number, y: number, z: number): number {
+    if (x < 0 || x >= this.sx || y < 0 || y >= this.sy || z < 0 || z >= this.sz) return 0;
+    return this.baseData[x + y * this.sx + z * this.sx * this.sy];
+  }
+
+  /**
+   * Permanently edit the base plate (carve with c = 0, or add rubble) and mirror
+   * it into liveData, without the O(grid) copy of setBase(). Cells inside the
+   * current stamp region are re-covered by the next stamp() anyway. Returns the
+   * box to upload, or null if nothing was in range.
+   */
+  writeBase(voxels: StampVoxel[]): DirtyBox | null {
+    let x0 = Infinity, y0 = Infinity, z0 = Infinity;
+    let x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+    for (const v of voxels) {
+      if (v.x < 0 || v.x >= this.sx || v.y < 0 || v.y >= this.sy || v.z < 0 || v.z >= this.sz)
+        continue;
+      const i = v.x + v.y * this.sx + v.z * this.sx * this.sy;
+      this.baseData[i] = v.c;
+      this.liveData[i] = v.c;
+      if (v.x < x0) x0 = v.x;
+      if (v.x > x1) x1 = v.x;
+      if (v.y < y0) y0 = v.y;
+      if (v.y > y1) y1 = v.y;
+      if (v.z < z0) z0 = v.z;
+      if (v.z > z1) z1 = v.z;
+    }
+    return x1 >= x0 ? { x0, y0, z0, x1, y1, z1 } : null;
+  }
+
   /** Restore the last stamped region from the base and forget it. */
   clear(): DirtyBox | null {
     if (!this.prev) return null;
