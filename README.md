@@ -1,4 +1,4 @@
-# @voxolith/render
+# @voxolith/renderer
 
 A WebGPU voxel raymarching engine for the browser. Formerly `voxray`, the engine behind
 [Catagochi](https://github.com/voxolith/games).
@@ -19,7 +19,7 @@ message when WebGPU is missing.
 ## Install
 
 ```sh
-bun add @voxolith/render
+bun add @voxolith/renderer
 ```
 
 The package ships raw TypeScript. Your bundler compiles it together with your app, so you need:
@@ -27,16 +27,16 @@ The package ships raw TypeScript. Your bundler compiles it together with your ap
 - Vite (or another bundler that understands `import x from "./file.wesl?raw"`)
 - `typescript`, `@webgpu/types` and `vite` as dev dependencies, with
   `"types": ["@webgpu/types", "vite/client"]` in your `tsconfig.json`
-- In `vite.config.ts`: `optimizeDeps: { exclude: ["@voxolith/render"] }`
+- In `vite.config.ts`: `optimizeDeps: { exclude: ["@voxolith/renderer"] }`
 
 ## Entry points
 
 | import | use from | contents |
 |---|---|---|
-| `@voxolith/render` | browser code | everything, including `initGpu`, `createRenderer` |
-| `@voxolith/render/core` | Node/bun tools | everything that does not touch the GPU |
-| `@voxolith/render/vox` | Node/bun tools | `.vox` parse/write only |
-| `@voxolith/render/ray` | Node/bun tools | ray/AABB helpers only |
+| `@voxolith/renderer` | browser code | everything, including `initGpu`, `createRenderer` |
+| `@voxolith/renderer/core` | Node/bun tools | everything that does not touch the GPU |
+| `@voxolith/renderer/vox` | Node/bun tools | `.vox` parse/write only |
+| `@voxolith/renderer/ray` | Node/bun tools | ray/AABB helpers only |
 
 Never import the main barrel from a script that runs outside a bundler: it pulls in the
 renderer, whose `?raw` shader imports only Vite can resolve.
@@ -47,7 +47,7 @@ renderer, whose `?raw` shader imports only Vite can resolve.
 import {
   initGpu, resizeToDisplay, showUnsupportedScreen, WebGPUUnsupportedError,
   createRenderer, OccupancyGrid, makeCamera, parseVox,
-} from "@voxolith/render";
+} from "@voxolith/renderer";
 
 const canvas = document.querySelector("canvas")!;
 let gpu;
@@ -106,7 +106,7 @@ bun run typecheck
 
 For local development against the viewer, editor, examples and games, clone the sibling repos
 next to this one and use a bun workspace root that lists them; consumers then resolve
-`@voxolith/render` through a symlink to this checkout.
+`@voxolith/renderer` through a symlink to this checkout.
 
 ## Releasing
 

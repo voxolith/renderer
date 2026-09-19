@@ -1,6 +1,6 @@
 name: Publish to npm
 
-# Publishes @voxolith/render when a version tag (v1.2.3) is pushed. The tag must
+# Publishes @voxolith/renderer when a version tag (v1.2.3) is pushed. The tag must
 # match package.json "version". Needs the NPM_TOKEN repository secret (an npm
 # automation token with publish rights on the @voxolith scope).
 

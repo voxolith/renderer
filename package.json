@@ -1,5 +1,5 @@
 {
-  "name": "@voxolith/render",
+  "name": "@voxolith/renderer",
   "version": "0.1.0",
   "description": "A WebGPU voxel raymarching engine: DDA raymarch + coarse occupancy, soft shadows, AO, materials, .vox and Minecraft .mca I/O, cameras and effects",
   "license": "MIT",
@@ -7,10 +7,10 @@
   "sideEffects": false,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/voxolith/render.git"
+    "url": "git+https://github.com/voxolith/renderer.git"
   },
-  "homepage": "https://github.com/voxolith/render#readme",
-  "bugs": "https://github.com/voxolith/render/issues",
+  "homepage": "https://github.com/voxolith/renderer#readme",
+  "bugs": "https://github.com/voxolith/renderer/issues",
   "keywords": ["webgpu", "voxel", "raymarching", "wgsl", "magicavoxel", "vox", "minecraft"],
   "files": ["src", "README.md", "LICENSE"],
   "exports": {

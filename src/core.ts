@@ -1,9 +1,9 @@
-// @voxolith/render — headless core. Everything that does not touch the GPU.
+// @voxolith/renderer — headless core. Everything that does not touch the GPU.
 //
 // Node/bun tools (generators, offline verifiers, CPU renderers) import from
-// "@voxolith/render/core" so they never pull in renderer.ts, whose `?raw`
+// "@voxolith/renderer/core" so they never pull in renderer.ts, whose `?raw`
 // shader imports only a bundler (Vite) can resolve. Browser code imports the
-// full barrel from "@voxolith/render" instead.
+// full barrel from "@voxolith/renderer" instead.
 
 export { parseVox, writeVox, parseVoxScene, decodeVoxRotation } from "./vox";
 export type { Voxel, VoxModel, VoxScene, VoxMaterial, Placement, Mat3 } from "./vox";
