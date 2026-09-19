@@ -122,8 +122,10 @@ Everything below is a runtime knob; nothing needs a rebuild.
   changes, and `loop.setContinuous(true)` only while something animates.
 - **Adapter check**: `gpu.adapterInfo` is what the browser reported and `gpu.software` is true for
   CPU implementations (SwiftShader, llvmpipe, lavapipe, fallback adapters). `initGpu` logs the
-  adapter to the console. If a capable GPU shows as software, the browser is not using it: on
-  Linux Chrome check `chrome://gpu` under WebGPU and enable Vulkan (`chrome://flags/#enable-vulkan`).
+  adapter to the console. If a capable GPU shows as software, the browser is not using it.
+- **Slow on Linux Chrome despite a hardware adapter**: when `chrome://gpu` reports
+  `Disabled Features: webgpu_on_vk_via_gl_interop`, the compositor runs on OpenGL and each WebGPU
+  frame is copied through the CPU. Enabling `chrome://flags/#enable-vulkan` fixes it.
 
 ```ts
 const gpu = await initGpu(canvas, { maxPixelRatio: gpu.software ? 1 : 2 });
