@@ -85,7 +85,7 @@ See [voxolith/examples](https://github.com/voxolith/examples) for complete, runn
 
 Grouped as in `src/index.ts`:
 
-- **Device**: `initGpu`, `resizeToDisplay`, `showUnsupportedScreen`, `WebGPUUnsupportedError`, `GpuContext`
+- **Device**: `initGpu`, `resizeToDisplay`, `showUnsupportedScreen` (options `appName`, `emoji`, `iconHtml`), `WebGPUUnsupportedError`, `GpuContext`
 - **Renderer**: `createRenderer`, `Renderer` (`render`, `updateVoxels`, `updateCoarse`, `setFloor`,
   `setClipBounds`, `setDebug`), `RenderScene`, `FrameParams`, `FloorParams`, `DirtyBox`, `raymarchShaderCode`
 - **Formats**: `parseVox`, `writeVox`, `parseVoxScene`, `decodeVoxRotation`, `voxSceneAnimator`,

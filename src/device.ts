@@ -102,8 +102,10 @@ export function resizeToDisplay(gpu: GpuContext): boolean {
 export interface UnsupportedOpts {
   /** App name shown in the card (default "This app"). */
   appName?: string;
-  /** Emoji shown at the top of the card (default "🧊"). */
+  /** Emoji shown at the top of the card (default "🧊"). Ignored when iconHtml is set. */
   emoji?: string;
+  /** Inline HTML (typically an <svg> or <img>) shown instead of the emoji. */
+  iconHtml?: string;
 }
 
 /**
@@ -112,13 +114,16 @@ export interface UnsupportedOpts {
  * class names; the consuming app styles them.
  */
 export function showUnsupportedScreen(message: string, opts: UnsupportedOpts = {}): void {
-  const { appName = "This app", emoji = "🧊" } = opts;
+  const { appName = "This app", emoji = "🧊", iconHtml } = opts;
   const app = document.getElementById("app");
   if (!app) return;
+  const icon = iconHtml
+    ? `<div class="unsupported-icon">${iconHtml}</div>`
+    : `<div class="unsupported-emoji">${emoji}</div>`;
   app.innerHTML = `
     <div class="unsupported">
       <div class="unsupported-card">
-        <div class="unsupported-emoji">${emoji}</div>
+        ${icon}
         <h1>Almost there!</h1>
         <p>${appName} needs <strong>WebGPU</strong> to run.</p>
         <p class="unsupported-hint">Try the latest Chrome, Edge, Firefox, or
