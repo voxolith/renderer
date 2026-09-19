@@ -79,11 +79,14 @@ fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
   // Soft shadow ray from just outside the hit face toward the light.
   let hitCenter = vec3<f32>(h.cell) + vec3<f32>(0.5) + n * 0.5;
   var shadow = 1.0;
-  if (ndl > 0.0 && inShadow(hitCenter, L)) {
+  if (U.shadowSteps > 0.5 && ndl > 0.0 && inShadow(hitCenter, L)) {
     shadow = 0.6;
   }
 
-  let ao = faceAO(h.cell, n);
+  var ao = 1.0;
+  if (U.aoEnabled > 0.5) {
+    ao = faceAO(h.cell, n);
+  }
 
   // Hemispheric ambient (sky above, ground bounce below) — time-of-day tinted
   // via uniforms so the scene shifts warm/day → cool/night.

@@ -27,7 +27,7 @@ export { makePanControl } from "./panControl";
 export type { PanControl, PanOptions } from "./panControl";
 
 export { makePerf } from "./perf";
-export type { Perf } from "./perf";
+export type { Perf, PerfOptions } from "./perf";
 
 export { rayAABB, makeRay } from "./ray";
 export type { Vec3 } from "./ray";

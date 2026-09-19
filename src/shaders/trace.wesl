@@ -13,9 +13,10 @@ struct Hit {
   mat    : u32,
 };
 
-// High enough to cross large grids (e.g. a ~360³ scene-graph mansion). With coarse
-// empty-space skipping on, typical rays use far fewer; the cap is only a backstop.
-const MAX_STEPS : i32 = 768;
+// Hard ceiling for the primary-ray DDA. The effective cap is U.maxSteps (set via
+// Renderer.setQuality), clamped to this; with coarse empty-space skipping on,
+// typical rays use far fewer steps and the cap is only a backstop.
+const MAX_STEPS : i32 = 1024;
 
 fn traverse(ro : vec3<f32>, rd : vec3<f32>, tStart : f32) -> Hit {
   var h : Hit;
@@ -29,7 +30,8 @@ fn traverse(ro : vec3<f32>, rd : vec3<f32>, tStart : f32) -> Hit {
   var sideDist = (sign(rd) * (vec3<f32>(cell) - p) + sign(rd) * 0.5 + 0.5) * deltaDist;
   var normal = vec3<f32>(0.0);
 
-  for (var i = 0; i < MAX_STEPS; i = i + 1) {
+  let steps = min(i32(U.maxSteps), MAX_STEPS);
+  for (var i = 0; i < steps; i = i + 1) {
     if (any(cell < vec3<i32>(-1)) || any(cell > vec3<i32>(U.gridSize))) {
       break;
     }

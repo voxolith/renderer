@@ -13,6 +13,32 @@ export interface GpuContext {
   pixelRatio: number;
   /** Quality scale on top of DPR (lowers the raymarch resolution). Adaptive. */
   renderScale: number;
+  /** What the browser reported for the adapter (fields may be empty strings). */
+  adapterInfo: AdapterInfo;
+  /**
+   * True when the adapter looks like a CPU implementation (SwiftShader, llvmpipe,
+   * lavapipe, or a browser "fallback" adapter). Expect single-digit fps.
+   */
+  software: boolean;
+}
+
+export interface AdapterInfo {
+  vendor: string;
+  architecture: string;
+  device: string;
+  description: string;
+  isFallbackAdapter: boolean;
+}
+
+export interface GpuOptions {
+  /** Cap on window.devicePixelRatio (default 2). Use 1 on weak GPUs. */
+  maxPixelRatio?: number;
+  /** Initial render scale on top of DPR (default 0.8). */
+  renderScale?: number;
+  /** Passed to requestAdapter (default "high-performance"). */
+  powerPreference?: GPUPowerPreference;
+  /** Log the chosen adapter to the console (default true). */
+  log?: boolean;
 }
 
 export class WebGPUUnsupportedError extends Error {
@@ -25,7 +51,7 @@ export class WebGPUUnsupportedError extends Error {
 /** Cap the internal resolution so phones don't render at 3x retina for free. */
 const MAX_PIXEL_RATIO = 2;
 
-export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
+export async function initGpu(canvas: HTMLCanvasElement, opts: GpuOptions = {}): Promise<GpuContext> {
   if (!("gpu" in navigator) || !navigator.gpu) {
     // WebGPU is only exposed in a secure context. Over plain http on a LAN IP
     // (e.g. a phone hitting the dev server) `navigator.gpu` is hidden even though
@@ -41,7 +67,7 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
   }
 
   const adapter = await navigator.gpu.requestAdapter({
-    powerPreference: "high-performance",
+    powerPreference: opts.powerPreference ?? "high-performance",
   });
   if (!adapter) {
     throw new WebGPUUnsupportedError("No suitable GPU adapter was found.");
@@ -59,7 +85,15 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
   }
 
   const format = navigator.gpu.getPreferredCanvasFormat();
-  const pixelRatio = Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
+  const pixelRatio = Math.min(window.devicePixelRatio || 1, opts.maxPixelRatio ?? MAX_PIXEL_RATIO);
+  const adapterInfo = readAdapterInfo(adapter);
+  const software = looksSoftware(adapterInfo);
+  if (opts.log !== false) {
+    const d = [adapterInfo.vendor, adapterInfo.architecture, adapterInfo.device, adapterInfo.description]
+      .filter(Boolean)
+      .join(" · ");
+    console.info(`[voxolith] WebGPU adapter: ${d || "unknown"}${software ? " (SOFTWARE — expect low fps)" : ""}`);
+  }
 
   context.configure({
     device,
@@ -75,11 +109,37 @@ export async function initGpu(canvas: HTMLCanvasElement): Promise<GpuContext> {
     width: 1,
     height: 1,
     pixelRatio,
-    renderScale: 0.8, // Balanced default; adaptively tuned in [0.6, 1.0].
+    renderScale: opts.renderScale ?? 0.8, // Balanced default; consumers tune it via makePerf/setRenderScale.
+    adapterInfo,
+    software,
   };
 
   resizeToDisplay(gpu);
   return gpu;
+}
+
+function readAdapterInfo(adapter: GPUAdapter): AdapterInfo {
+  // `info` is the standard; older Chromes only had the deprecated isFallbackAdapter.
+  const info = (adapter as { info?: Partial<AdapterInfo> }).info ?? {};
+  const legacyFallback = (adapter as { isFallbackAdapter?: boolean }).isFallbackAdapter ?? false;
+  return {
+    vendor: info.vendor ?? "",
+    architecture: info.architecture ?? "",
+    device: info.device ?? "",
+    description: info.description ?? "",
+    isFallbackAdapter: info.isFallbackAdapter ?? legacyFallback,
+  };
+}
+
+function looksSoftware(i: AdapterInfo): boolean {
+  if (i.isFallbackAdapter) return true;
+  const s = `${i.vendor} ${i.architecture} ${i.device} ${i.description}`.toLowerCase();
+  return /swiftshader|llvmpipe|lavapipe|softpipe|software|cpu/.test(s);
+}
+
+/** Set the render scale (0.1..1). Call resizeToDisplay afterwards, or let the frame loop do it. */
+export function setRenderScale(gpu: GpuContext, scale: number): void {
+  gpu.renderScale = Math.max(0.1, Math.min(1, scale));
 }
 
 /**

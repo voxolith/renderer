@@ -102,6 +102,25 @@ export interface FrameParams {
 }
 
 /** Optional infinite ground-plane drawn on ray-miss below `y` (off by default). */
+/** Per-frame cost knobs. All are runtime uniforms; changing them is free. */
+export interface RenderQuality {
+  /** Primary-ray DDA step cap (16..1024). Lower is cheaper; too low clips far geometry. */
+  maxSteps: number;
+  /** Shadow-ray step cap (0..128). 0 disables shadows entirely. */
+  shadowSteps: number;
+  /** Face ambient occlusion (8 neighbour lookups per hit). */
+  ao: boolean;
+}
+
+export type QualityPreset = "low" | "medium" | "high";
+
+/** Presets consumers can offer in a UI; `high` matches the engine's original look. */
+export const QUALITY_PRESETS: Record<QualityPreset, RenderQuality> = {
+  low: { maxSteps: 256, shadowSteps: 0, ao: false },
+  medium: { maxSteps: 512, shadowSteps: 48, ao: true },
+  high: { maxSteps: 768, shadowSteps: 90, ao: true },
+};
+
 export interface FloorParams {
   enabled: boolean;
   y: number;
@@ -134,6 +153,7 @@ export class Renderer {
     colorB: [0, 0, 0],
   };
   private debugMode = 0;
+  private quality: RenderQuality = { ...QUALITY_PRESETS.high };
 
   constructor(gpu: GpuContext, scene: RenderScene, shaderCode: string) {
     this.gpu = gpu;
@@ -279,6 +299,20 @@ export class Renderer {
   }
 
   /** 1 = force single-step DDA (ignore coarse skip) — for the ?diff exactness check. */
+  /** Set per-frame cost knobs (partial updates allowed). Takes effect next frame. */
+  setQuality(q: Partial<RenderQuality> | QualityPreset): void {
+    const src = typeof q === "string" ? QUALITY_PRESETS[q] : q;
+    this.quality = {
+      maxSteps: Math.max(16, Math.min(1024, Math.round(src.maxSteps ?? this.quality.maxSteps))),
+      shadowSteps: Math.max(0, Math.min(128, Math.round(src.shadowSteps ?? this.quality.shadowSteps))),
+      ao: src.ao ?? this.quality.ao,
+    };
+  }
+
+  getQuality(): RenderQuality {
+    return { ...this.quality };
+  }
+
   setDebug(v: number): void {
     this.debugMode = v;
   }
@@ -384,6 +418,9 @@ export class Renderer {
     w3(76, this.occMin); w3(80, this.occMax);
     w3(84, this.coarseDim);
     u[88] = this.debugMode;
+    u[89] = this.quality.maxSteps;
+    u[90] = this.quality.shadowSteps;
+    u[91] = this.quality.ao ? 1 : 0;
     // Optional ground-plane floor (92..103).
     u[92] = this.floor.enabled ? 1 : 0;
     u[93] = this.floor.y;

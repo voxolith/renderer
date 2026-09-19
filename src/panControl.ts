@@ -24,6 +24,8 @@ export interface PanOptions {
   panSpeed?: number;
   /** Clamp the target to these XZ bounds (optional). */
   bounds?: { minX: number; maxX: number; minZ: number; maxZ: number };
+  /** Called whenever target or distance changes (render-on-demand hook). */
+  onChange?: () => void;
 }
 
 export function makePanControl(el: HTMLElement, opts: PanOptions): PanControl {
@@ -62,6 +64,7 @@ export function makePanControl(el: HTMLElement, opts: PanOptions): PanControl {
     tx -= dx * panSpeed * (dist / opts.distance);
     tz -= dy * panSpeed * (dist / opts.distance);
     clampTarget();
+    opts.onChange?.();
   });
   const end = () => {
     dragging = false;
@@ -77,6 +80,7 @@ export function makePanControl(el: HTMLElement, opts: PanOptions): PanControl {
         opts.minDistance,
         Math.min(opts.maxDistance, dist * (1 + Math.sign(e.deltaY) * 0.1)),
       );
+      opts.onChange?.();
     },
     { passive: false },
   );

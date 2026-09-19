@@ -4,7 +4,8 @@
 import package::uniforms::U;
 import package::grid::{isSolid, coarseSolid, COARSE_B};
 
-const SHADOW_STEPS : i32 = 90;
+// Hard ceiling; the effective cap is U.shadowSteps (0 disables shadows upstream).
+const SHADOW_STEPS : i32 = 128;
 
 fn inShadow(origin : vec3<f32>, rd : vec3<f32>) -> bool {
   var cell = vec3<i32>(floor(origin));
@@ -12,7 +13,8 @@ fn inShadow(origin : vec3<f32>, rd : vec3<f32>) -> bool {
   let deltaDist = abs(1.0 / rd);
   var sideDist = (sign(rd) * (vec3<f32>(cell) - origin) + sign(rd) * 0.5 + 0.5) * deltaDist;
 
-  for (var i = 0; i < SHADOW_STEPS; i = i + 1) {
+  let steps = min(i32(U.shadowSteps), SHADOW_STEPS);
+  for (var i = 0; i < steps; i = i + 1) {
     if (any(cell < vec3<i32>(0)) || any(cell >= vec3<i32>(U.gridSize))) {
       return false;
     }

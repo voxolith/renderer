@@ -9,18 +9,25 @@
 export {
   initGpu,
   resizeToDisplay,
+  setRenderScale,
   showUnsupportedScreen,
   WebGPUUnsupportedError,
 } from "./device";
-export type { GpuContext, UnsupportedOpts } from "./device";
+export type { GpuContext, GpuOptions, AdapterInfo, UnsupportedOpts } from "./device";
 
-export { Renderer, createRenderer, raymarchShaderCode } from "./renderer";
+export { Renderer, createRenderer, raymarchShaderCode, QUALITY_PRESETS } from "./renderer";
 export type {
   RenderScene,
   DirtyBox,
   RenderTarget,
   FrameParams,
   FloorParams,
+  RenderQuality,
+  QualityPreset,
 } from "./renderer";
+
+// Render-on-demand loop (browser only; not part of ./core).
+export { makeFrameLoop, observeResize } from "./frameLoop";
+export type { FrameLoop, FrameLoopOptions } from "./frameLoop";
 
 export * from "./core";

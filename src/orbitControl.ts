@@ -10,7 +10,7 @@ export interface OrbitControl {
 
 export function makeOrbitControl(
   el: HTMLElement,
-  opts: { start: number; min: number; max: number; sensitivity?: number },
+  opts: { start: number; min: number; max: number; sensitivity?: number; onChange?: () => void },
 ): OrbitControl {
   const sensitivity = opts.sensitivity ?? 0.35; // degrees per pixel
   let yaw = opts.start;
@@ -31,7 +31,11 @@ export function makeOrbitControl(
     const dx = e.clientX - lastX;
     lastX = e.clientX;
     // Drag right → scene rotates so we look further left (yaw decreases).
-    yaw = clamp(yaw - dx * sensitivity);
+    const next = clamp(yaw - dx * sensitivity);
+    if (next !== yaw) {
+      yaw = next;
+      opts.onChange?.();
+    }
   });
   const end = () => {
     dragging = false;

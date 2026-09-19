@@ -40,9 +40,9 @@ struct Uniforms {
   occMax       : vec3<f32>, _o1 : f32,  // 80-83
   coarseDim    : vec3<f32>, _o2 : f32,  // 84-87  coarse occupancy grid dims
   debug        : f32,                   // 88     1 = force single-step DDA (no skip)
-  _o3          : f32,                   // 89
-  _o4          : f32,                   // 90
-  _o5          : f32,                   // 91
+  maxSteps     : f32,                   // 89     primary-ray DDA step cap (quality)
+  shadowSteps  : f32,                   // 90     shadow-ray step cap; 0 = shadows off
+  aoEnabled    : f32,                   // 91     1 = face ambient occlusion
   // --- optional ground-plane floor ---
   floorParams  : vec2<f32>,             // 92,93  x = enabled (0/1), y = floor Y
   _f0          : vec2<f32>,             // 94,95  pad
