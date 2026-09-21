@@ -40,7 +40,12 @@ export function makeFrameLoop(opts: FrameLoopOptions): FrameLoop {
   function tick(now: number) {
     handle = 0;
     if (cont) schedule();
-    if (cont && now - last < minDt) return; // wait for the next slot
+    // The fps cap only throttles the *animation*; a pending invalidate (and the
+    // initial dirty flag) always gets its frame. Without that exception a
+    // continuous loop can stall forever: `last` is seeded from performance.now()
+    // while `now` is the rAF frame timestamp, which may already be in the past,
+    // and a tick that returns here never updates `last` to resynchronise them.
+    if (!dirty && cont && now - last < minDt) return; // wait for the next slot
     if (!cont && !dirty) return;
     const dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
     last = now;
