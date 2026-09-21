@@ -13,6 +13,9 @@ import backgroundWesl from "./shaders/background.wesl?raw";
 import materialsWesl from "./shaders/materials.wesl?raw";
 import raymarchWesl from "./shaders/raymarch.wesl?raw";
 import type { GpuContext } from "./device";
+import type { DirtyBox } from "./box";
+
+export type { DirtyBox };
 import { COARSE_B } from "./occupancy";
 
 // WESL modules of the raymarch pass, linked once into the final WGSL. Keys are
@@ -56,16 +59,6 @@ export interface RenderScene {
   palette: Float32Array;
   /** Optional per-slot materials (256×8 f32); enables material shading. */
   materials?: Float32Array;
-}
-
-/** Inclusive voxel-space bounding box for a partial grid update. */
-export interface DirtyBox {
-  x0: number;
-  y0: number;
-  z0: number;
-  x1: number;
-  y1: number;
-  z1: number;
 }
 
 /** Optional offscreen render destination (defaults to the canvas swapchain). */

@@ -4,7 +4,7 @@
 // returns the union dirty box (old ∪ new) for a partial re-upload. Batch all
 // moving objects (e.g. RTS units) into one stamp() call per frame.
 
-import type { DirtyBox } from "./renderer";
+import type { DirtyBox } from "./box";
 
 export interface StampVoxel {
   x: number;

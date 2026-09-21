@@ -5,7 +5,7 @@
 //
 // COARSE_B is duplicated as a WGSL const in shaders/raymarch.wesl — keep them in sync.
 
-import type { DirtyBox } from "./renderer";
+import type { DirtyBox } from "./box";
 
 export const COARSE_B = 4;
 
