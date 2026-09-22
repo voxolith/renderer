@@ -11,8 +11,20 @@
   },
   "homepage": "https://github.com/voxolith/renderer#readme",
   "bugs": "https://github.com/voxolith/renderer/issues",
-  "keywords": ["webgpu", "voxel", "raymarching", "wgsl", "magicavoxel", "vox", "minecraft"],
-  "files": ["src", "README.md", "LICENSE"],
+  "keywords": [
+    "webgpu",
+    "voxel",
+    "raymarching",
+    "wgsl",
+    "magicavoxel",
+    "vox",
+    "minecraft"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
   "exports": {
     ".": "./src/index.ts",
     "./core": "./src/core.ts",
@@ -23,7 +35,8 @@
     "access": "public"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify": "bun tools/verify.ts"
   },
   "dependencies": {
     "wesl": "^0.7.31"

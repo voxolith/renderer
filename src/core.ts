@@ -16,6 +16,8 @@ export { buildMinecraftRegion } from "./formats/minecraft/scene";
 export type { MinecraftScene, MinecraftBuildOpts } from "./formats/minecraft/scene";
 
 export { OccupancyGrid, COARSE_B } from "./occupancy";
+export { BrickGrid, BRICK_B, PALETTE_ENTRIES } from "./brick";
+export type { BrickStats, BrickEdit } from "./brick";
 export type { DirtyBox } from "./box";
 
 export { makeCamera, firstPersonFrame, chaseFrame } from "./camera";
