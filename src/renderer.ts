@@ -446,6 +446,13 @@ export class Renderer {
     this.uploadSlots(edit.slots4, edit.slots8);
   }
 
+  /** Free every brick in `box` — see BrickGrid.clearBox. */
+  clear(box: DirtyBox): void {
+    const edit = this.bricks.clearBox(box);
+    this.uploadIndex(edit.index);
+    this.uploadSlots(edit.slots4, edit.slots8);
+  }
+
   // --- brick pool plumbing ---------------------------------------------------
 
   /**

@@ -198,6 +198,55 @@ export class BrickGrid {
     return edit;
   }
 
+  /**
+   * Drop every brick fully inside `box`, returning their slots to the pool.
+   * Used when a chunk leaves the resident set: its bricks are the only place
+   * its voxels existed, so freeing them frees the memory.
+   *
+   * Bricks only partly covered are edited rather than dropped, so a box that
+   * does not land on brick boundaries cannot delete a neighbour's content.
+   */
+  clearBox(box: DirtyBox): BrickEdit {
+    const [bx, by, bz] = this.dim;
+    const x0 = Math.max(0, (box.x0 / BRICK_B) | 0);
+    const y0 = Math.max(0, (box.y0 / BRICK_B) | 0);
+    const z0 = Math.max(0, (box.z0 / BRICK_B) | 0);
+    const x1 = Math.min(bx - 1, (box.x1 / BRICK_B) | 0);
+    const y1 = Math.min(by - 1, (box.y1 / BRICK_B) | 0);
+    const z1 = Math.min(bz - 1, (box.z1 / BRICK_B) | 0);
+    const edit: BrickEdit = { index: { x0, y0, z0, x1, y1, z1 }, slots4: [], slots8: [] };
+    if (x1 < x0 || y1 < y0 || z1 < z0) return edit;
+    const cells = this.scratch;
+    for (let z = z0; z <= z1; z++)
+      for (let y = y0; y <= y1; y++)
+        for (let x = x0; x <= x1; x++) {
+          const ox = x * BRICK_B, oy = y * BRICK_B, oz = z * BRICK_B;
+          const whole =
+            ox >= box.x0 && oy >= box.y0 && oz >= box.z0 &&
+            ox + BRICK_B - 1 <= box.x1 && oy + BRICK_B - 1 <= box.y1 && oz + BRICK_B - 1 <= box.z1;
+          const ii = x + y * bx + z * bx * by;
+          if (whole) {
+            this.release(this.index[ii]);
+            this.index[ii] = 0;
+            continue;
+          }
+          if (!this.index[ii]) continue;
+          this.decodeBrick(ii, cells);
+          for (let lz = 0; lz < BRICK_B; lz++)
+            for (let ly = 0; ly < BRICK_B; ly++)
+              for (let lx = 0; lx < BRICK_B; lx++) {
+                const wx = ox + lx, wy = oy + ly, wz = oz + lz;
+                if (wx < box.x0 || wx > box.x1 || wy < box.y0 || wy > box.y1 || wz < box.z0 || wz > box.z1) continue;
+                cells[lx + ly * BRICK_B + lz * BRICK_B * BRICK_B] = 0;
+              }
+          const e = this.encodeBrick(x, y, z, cells);
+          if (!e) continue;
+          const slot = (e & SLOT_MASK) - 1;
+          (e & TIER_BIT ? edit.slots8 : edit.slots4).push(slot);
+        }
+    return edit;
+  }
+
   /** Read back a voxel from the sparse form. For verification and CPU picking. */
   get(x: number, y: number, z: number): number {
     const { x: sx, y: sy, z: sz } = this.size;
