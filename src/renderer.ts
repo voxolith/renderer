@@ -57,7 +57,12 @@ const UNIFORM_FLOATS = 104;
 /** Minimal scene data the renderer needs to build/upload the voxel grid. */
 export interface RenderScene {
   size: { x: number; y: number; z: number };
-  data: Uint8Array;
+  /**
+   * Dense voxels, `x + y*sx + z*sx*sy`. Optional: omit it for an empty world
+   * and fill it through `Renderer.edit`, which is how a large scene avoids ever
+   * holding a dense copy of itself in memory.
+   */
+  data?: Uint8Array;
   palette: Float32Array;
   /** Optional per-slot materials (256×8 f32); enables material shading. */
   materials?: Float32Array;
@@ -162,7 +167,11 @@ export class Renderer {
     this.gpu = gpu;
     const { device } = gpu;
     this.gridSize = [scene.size.x, scene.size.y, scene.size.z];
-    [this.occMin, this.occMax] = occupiedBounds(scene.data, scene.size);
+    [this.occMin, this.occMax] = scene.data
+      ? occupiedBounds(scene.data, scene.size)
+      : // Nothing to scan yet; a world filled through edit() sets its own bounds
+        // via setClipBounds, and the full grid is the safe default until then.
+        [[0, 0, 0], [scene.size.x - 1, scene.size.y - 1, scene.size.z - 1]];
 
     const module = device.createShaderModule({ code: shaderCode });
 
@@ -412,6 +421,23 @@ export class Renderer {
     const edit = this.bricks.rebuildBox(data, box);
     // Growing reallocates and re-uploads everything, so there is nothing left
     // to send afterwards.
+    if (this.growPools()) {
+      this.uploadIndex();
+      return;
+    }
+    this.uploadIndex(edit.index);
+    this.uploadSlots(edit.slots4, edit.slots8);
+  }
+
+  /**
+   * Edit the world a brick at a time, with no dense array involved.
+   *
+   * `fill` gets each overlapping brick's current 512 voxels and its world
+   * origin; see BrickGrid.editBox. Touched bricks are uploaded before this
+   * returns.
+   */
+  edit(box: DirtyBox, fill: (cells: Uint8Array, ox: number, oy: number, oz: number) => boolean): void {
+    const edit = this.bricks.editBox(box, fill);
     if (this.growPools()) {
       this.uploadIndex();
       return;

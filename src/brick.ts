@@ -79,10 +79,17 @@ export class BrickGrid {
   private readonly size: { x: number; y: number; z: number };
   private slots4 = 0;
   private slots8 = 0;
+  /** Reused 512-voxel staging buffer; a brick is never big enough to justify allocating one per call. */
+  private readonly scratch = new Uint8Array(BRICK_VOXELS);
   private free4: number[] = [];
   private free8: number[] = [];
 
-  constructor(size: { x: number; y: number; z: number }, data: Uint8Array) {
+  /**
+   * Build from a dense grid, or omit `data` for an empty world that is filled
+   * through `editBox`. The second form is what lets a large scene exist without
+   * ever materialising a dense mirror of itself.
+   */
+  constructor(size: { x: number; y: number; z: number }, data?: Uint8Array) {
     this.size = size;
     this.dim = [
       Math.ceil(size.x / BRICK_B),
@@ -94,7 +101,7 @@ export class BrickGrid {
     this.voxels4 = new Uint32Array(BRICK_WORDS_4 * 64);
     this.palettes = new Uint32Array(PALETTE_WORDS * 64);
     this.voxels8 = new Uint32Array(BRICK_WORDS_8 * 4);
-    this.rebuildAll(data);
+    if (data) this.rebuildAll(data);
   }
 
   get slotCount4(): number {
@@ -157,6 +164,40 @@ export class BrickGrid {
     return edit;
   }
 
+  /**
+   * Edit every brick overlapping `box` in place.
+   *
+   * `fill` receives the brick's current 512 voxels (local index
+   * `lx + ly*8 + lz*64`) and its world-space origin, mutates what it wants, and
+   * returns whether it changed anything. Bricks are the source of truth here —
+   * nothing reads back from a dense array — so a world can be built, and later
+   * edited, without one existing at all.
+   */
+  editBox(box: DirtyBox, fill: (cells: Uint8Array, ox: number, oy: number, oz: number) => boolean): BrickEdit {
+    const [bx, by, bz] = this.dim;
+    const x0 = Math.max(0, (box.x0 / BRICK_B) | 0);
+    const y0 = Math.max(0, (box.y0 / BRICK_B) | 0);
+    const z0 = Math.max(0, (box.z0 / BRICK_B) | 0);
+    const x1 = Math.min(bx - 1, (box.x1 / BRICK_B) | 0);
+    const y1 = Math.min(by - 1, (box.y1 / BRICK_B) | 0);
+    const z1 = Math.min(bz - 1, (box.z1 / BRICK_B) | 0);
+    const edit: BrickEdit = { index: { x0, y0, z0, x1, y1, z1 }, slots4: [], slots8: [] };
+    if (x1 < x0 || y1 < y0 || z1 < z0) return edit;
+    const cells = this.scratch;
+    for (let z = z0; z <= z1; z++)
+      for (let y = y0; y <= y1; y++)
+        for (let x = x0; x <= x1; x++) {
+          const ii = x + y * bx + z * bx * by;
+          this.decodeBrick(ii, cells);
+          if (!fill(cells, x * BRICK_B, y * BRICK_B, z * BRICK_B)) continue;
+          const e = this.encodeBrick(x, y, z, cells);
+          if (!e) continue;
+          const slot = (e & SLOT_MASK) - 1;
+          (e & TIER_BIT ? edit.slots8 : edit.slots4).push(slot);
+        }
+    return edit;
+  }
+
   /** Read back a voxel from the sparse form. For verification and CPU picking. */
   get(x: number, y: number, z: number): number {
     const { x: sx, y: sy, z: sz } = this.size;
@@ -182,14 +223,8 @@ export class BrickGrid {
   /** Rebuild one brick from the dense grid; returns its new index entry. */
   private rebuildBrick(data: Uint8Array, bxi: number, byi: number, bzi: number): number {
     const { x: sx, y: sy, z: sz } = this.size;
-    const [bx, by] = this.dim;
-    const ii = bxi + byi * bx + bzi * bx * by;
-    const prev = this.index[ii];
-
-    // Gather the brick's contents and its distinct values in one pass.
-    const cells = new Uint8Array(BRICK_VOXELS);
-    const seen = new Map<number, number>(); // value -> palette entry (1-based)
-    let any = false;
+    const cells = this.scratch;
+    cells.fill(0);
     const ox = bxi * BRICK_B;
     const oy = byi * BRICK_B;
     const oz = bzi * BRICK_B;
@@ -203,13 +238,58 @@ export class BrickGrid {
         for (let lx = 0; lx < BRICK_B; lx++) {
           const wx = ox + lx;
           if (wx >= sx) break;
-          const v = data[row + wx];
-          if (v === 0) continue;
-          cells[lx + ly * BRICK_B + lz * BRICK_B * BRICK_B] = v;
-          any = true;
-          if (!seen.has(v)) seen.set(v, seen.size + 1);
+          cells[lx + ly * BRICK_B + lz * BRICK_B * BRICK_B] = data[row + wx];
         }
       }
+    }
+    return this.encodeBrick(bxi, byi, bzi, cells);
+  }
+
+  /**
+   * Read a brick's 512 voxels into `out` (zero-filled when the brick is empty).
+   * Paired with `editBrick` so callers can modify a brick without the grid ever
+   * existing densely.
+   */
+  private decodeBrick(ii: number, out: Uint8Array): void {
+    const e = this.index[ii];
+    if (!e) {
+      out.fill(0);
+      return;
+    }
+    const slot = (e & SLOT_MASK) - 1;
+    if (e & TIER_BIT) {
+      const base = slot * BRICK_WORDS_8;
+      for (let i = 0; i < BRICK_VOXELS; i++) {
+        out[i] = (this.voxels8[base + (i >> 2)] >>> ((i & 3) * 8)) & 0xff;
+      }
+      return;
+    }
+    const vbase = slot * BRICK_WORDS_4;
+    const pbase = slot * PALETTE_WORDS;
+    for (let i = 0; i < BRICK_VOXELS; i++) {
+      const nib = (this.voxels4[vbase + (i >> 3)] >>> ((i & 7) * 4)) & 0xf;
+      if (nib === 0) {
+        out[i] = 0;
+        continue;
+      }
+      const w = this.palettes[pbase + ((nib - 1) >> 1)];
+      out[i] = (w >>> (((nib - 1) & 1) * 16)) & 0xffff;
+    }
+  }
+
+  /** Encode 512 voxels into the brick at (bxi,byi,bzi); returns its index entry. */
+  private encodeBrick(bxi: number, byi: number, bzi: number, cells: Uint8Array): number {
+    const [bx, by] = this.dim;
+    const ii = bxi + byi * bx + bzi * bx * by;
+    const prev = this.index[ii];
+
+    const seen = new Map<number, number>(); // value -> palette entry (1-based)
+    let any = false;
+    for (let i = 0; i < BRICK_VOXELS; i++) {
+      const v = cells[i];
+      if (v === 0) continue;
+      any = true;
+      if (!seen.has(v)) seen.set(v, seen.size + 1);
     }
 
     if (!any) {
