@@ -3,6 +3,7 @@
 import { link } from "wesl";
 import uniformsWesl from "./shaders/uniforms.wesl?raw";
 import gridWesl from "./shaders/grid.wesl?raw";
+import ddaWesl from "./shaders/dda.wesl?raw";
 import highlightWesl from "./shaders/highlight.wesl?raw";
 import intersectWesl from "./shaders/intersect.wesl?raw";
 import skyWesl from "./shaders/sky.wesl?raw";
@@ -23,6 +24,7 @@ import { COARSE_B } from "./occupancy";
 const WESL_SRC: Record<string, string> = {
   "./uniforms.wesl": uniformsWesl,
   "./grid.wesl": gridWesl,
+  "./dda.wesl": ddaWesl,
   "./highlight.wesl": highlightWesl,
   "./intersect.wesl": intersectWesl,
   "./sky.wesl": skyWesl,

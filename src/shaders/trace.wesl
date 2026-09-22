@@ -3,7 +3,8 @@
 // face normal, palette colour, and material index.
 
 import package::uniforms::{U, palette};
-import package::grid::{sampleVoxel, coarseSolid, COARSE_B};
+import package::grid::{sampleVoxel, coarseSolid};
+import package::dda::{stepMask, seedSideDist, skipBlock};
 
 struct Hit {
   hit    : bool,
@@ -27,7 +28,7 @@ fn traverse(ro : vec3<f32>, rd : vec3<f32>, tStart : f32) -> Hit {
   let stepDir = vec3<i32>(sign(rd));
   let deltaDist = abs(1.0 / rd);
   // t to the first voxel boundary on each axis.
-  var sideDist = (sign(rd) * (vec3<f32>(cell) - p) + sign(rd) * 0.5 + 0.5) * deltaDist;
+  var sideDist = seedSideDist(cell, p, rd, deltaDist);
   var normal = vec3<f32>(0.0);
 
   let steps = min(i32(U.maxSteps), MAX_STEPS);
@@ -38,15 +39,10 @@ fn traverse(ro : vec3<f32>, rd : vec3<f32>, tStart : f32) -> Hit {
     // Empty-space skip: if the coarse block is empty, jump the ray to that
     // block's far plane in one hop (re-seed exactly like the entry above).
     if (U.debug < 0.5 && !coarseSolid(cell)) {
-      let cc = floor(vec3<f32>(cell) / f32(COARSE_B));
-      let planeF = (cc + step(vec3<f32>(0.0), rd)) * f32(COARSE_B);
-      let tP = (planeF - ro) / rd;
-      let tExit = min(min(tP.x, tP.y), tP.z);
-      let m = select(vec3<f32>(0.0), vec3<f32>(1.0), tP <= vec3<f32>(tExit));
-      let pj = ro + rd * (tExit + 1e-3);
-      cell = vec3<i32>(floor(pj));
-      sideDist = (sign(rd) * (vec3<f32>(cell) - pj) + sign(rd) * 0.5 + 0.5) * deltaDist;
-      normal = m * -sign(rd);
+      let seed = skipBlock(ro, rd, cell, deltaDist);
+      cell = seed.cell;
+      sideDist = seed.sideDist;
+      normal = seed.axis * -sign(rd);
       continue;
     }
     let c = sampleVoxel(cell);
@@ -59,11 +55,7 @@ fn traverse(ro : vec3<f32>, rd : vec3<f32>, tStart : f32) -> Hit {
       return h;
     }
     // Advance along the axis with the smallest accumulated distance.
-    let mask = select(
-      vec3<f32>(0.0),
-      vec3<f32>(1.0),
-      sideDist.xyz <= min(sideDist.yzx, sideDist.zxy),
-    );
+    let mask = stepMask(sideDist);
     sideDist += mask * deltaDist;
     cell += vec3<i32>(mask) * stepDir;
     normal = mask * -sign(rd);
