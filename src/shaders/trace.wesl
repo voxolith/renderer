@@ -17,7 +17,13 @@ struct Hit {
 // Hard ceiling for the primary-ray DDA. The effective cap is U.maxSteps (set via
 // Renderer.setQuality), clamped to this; with coarse empty-space skipping on,
 // typical rays use far fewer steps and the cap is only a backstop.
-const MAX_STEPS : i32 = 1024;
+//
+// It has to clear the worst case for the largest grid a consumer might hand us,
+// because a ray that runs out of steps returns "no hit" and shades as sky — a
+// hole in solid geometry. One axis is stepped at a time, so the worst case is
+// the grid's Manhattan extent: 2736 for a 1280x176x1280 scene. Raising this
+// costs nothing on its own; rays that terminate early still terminate early.
+const MAX_STEPS : i32 = 4096;
 
 fn traverse(ro : vec3<f32>, rd : vec3<f32>, tStart : f32) -> Hit {
   var h : Hit;

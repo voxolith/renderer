@@ -31,6 +31,14 @@ export interface PerfOptions {
   adaptEveryMs?: number;
   /** Fixed scale: disables adaptation when true. */
   locked?: boolean;
+  /**
+   * Frame gaps longer than this are treated as idle (tab hidden, render-on-
+   * demand waiting) and ignored. Default 250 ms. A scene that renders
+   * continuously and may legitimately be slower than that must raise it, or
+   * every frame is discarded: the readout then sits at its initial value,
+   * reporting 60 fps, and the scale controller never sees a sample.
+   */
+  maxSampleMs?: number;
   /** Extra text shown in the overlay (adapter name, quality preset, ...). */
   label?: string;
 }
@@ -40,6 +48,7 @@ export function makePerf(opts: PerfOptions): Perf {
   const maxScale = opts.maxScale ?? 1;
   const targetMs = opts.targetMs ?? 1000 / 60;
   const adaptEvery = opts.adaptEveryMs ?? 500;
+  const maxSample = opts.maxSampleMs ?? 250;
   let scale = Math.max(minScale, Math.min(maxScale, opts.scale));
   let label = opts.label ?? "";
   let emaMs = targetMs;
@@ -64,7 +73,7 @@ export function makePerf(opts: PerfOptions): Perf {
     const dt = now - last;
     last = now;
     // Ignore gaps (tab hidden, on-demand idle): they are not render cost.
-    if (dt > 0 && dt < 250) {
+    if (dt > 0 && dt < maxSample) {
       emaMs += (dt - emaMs) * 0.2;
       samples++;
     }

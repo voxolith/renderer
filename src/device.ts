@@ -20,6 +20,18 @@ export interface GpuContext {
    * lavapipe, or a browser "fallback" adapter). Expect single-digit fps.
    */
   software: boolean;
+  /**
+   * The limits actually granted on the device, after negotiating against the
+   * adapter. Consumers should size scenes against these rather than assume the
+   * WebGPU defaults (`maxTextureDimension3D` 2048, `maxBufferSize` 256 MiB),
+   * which are well below what most adapters offer.
+   */
+  limits: GrantedLimits;
+}
+
+export interface GrantedLimits {
+  maxTextureDimension3D: number;
+  maxBufferSize: number;
 }
 
 export interface AdapterInfo {
@@ -39,7 +51,19 @@ export interface GpuOptions {
   powerPreference?: GPUPowerPreference;
   /** Log the chosen adapter to the console (default true). */
   log?: boolean;
+  /**
+   * Ceilings to ask the device for, each clamped to what the adapter reports.
+   * Defaults are generous: a large voxel grid needs far more than the WebGPU
+   * defaults allow, and asking costs nothing when the adapter can supply it.
+   */
+  limits?: Partial<GrantedLimits>;
 }
+
+/** Asked for by default; each is clamped to `adapter.limits` before requesting. */
+const WANT_LIMITS: GrantedLimits = {
+  maxTextureDimension3D: 4096,
+  maxBufferSize: 1 << 30, // 1 GiB
+};
 
 export class WebGPUUnsupportedError extends Error {
   constructor(message: string) {
@@ -73,7 +97,32 @@ export async function initGpu(canvas: HTMLCanvasElement, opts: GpuOptions = {}):
     throw new WebGPUUnsupportedError("No suitable GPU adapter was found.");
   }
 
-  const device = await adapter.requestDevice();
+  // Requesting a limit the adapter cannot meet rejects the promise, so every
+  // value is clamped to what the adapter reports first. Without this the device
+  // runs on WebGPU defaults, and a single writeTexture of a large grid blows the
+  // 256 MiB default maxBufferSize via the driver's staging buffer.
+  const want = { ...WANT_LIMITS, ...opts.limits };
+  const requiredLimits: Record<string, number> = {};
+  const limits: GrantedLimits = { ...WANT_LIMITS };
+  for (const key of Object.keys(WANT_LIMITS) as (keyof GrantedLimits)[]) {
+    const supported = Number(adapter.limits[key] ?? 0);
+    const asked = Math.min(want[key], supported);
+    // Never ask for less than the default: that would *lower* the limit.
+    if (asked > 0) requiredLimits[key] = asked;
+    limits[key] = asked || supported;
+  }
+
+  const device = await adapter.requestDevice({ requiredLimits }).catch(async (err) => {
+    // A driver that refuses the negotiated set is still better served than not
+    // running at all; fall back to defaults and let callers size accordingly.
+    console.warn("[voxolith] requestDevice with raised limits failed, using defaults:", err);
+    limits.maxTextureDimension3D = 2048;
+    limits.maxBufferSize = 268435456;
+    return adapter.requestDevice();
+  });
+  for (const key of Object.keys(limits) as (keyof GrantedLimits)[]) {
+    limits[key] = Number(device.limits[key] ?? limits[key]);
+  }
   device.lost.then((info) => {
     // Surfaced to the console; a production build would attempt re-init here.
     console.error("WebGPU device lost:", info.message, info.reason);
@@ -93,6 +142,10 @@ export async function initGpu(canvas: HTMLCanvasElement, opts: GpuOptions = {}):
       .filter(Boolean)
       .join(" · ");
     console.info(`[voxolith] WebGPU adapter: ${d || "unknown"}${software ? " (SOFTWARE — expect low fps)" : ""}`);
+    console.info(
+      `[voxolith] limits: max 3D texture ${limits.maxTextureDimension3D}, ` +
+        `max buffer ${(limits.maxBufferSize / 1048576).toFixed(0)} MiB`,
+    );
   }
 
   context.configure({
@@ -112,6 +165,7 @@ export async function initGpu(canvas: HTMLCanvasElement, opts: GpuOptions = {}):
     renderScale: opts.renderScale ?? 0.8, // Balanced default; consumers tune it via makePerf/setRenderScale.
     adapterInfo,
     software,
+    limits,
   };
 
   resizeToDisplay(gpu);

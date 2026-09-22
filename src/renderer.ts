@@ -99,7 +99,7 @@ export interface FrameParams {
 /** Optional infinite ground-plane drawn on ray-miss below `y` (off by default). */
 /** Per-frame cost knobs. All are runtime uniforms; changing them is free. */
 export interface RenderQuality {
-  /** Primary-ray DDA step cap (16..1024). Lower is cheaper; too low clips far geometry. */
+  /** Primary-ray DDA step cap (16..4096). Lower is cheaper; too low clips far geometry. */
   maxSteps: number;
   /** Shadow-ray step cap (0..128). 0 disables shadows entirely. */
   shadowSteps: number;
@@ -108,6 +108,42 @@ export interface RenderQuality {
 }
 
 export type QualityPreset = "low" | "medium" | "high";
+
+/**
+ * Ceiling on a single `writeTexture` payload. The driver stages the whole copy
+ * in one buffer, so a big grid in one call trips `maxBufferSize` — the WebGPU
+ * default is 256 MiB and a 1280x176x1280 grid is 275 MB, which is exactly the
+ * error this guards against. Kept well under any device limit so the transient
+ * staging allocation stays modest even where a larger one would be legal.
+ */
+const UPLOAD_SLAB_BYTES = 64 << 20;
+
+/**
+ * Upload a whole 3D grid as a series of z-slabs, each small enough to stage.
+ * `data` is the full dense grid in `x + y*sx + z*sx*sy` order, so a slab is a
+ * contiguous run and needs no scratch copy.
+ */
+function writeGridSliced(
+  device: GPUDevice,
+  texture: GPUTexture,
+  data: Uint8Array,
+  sx: number,
+  sy: number,
+  sz: number,
+  maxBytes: number,
+): void {
+  const layer = sx * sy;
+  const perSlab = Math.max(1, Math.min(sz, Math.floor(Math.max(layer, maxBytes) / layer)));
+  for (let z0 = 0; z0 < sz; z0 += perSlab) {
+    const depth = Math.min(perSlab, sz - z0);
+    device.queue.writeTexture(
+      { texture, origin: { x: 0, y: 0, z: z0 } },
+      data,
+      { offset: z0 * layer, bytesPerRow: sx, rowsPerImage: sy },
+      { width: sx, height: sy, depthOrArrayLayers: depth },
+    );
+  }
+}
 
 /** Presets consumers can offer in a UI; `high` matches the engine's original look. */
 export const QUALITY_PRESETS: Record<QualityPreset, RenderQuality> = {
@@ -148,6 +184,7 @@ export class Renderer {
     colorB: [0, 0, 0],
   };
   private debugMode = 0;
+  private readonly uploadSlab: number;
   private quality: RenderQuality = { ...QUALITY_PRESETS.high };
 
   constructor(gpu: GpuContext, scene: RenderScene, shaderCode: string) {
@@ -158,6 +195,15 @@ export class Renderer {
 
     const module = device.createShaderModule({ code: shaderCode });
 
+    const maxDim = gpu.limits?.maxTextureDimension3D ?? 2048;
+    const biggest = Math.max(scene.size.x, scene.size.y, scene.size.z);
+    if (biggest > maxDim) {
+      throw new Error(
+        `Scene is ${scene.size.x}x${scene.size.y}x${scene.size.z}, but this adapter's ` +
+          `maxTextureDimension3D is ${maxDim}. Reduce the grid, or raise it via ` +
+          `initGpu({ limits: { maxTextureDimension3D } }) if the adapter supports more.`,
+      );
+    }
     const voxTexture = device.createTexture({
       size: [scene.size.x, scene.size.y, scene.size.z],
       dimension: "3d",
@@ -165,14 +211,10 @@ export class Renderer {
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
     this.voxTexture = voxTexture;
-    device.queue.writeTexture(
-      { texture: voxTexture },
-      scene.data,
-      {
-        bytesPerRow: scene.size.x,
-        rowsPerImage: scene.size.y,
-      },
-      { width: scene.size.x, height: scene.size.y, depthOrArrayLayers: scene.size.z },
+    this.uploadSlab = Math.min(gpu.limits?.maxBufferSize ?? 268435456, UPLOAD_SLAB_BYTES);
+    writeGridSliced(
+      device, voxTexture, scene.data,
+      scene.size.x, scene.size.y, scene.size.z, this.uploadSlab,
     );
 
     const paletteBuffer = device.createBuffer({
@@ -298,7 +340,7 @@ export class Renderer {
   setQuality(q: Partial<RenderQuality> | QualityPreset): void {
     const src = typeof q === "string" ? QUALITY_PRESETS[q] : q;
     this.quality = {
-      maxSteps: Math.max(16, Math.min(1024, Math.round(src.maxSteps ?? this.quality.maxSteps))),
+      maxSteps: Math.max(16, Math.min(4096, Math.round(src.maxSteps ?? this.quality.maxSteps))),
       shadowSteps: Math.max(0, Math.min(128, Math.round(src.shadowSteps ?? this.quality.shadowSteps))),
       ao: src.ao ?? this.quality.ao,
     };
@@ -310,6 +352,21 @@ export class Renderer {
 
   setDebug(v: number): void {
     this.debugMode = v;
+  }
+
+  /**
+   * Release every GPU resource this renderer owns. Call it before dropping a
+   * renderer — an app that builds a fresh one per load (the viewer does, because
+   * the grid size changes) otherwise leaks a full-size 3D texture each time,
+   * which at forest scale is hundreds of megabytes per reload. The instance is
+   * unusable afterwards.
+   */
+  destroy(): void {
+    this.voxTexture.destroy();
+    this.coarseTexture.destroy();
+    this.paletteBuffer.destroy();
+    this.materialBuffer.destroy();
+    this.uniformBuffer.destroy();
   }
 
   /**
@@ -327,12 +384,7 @@ export class Renderer {
     const [cx, cy, cz] = this.coarseDim;
     const { device } = this.gpu;
     if (!box) {
-      device.queue.writeTexture(
-        { texture: this.coarseTexture },
-        data,
-        { bytesPerRow: cx, rowsPerImage: cy },
-        { width: cx, height: cy, depthOrArrayLayers: cz },
-      );
+      writeGridSliced(device, this.coarseTexture, data, cx, cy, cz, this.uploadSlab);
       return;
     }
     const bw = box.x1 - box.x0 + 1;
@@ -354,12 +406,7 @@ export class Renderer {
   updateVoxels(data: Uint8Array, box?: DirtyBox): void {
     const [sx, sy] = this.gridSize;
     if (!box) {
-      this.gpu.device.queue.writeTexture(
-        { texture: this.voxTexture },
-        data,
-        { bytesPerRow: sx, rowsPerImage: sy },
-        { width: sx, height: sy, depthOrArrayLayers: this.gridSize[2] },
-      );
+      writeGridSliced(this.gpu.device, this.voxTexture, data, sx, sy, this.gridSize[2], this.uploadSlab);
       return;
     }
     const bw = box.x1 - box.x0 + 1;
