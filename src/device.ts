@@ -32,6 +32,13 @@ export interface GpuContext {
 export interface GrantedLimits {
   maxTextureDimension3D: number;
   maxBufferSize: number;
+  /**
+   * Caps a single storage-buffer binding. The default is only 128 MiB, well
+   * under what a large sparse world's brick pool needs, and exceeding it makes
+   * the bind group invalid — which surfaces as rendering silently stopping
+   * rather than as an allocation failure.
+   */
+  maxStorageBufferBindingSize: number;
 }
 
 export interface AdapterInfo {
@@ -63,6 +70,7 @@ export interface GpuOptions {
 const WANT_LIMITS: GrantedLimits = {
   maxTextureDimension3D: 4096,
   maxBufferSize: 1 << 30, // 1 GiB
+  maxStorageBufferBindingSize: 1 << 30, // 1 GiB
 };
 
 export class WebGPUUnsupportedError extends Error {
@@ -118,6 +126,7 @@ export async function initGpu(canvas: HTMLCanvasElement, opts: GpuOptions = {}):
     console.warn("[voxolith] requestDevice with raised limits failed, using defaults:", err);
     limits.maxTextureDimension3D = 2048;
     limits.maxBufferSize = 268435456;
+    limits.maxStorageBufferBindingSize = 134217728;
     return adapter.requestDevice();
   });
   for (const key of Object.keys(limits) as (keyof GrantedLimits)[]) {
@@ -144,7 +153,8 @@ export async function initGpu(canvas: HTMLCanvasElement, opts: GpuOptions = {}):
     console.info(`[voxolith] WebGPU adapter: ${d || "unknown"}${software ? " (SOFTWARE — expect low fps)" : ""}`);
     console.info(
       `[voxolith] limits: max 3D texture ${limits.maxTextureDimension3D}, ` +
-        `max buffer ${(limits.maxBufferSize / 1048576).toFixed(0)} MiB`,
+        `max buffer ${(limits.maxBufferSize / 1048576).toFixed(0)} MiB, ` +
+        `max storage binding ${(limits.maxStorageBufferBindingSize / 1048576).toFixed(0)} MiB`,
     );
   }
 

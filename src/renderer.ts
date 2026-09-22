@@ -202,8 +202,9 @@ export class Renderer {
     // Brick pools, sized with headroom: entities stamped in after construction
     // claim more bricks, and growPools() reallocates when they run out. The
     // contents are uploaded once the bind group exists, at the end of the ctor.
-    this.slotCap4 = Math.max(256, this.bricks.slotCount4 * 2);
-    this.slotCap8 = Math.max(16, this.bricks.slotCount8 * 2);
+    this.slotCap4 = Math.max(256, Math.ceil(this.bricks.slotCount4 * 1.5));
+    this.slotCap8 = Math.max(16, Math.ceil(this.bricks.slotCount8 * 1.5));
+    this.checkPoolFits(this.slotCap4, this.slotCap8);
     this.brickVox4 = this.makePool(BRICK_WORDS_4, this.slotCap4);
     this.brickPal = this.makePool(PALETTE_WORDS, this.slotCap4);
     this.brickVox8 = this.makePool(BRICK_WORDS_8, this.slotCap8);
@@ -421,6 +422,23 @@ export class Renderer {
 
   // --- brick pool plumbing ---------------------------------------------------
 
+  /**
+   * A binding larger than the device allows does not fail at creation — it
+   * makes the bind group invalid, and rendering stops with a validation error
+   * per frame. Catch it here, where the message can say what to do.
+   */
+  private checkPoolFits(cap4: number, cap8: number): void {
+    const limit = this.gpu.limits?.maxStorageBufferBindingSize ?? 134217728;
+    const biggest = Math.max(cap4 * BRICK_WORDS_4, cap8 * BRICK_WORDS_8) * 4;
+    if (biggest <= limit) return;
+    const mb = (n: number) => `${(n / 1048576).toFixed(0)} MiB`;
+    throw new Error(
+      `Scene needs a ${mb(biggest)} brick pool but this device caps a storage binding at ` +
+        `${mb(limit)}. Raise it via initGpu({ limits: { maxStorageBufferBindingSize } }) if the ` +
+        `adapter supports more, or use a smaller world.`,
+    );
+  }
+
   private makePool(wordsPerSlot: number, slots: number): GPUBuffer {
     // WebGPU rejects a zero-sized buffer, so empty pools still get one slot.
     const size = Math.max(1, slots) * wordsPerSlot * 4;
@@ -441,10 +459,14 @@ export class Renderer {
     const need8 = this.bricks.slotCount8;
     if (need4 <= this.slotCap4 && need8 <= this.slotCap8) return false;
     // Geometric growth with a floor, so planting a thousand entities does not
-    // reallocate a thousand times.
-    const cap = (need: number, have: number) => Math.max(256, need * 2, have * 2);
-    this.slotCap4 = cap(need4, this.slotCap4);
-    this.slotCap8 = Math.max(16, need8 * 2, this.slotCap8 * 2);
+    // reallocate a thousand times. 1.5x rather than 2x: at forest scale the
+    // headroom is hundreds of megabytes of otherwise idle GPU memory, and a
+    // storage binding has a hard ceiling that doubling walks straight into.
+    const cap = (need: number, have: number, floor: number) =>
+      Math.max(floor, Math.ceil(need * 1.5), Math.ceil(have * 1.5));
+    this.slotCap4 = cap(need4, this.slotCap4, 256);
+    this.slotCap8 = cap(need8, this.slotCap8, 16);
+    this.checkPoolFits(this.slotCap4, this.slotCap8);
     this.brickVox4.destroy();
     this.brickPal.destroy();
     this.brickVox8.destroy();
