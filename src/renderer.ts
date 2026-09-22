@@ -17,7 +17,7 @@ import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
 
 export type { DirtyBox };
-import { BrickGrid, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS } from "./brick";
+import { BrickGrid, BRICK_B, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS } from "./brick";
 
 // WESL modules of the raymarch pass, linked once into the final WGSL. Keys are
 // the modules' relative paths (./foo.wesl → import path `package::foo`).
@@ -166,13 +166,18 @@ export class Renderer {
 
     const module = device.createShaderModule({ code: shaderCode });
 
+    // The only 3D texture is the brick index, one texel per BRICK_B^3 voxels, so
+    // the per-axis ceiling is maxTextureDimension3D * BRICK_B voxels — eight
+    // times what a dense grid could reach on the same adapter.
     const maxDim = gpu.limits?.maxTextureDimension3D ?? 2048;
+    const maxVoxels = maxDim * BRICK_B;
     const biggest = Math.max(scene.size.x, scene.size.y, scene.size.z);
-    if (biggest > maxDim) {
+    if (biggest > maxVoxels) {
       throw new Error(
         `Scene is ${scene.size.x}x${scene.size.y}x${scene.size.z}, but this adapter's ` +
-          `maxTextureDimension3D is ${maxDim}. Reduce the grid, or raise it via ` +
-          `initGpu({ limits: { maxTextureDimension3D } }) if the adapter supports more.`,
+          `maxTextureDimension3D of ${maxDim} caps a grid at ${maxVoxels} voxels per axis. ` +
+          `Reduce the grid, or raise the limit via initGpu({ limits: { maxTextureDimension3D } }) ` +
+          `if the adapter supports more.`,
       );
     }
 
