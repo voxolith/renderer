@@ -51,8 +51,17 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> U : Uniforms;
-@group(0) @binding(1) var voxTex : texture_3d<u32>;
+// Brick index volume, one texel per 8^3 brick: 0 = empty, else (slot + 1) with
+// bit 31 set when the brick stores 8 bits per voxel instead of 4. It doubles as
+// the empty-space-skip structure, so there is no separate occupancy texture.
+@group(0) @binding(1) var indexTex : texture_3d<u32>;
 @group(0) @binding(2) var<storage, read> palette : array<vec4<f32>, 256>;
-@group(0) @binding(3) var coarseTex : texture_3d<u32>;
+// 4-bit brick payloads: 64 u32 per slot, 8 voxels per word.
+@group(0) @binding(3) var<storage, read> brickVox4 : array<u32>;
 // Per-slot materials: 256 × 2 vec4. See materials.wesl for the field packing.
 @group(0) @binding(4) var<storage, read> materials : array<vec4<f32>, 512>;
+// Per-brick palettes: 8 u32 per slot, two u16 global indices per word.
+@group(0) @binding(5) var<storage, read> brickPal : array<u32>;
+// 8-bit fallback payloads for bricks with more than 15 distinct values:
+// 128 u32 per slot, 4 voxels per word, indices are global and need no palette.
+@group(0) @binding(6) var<storage, read> brickVox8 : array<u32>;

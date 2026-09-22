@@ -17,7 +17,7 @@ import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
 
 export type { DirtyBox };
-import { COARSE_B } from "./occupancy";
+import { BrickGrid, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS } from "./brick";
 
 // WESL modules of the raymarch pass, linked once into the final WGSL. Keys are
 // the modules' relative paths (./foo.wesl → import path `package::foo`).
@@ -109,42 +109,6 @@ export interface RenderQuality {
 
 export type QualityPreset = "low" | "medium" | "high";
 
-/**
- * Ceiling on a single `writeTexture` payload. The driver stages the whole copy
- * in one buffer, so a big grid in one call trips `maxBufferSize` — the WebGPU
- * default is 256 MiB and a 1280x176x1280 grid is 275 MB, which is exactly the
- * error this guards against. Kept well under any device limit so the transient
- * staging allocation stays modest even where a larger one would be legal.
- */
-const UPLOAD_SLAB_BYTES = 64 << 20;
-
-/**
- * Upload a whole 3D grid as a series of z-slabs, each small enough to stage.
- * `data` is the full dense grid in `x + y*sx + z*sx*sy` order, so a slab is a
- * contiguous run and needs no scratch copy.
- */
-function writeGridSliced(
-  device: GPUDevice,
-  texture: GPUTexture,
-  data: Uint8Array,
-  sx: number,
-  sy: number,
-  sz: number,
-  maxBytes: number,
-): void {
-  const layer = sx * sy;
-  const perSlab = Math.max(1, Math.min(sz, Math.floor(Math.max(layer, maxBytes) / layer)));
-  for (let z0 = 0; z0 < sz; z0 += perSlab) {
-    const depth = Math.min(perSlab, sz - z0);
-    device.queue.writeTexture(
-      { texture, origin: { x: 0, y: 0, z: z0 } },
-      data,
-      { offset: z0 * layer, bytesPerRow: sx, rowsPerImage: sy },
-      { width: sx, height: sy, depthOrArrayLayers: depth },
-    );
-  }
-}
-
 /** Presets consumers can offer in a UI; `high` matches the engine's original look. */
 export const QUALITY_PRESETS: Record<QualityPreset, RenderQuality> = {
   low: { maxSteps: 256, shadowSteps: 0, ao: false },
@@ -164,14 +128,22 @@ export class Renderer {
   private readonly pipeline: GPURenderPipeline;
   private readonly uniformBuffer: GPUBuffer;
   private readonly uniformData = new Float32Array(UNIFORM_FLOATS);
-  private readonly bindGroup: GPUBindGroup;
+  private bindGroup: GPUBindGroup;
   private readonly gridSize: [number, number, number];
-  private readonly voxTexture: GPUTexture;
   private readonly paletteBuffer: GPUBuffer;
   private occMin: Vec3;
   private occMax: Vec3;
-  private readonly coarseTexture: GPUTexture;
+  /** Sparse mirror of the caller's dense grid; see src/brick.ts. */
+  private readonly bricks: BrickGrid;
+  private readonly indexTexture: GPUTexture;
+  /** Brick-space dims, also the bounds test for the empty-space skip. */
   private readonly coarseDim: Vec3;
+  private brickVox4: GPUBuffer;
+  private brickPal: GPUBuffer;
+  private brickVox8: GPUBuffer;
+  private slotCap4 = 0;
+  private slotCap8 = 0;
+  private readonly bindLayout: GPUBindGroupLayout;
   private readonly materialBuffer: GPUBuffer;
   private materialsEnabled = 0;
   // Generic selection highlight: when mode=1, voxels with a palette slot in
@@ -184,7 +156,6 @@ export class Renderer {
     colorB: [0, 0, 0],
   };
   private debugMode = 0;
-  private readonly uploadSlab: number;
   private quality: RenderQuality = { ...QUALITY_PRESETS.high };
 
   constructor(gpu: GpuContext, scene: RenderScene, shaderCode: string) {
@@ -204,18 +175,17 @@ export class Renderer {
           `initGpu({ limits: { maxTextureDimension3D } }) if the adapter supports more.`,
       );
     }
-    const voxTexture = device.createTexture({
-      size: [scene.size.x, scene.size.y, scene.size.z],
+
+    // Sparse brick form of the grid. The caller's dense array stays the source
+    // of truth; this is the mirror the GPU reads.
+    this.bricks = new BrickGrid(scene.size, scene.data);
+    this.coarseDim = [...this.bricks.dim] as Vec3;
+    this.indexTexture = device.createTexture({
+      size: this.bricks.dim,
       dimension: "3d",
-      format: "r8uint",
+      format: "r32uint",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
-    this.voxTexture = voxTexture;
-    this.uploadSlab = Math.min(gpu.limits?.maxBufferSize ?? 268435456, UPLOAD_SLAB_BYTES);
-    writeGridSliced(
-      device, voxTexture, scene.data,
-      scene.size.x, scene.size.y, scene.size.z, this.uploadSlab,
-    );
 
     const paletteBuffer = device.createBuffer({
       size: scene.palette.byteLength,
@@ -224,24 +194,14 @@ export class Renderer {
     device.queue.writeBuffer(paletteBuffer, 0, scene.palette);
     this.paletteBuffer = paletteBuffer;
 
-    // Coarse occupancy texture (empty-space skipping). Filled via updateCoarse().
-    const cdx = Math.ceil(scene.size.x / COARSE_B);
-    const cdy = Math.ceil(scene.size.y / COARSE_B);
-    const cdz = Math.ceil(scene.size.z / COARSE_B);
-    this.coarseDim = [cdx, cdy, cdz];
-    const coarseTexture = device.createTexture({
-      size: [cdx, cdy, cdz],
-      dimension: "3d",
-      format: "r8uint",
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    });
-    this.coarseTexture = coarseTexture;
-    device.queue.writeTexture(
-      { texture: coarseTexture },
-      new Uint8Array(cdx * cdy * cdz),
-      { bytesPerRow: cdx, rowsPerImage: cdy },
-      { width: cdx, height: cdy, depthOrArrayLayers: cdz },
-    );
+    // Brick pools, sized with headroom: entities stamped in after construction
+    // claim more bricks, and growPools() reallocates when they run out. The
+    // contents are uploaded once the bind group exists, at the end of the ctor.
+    this.slotCap4 = Math.max(256, this.bricks.slotCount4 * 2);
+    this.slotCap8 = Math.max(16, this.bricks.slotCount8 * 2);
+    this.brickVox4 = this.makePool(BRICK_WORDS_4, this.slotCap4);
+    this.brickPal = this.makePool(PALETTE_WORDS, this.slotCap4);
+    this.brickVox8 = this.makePool(BRICK_WORDS_8, this.slotCap8);
 
     // Material buffer (always bound). Populated from scene.materials, else zero
     // (materialsEnabled=0 → the shader keeps the flat-palette path unchanged).
@@ -281,15 +241,26 @@ export class Renderer {
         {
           binding: 3,
           visibility: GPUShaderStage.FRAGMENT,
-          texture: { sampleType: "uint", viewDimension: "3d" },
+          buffer: { type: "read-only-storage" },
         },
         {
           binding: 4,
           visibility: GPUShaderStage.FRAGMENT,
           buffer: { type: "read-only-storage" },
         },
+        {
+          binding: 5,
+          visibility: GPUShaderStage.FRAGMENT,
+          buffer: { type: "read-only-storage" },
+        },
+        {
+          binding: 6,
+          visibility: GPUShaderStage.FRAGMENT,
+          buffer: { type: "read-only-storage" },
+        },
       ],
     });
+    this.bindLayout = layout;
 
     this.pipeline = device.createRenderPipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
@@ -302,14 +273,41 @@ export class Renderer {
       primitive: { topology: "triangle-list" },
     });
 
-    this.bindGroup = device.createBindGroup({
-      layout,
+    this.bindGroup = this.makeBindGroup();
+    this.uploadIndex();
+    this.uploadSlots(null, null);
+  }
+
+  /**
+   * Resident voxel memory, for benchmarks and budgeting. `dense` is what the
+   * same grid would have cost as one 3D texture.
+   */
+  stats(): { bricks: number; wide: number; bytes: number; dense: number } {
+    const st = this.bricks.stats();
+    const [bx, by, bz] = this.coarseDim;
+    return {
+      bricks: st.used,
+      wide: st.wide,
+      bytes:
+        this.slotCap4 * (BRICK_WORDS_4 + PALETTE_WORDS) * 4 +
+        this.slotCap8 * BRICK_WORDS_8 * 4 +
+        bx * by * bz * 4,
+      dense: st.denseBytes,
+    };
+  }
+
+  /** Bind group is rebuilt whenever a brick pool is reallocated. */
+  private makeBindGroup(): GPUBindGroup {
+    return this.gpu.device.createBindGroup({
+      layout: this.bindLayout,
       entries: [
         { binding: 0, resource: { buffer: this.uniformBuffer } },
-        { binding: 1, resource: voxTexture.createView() },
-        { binding: 2, resource: { buffer: paletteBuffer } },
-        { binding: 3, resource: coarseTexture.createView() },
+        { binding: 1, resource: this.indexTexture.createView() },
+        { binding: 2, resource: { buffer: this.paletteBuffer } },
+        { binding: 3, resource: { buffer: this.brickVox4 } },
         { binding: 4, resource: { buffer: this.materialBuffer } },
+        { binding: 5, resource: { buffer: this.brickPal } },
+        { binding: 6, resource: { buffer: this.brickVox8 } },
       ],
     });
   }
@@ -362,8 +360,10 @@ export class Renderer {
    * unusable afterwards.
    */
   destroy(): void {
-    this.voxTexture.destroy();
-    this.coarseTexture.destroy();
+    this.indexTexture.destroy();
+    this.brickVox4.destroy();
+    this.brickPal.destroy();
+    this.brickVox8.destroy();
     this.paletteBuffer.destroy();
     this.materialBuffer.destroy();
     this.uniformBuffer.destroy();
@@ -379,49 +379,148 @@ export class Renderer {
     this.occMax = max;
   }
 
-  /** Re-upload coarse occupancy (full, or a coarse-voxel sub-box mirroring updateVoxels). */
-  updateCoarse(data: Uint8Array, box?: DirtyBox): void {
-    const [cx, cy, cz] = this.coarseDim;
-    const { device } = this.gpu;
+  /**
+   * No longer needed: the brick index *is* the empty-space structure, so a null
+   * brick means "skip". Kept as a no-op because consumers pair it with
+   * updateVoxels, which now maintains both.
+   */
+  updateCoarse(_data: Uint8Array, _box?: DirtyBox): void {
+    /* intentionally empty */
+  }
+
+  /**
+   * Re-derive the sparse form from the caller's dense grid. With a `box`, only
+   * the bricks overlapping it are rebuilt and uploaded; otherwise everything is.
+   *
+   * `data` must always be the full-grid array in `x + y*sx + z*sx*sy` order —
+   * the box selects a region of it, it is not a standalone sub-grid.
+   */
+  updateVoxels(data: Uint8Array, box?: DirtyBox): void {
     if (!box) {
-      writeGridSliced(device, this.coarseTexture, data, cx, cy, cz, this.uploadSlab);
+      this.bricks.rebuildAll(data);
+      this.growPools();
+      this.uploadIndex();
+      this.uploadSlots(null, null);
       return;
     }
-    const bw = box.x1 - box.x0 + 1;
-    const bh = box.y1 - box.y0 + 1;
-    const bd = box.z1 - box.z0 + 1;
+    const edit = this.bricks.rebuildBox(data, box);
+    // Growing reallocates and re-uploads everything, so there is nothing left
+    // to send afterwards.
+    if (this.growPools()) {
+      this.uploadIndex();
+      return;
+    }
+    this.uploadIndex(edit.index);
+    this.uploadSlots(edit.slots4, edit.slots8);
+  }
+
+  // --- brick pool plumbing ---------------------------------------------------
+
+  private makePool(wordsPerSlot: number, slots: number): GPUBuffer {
+    // WebGPU rejects a zero-sized buffer, so empty pools still get one slot.
+    const size = Math.max(1, slots) * wordsPerSlot * 4;
+    return this.gpu.device.createBuffer({
+      size,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+  }
+
+  /**
+   * Make sure the GPU pools can hold every claimed slot. Entities stamped in
+   * after construction claim more bricks, and a storage buffer cannot be
+   * resized, so this reallocates with headroom and rebinds. Returns true when
+   * it reallocated, in which case the caller must re-upload everything.
+   */
+  private growPools(): boolean {
+    const need4 = this.bricks.slotCount4;
+    const need8 = this.bricks.slotCount8;
+    if (need4 <= this.slotCap4 && need8 <= this.slotCap8) return false;
+    // Geometric growth with a floor, so planting a thousand entities does not
+    // reallocate a thousand times.
+    const cap = (need: number, have: number) => Math.max(256, need * 2, have * 2);
+    this.slotCap4 = cap(need4, this.slotCap4);
+    this.slotCap8 = Math.max(16, need8 * 2, this.slotCap8 * 2);
+    this.brickVox4.destroy();
+    this.brickPal.destroy();
+    this.brickVox8.destroy();
+    this.brickVox4 = this.makePool(BRICK_WORDS_4, this.slotCap4);
+    this.brickPal = this.makePool(PALETTE_WORDS, this.slotCap4);
+    this.brickVox8 = this.makePool(BRICK_WORDS_8, this.slotCap8);
+    this.bindGroup = this.makeBindGroup();
+    this.uploadSlots(null, null);
+    return true;
+  }
+
+  /** Upload the brick index volume, whole or a brick-space sub-box. */
+  private uploadIndex(box?: DirtyBox): void {
+    const [bx, by, bz] = this.coarseDim;
+    const { device } = this.gpu;
+    const data = this.bricks.index;
+    if (!box) {
+      device.queue.writeTexture(
+        { texture: this.indexTexture },
+        data,
+        { bytesPerRow: bx * 4, rowsPerImage: by },
+        { width: bx, height: by, depthOrArrayLayers: bz },
+      );
+      return;
+    }
+    const w = box.x1 - box.x0 + 1;
+    const h = box.y1 - box.y0 + 1;
+    const d = box.z1 - box.z0 + 1;
+    if (w <= 0 || h <= 0 || d <= 0) return;
     device.queue.writeTexture(
-      { texture: this.coarseTexture, origin: { x: box.x0, y: box.y0, z: box.z0 } },
+      { texture: this.indexTexture, origin: { x: box.x0, y: box.y0, z: box.z0 } },
       data,
-      { offset: box.x0 + box.y0 * cx + box.z0 * cx * cy, bytesPerRow: cx, rowsPerImage: cy },
-      { width: bw, height: bh, depthOrArrayLayers: bd },
+      {
+        offset: (box.x0 + box.y0 * bx + box.z0 * bx * by) * 4,
+        bytesPerRow: bx * 4,
+        rowsPerImage: by,
+      },
+      { width: w, height: h, depthOrArrayLayers: d },
     );
   }
 
   /**
-   * Re-upload voxel data. With a `box`, only that sub-region is sent (a strided
-   * copy straight out of the full-grid `data`, no scratch buffer); otherwise the
-   * whole grid is uploaded.
+   * Upload brick payloads. `null` means every slot. A list is sorted and
+   * coalesced into contiguous runs first: bricks claimed together get
+   * consecutive slots, so stamping one entity usually collapses to a handful of
+   * writes rather than one per brick.
    */
-  updateVoxels(data: Uint8Array, box?: DirtyBox): void {
-    const [sx, sy] = this.gridSize;
-    if (!box) {
-      writeGridSliced(this.gpu.device, this.voxTexture, data, sx, sy, this.gridSize[2], this.uploadSlab);
-      return;
+  private uploadSlots(slots4: number[] | null, slots8: number[] | null): void {
+    const { device } = this.gpu;
+    if (slots4 === null) {
+      // The CPU pools are sized to the slots actually claimed, which is less
+      // than the GPU capacity; only send what exists.
+      const nv = Math.min(this.slotCap4 * BRICK_WORDS_4, this.bricks.voxels4.length);
+      const np = Math.min(this.slotCap4 * PALETTE_WORDS, this.bricks.palettes.length);
+      device.queue.writeBuffer(this.brickVox4, 0, this.bricks.voxels4, 0, nv);
+      device.queue.writeBuffer(this.brickPal, 0, this.bricks.palettes, 0, np);
+    } else {
+      for (const [lo, hi] of runs(slots4)) {
+        const n = hi - lo + 1;
+        device.queue.writeBuffer(
+          this.brickVox4, lo * BRICK_WORDS_4 * 4,
+          this.bricks.voxels4, lo * BRICK_WORDS_4, n * BRICK_WORDS_4,
+        );
+        device.queue.writeBuffer(
+          this.brickPal, lo * PALETTE_WORDS * 4,
+          this.bricks.palettes, lo * PALETTE_WORDS, n * PALETTE_WORDS,
+        );
+      }
     }
-    const bw = box.x1 - box.x0 + 1;
-    const bh = box.y1 - box.y0 + 1;
-    const bd = box.z1 - box.z0 + 1;
-    this.gpu.device.queue.writeTexture(
-      { texture: this.voxTexture, origin: { x: box.x0, y: box.y0, z: box.z0 } },
-      data,
-      {
-        offset: box.x0 + box.y0 * sx + box.z0 * sx * sy,
-        bytesPerRow: sx,
-        rowsPerImage: sy,
-      },
-      { width: bw, height: bh, depthOrArrayLayers: bd },
-    );
+    if (slots8 === null) {
+      const n = Math.min(this.slotCap8 * BRICK_WORDS_8, this.bricks.voxels8.length);
+      device.queue.writeBuffer(this.brickVox8, 0, this.bricks.voxels8, 0, n);
+    } else {
+      for (const [lo, hi] of runs(slots8)) {
+        const n = hi - lo + 1;
+        device.queue.writeBuffer(
+          this.brickVox8, lo * BRICK_WORDS_8 * 4,
+          this.bricks.voxels8, lo * BRICK_WORDS_8, n * BRICK_WORDS_8,
+        );
+      }
+    }
   }
 
   /**
@@ -523,4 +622,22 @@ function occupiedBounds(
     }
   if (x1 < x0) return [[0, 0, 0], [sx - 1, sy - 1, sz - 1]]; // empty grid fallback
   return [[x0, y0, z0], [x1, y1, z1]];
+}
+
+/** Sort and coalesce slot indices into inclusive contiguous [lo, hi] runs. */
+function runs(slots: number[]): [number, number][] {
+  if (slots.length === 0) return [];
+  const sorted = [...new Set(slots)].sort((a, b) => a - b);
+  const out: [number, number][] = [];
+  let lo = sorted[0];
+  let prev = lo;
+  for (let i = 1; i < sorted.length; i++) {
+    const v = sorted[i];
+    if (v === prev + 1) { prev = v; continue; }
+    out.push([lo, prev]);
+    lo = v;
+    prev = v;
+  }
+  out.push([lo, prev]);
+  return out;
 }
