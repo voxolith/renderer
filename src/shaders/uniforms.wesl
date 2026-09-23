@@ -18,7 +18,7 @@ struct Uniforms {
   highlight  : vec2<f32>, // 26,27  x = mode (0/1), y = highlight min slot
   highlightMax : f32,     // 28
   materialsEnabled : f32, // 29  (0 = flat palette; 1 = per-slot material shading)
-  _pad1     : f32,        // 30
+  lightCount: f32,        // 30  point lights in use (see lights.wesl)
   _pad2     : f32,        // 31
   // --- environment/sky block (each vec3 on a 16-byte boundary) ---
   sunDir       : vec3<f32>, _s0 : f32,  // 32-35
@@ -65,3 +65,6 @@ struct Uniforms {
 // 8-bit fallback payloads for bricks with more than 15 distinct values:
 // 128 u32 per slot, 4 voxels per word, indices are global and need no palette.
 @group(0) @binding(6) var<storage, read> brickVox8 : array<u32>;
+// Point lights: 3 vec4 each — (position, range), (colour × intensity, 0),
+// (shadows 0/1, glow radius, 0, 0). U.lightCount of them are live.
+@group(0) @binding(7) var<storage, read> lights : array<vec4<f32>>;

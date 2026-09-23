@@ -102,6 +102,9 @@ Grouped as in `src/index.ts`:
 - **Cameras**: `makeCamera`, `firstPersonFrame`, `chaseFrame`. Input (orbit and first-person
   controllers, gestures, keys, gamepad, touch controls) lives in
   [`@voxolith/engine/input`](https://github.com/voxolith/engine#input); the renderer only draws.
+- **Lighting**: `renderer.setLights()` (point lights with range-limited shadows and a visible
+  glow, up to `MAX_LIGHTS`), `dayNight(phase)` (every lighting field of `FrameParams` from a time
+  of day)
 - **Effects**: `makeExplosion`, `makeMuzzleFlash`
 - **Utilities**: `rayAABB`, `makeRay`, `voxelRaycast` (CPU DDA for hit tests), `seededRandom` / `hashSeed`, `makePerf` (adaptive render scale + overlay)
 
@@ -147,6 +150,38 @@ observeResize(canvas, loop);
 // From @voxolith/engine/input: every input event invalidates the loop.
 const orbit = makeOrbitController(createInput(canvas, { loop }), { distance: 120, distanceLimits: [20, 600] });
 loop.invalidate();
+```
+
+## Lights and time of day
+
+The scene has one directional key light (`lightDir`, `lightColor` in `FrameParams`) plus up to
+`MAX_LIGHTS` (32) point lights:
+
+```ts
+renderer.setLights([
+  { position: [120, 30, 80], color: [1, 0.7, 0.4], intensity: 2.5, range: 90, glow: 3 },
+  { position: [60, 20, 40], color: [0.4, 0.6, 1], range: 40, shadows: false },
+]);
+loop.invalidate();
+```
+
+- `range` is hard: past it a light contributes exactly nothing, and the range test comes first,
+  so a pixel no light reaches costs a loop over the list and nothing else.
+- Inside the range the light fades smoothly to zero at the edge, with a soft inverse square.
+- `shadows` (default on) traces one shadow ray per pixel towards the light, stopping at the light
+  and capped by the quality preset's `shadowSteps`. So `low` keeps the lights but drops their
+  shadows, and the cost is one short ray per shadowed light in range per pixel.
+- `glow` draws a visible halo, so the lamp itself shows, including against the sky.
+- Metal and glass reflections pick up the lights, unshadowed.
+- `setLights` rewrites a 1.5 KB buffer, so moving a lamp every frame is cheap.
+
+`dayNight(phase)` returns the lighting half of `FrameParams`: 0 is midnight, 0.25 sunrise, 0.5 noon
+and 0.75 sunset. By day the key light follows the sun; at night it becomes a dim blue moonlight
+and the ambient drops low enough for point lights to carry the scene. The sun and moon discs
+only paint the sky; they do not light anything themselves. Animate `phase` for a transition.
+
+```ts
+renderer.render({ ...camera(yaw), ...dayNight(0.5) }); // noon
 ```
 
 ## Development

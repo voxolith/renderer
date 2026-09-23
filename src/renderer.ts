@@ -12,12 +12,14 @@ import shadowWesl from "./shaders/shadow.wesl?raw";
 import aoWesl from "./shaders/ao.wesl?raw";
 import backgroundWesl from "./shaders/background.wesl?raw";
 import materialsWesl from "./shaders/materials.wesl?raw";
+import lightsWesl from "./shaders/lights.wesl?raw";
 import raymarchWesl from "./shaders/raymarch.wesl?raw";
 import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
 
 export type { DirtyBox };
 import { BrickGrid, BRICK_B, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS } from "./brick";
+import { LIGHT_FLOATS, MAX_LIGHTS, packLights, type PointLight } from "./lights";
 
 // WESL modules of the raymarch pass, linked once into the final WGSL. Keys are
 // the modules' relative paths (./foo.wesl → import path `package::foo`).
@@ -33,6 +35,7 @@ const WESL_SRC: Record<string, string> = {
   "./ao.wesl": aoWesl,
   "./background.wesl": backgroundWesl,
   "./materials.wesl": materialsWesl,
+  "./lights.wesl": lightsWesl,
   "./raymarch.wesl": raymarchWesl,
 };
 
@@ -150,6 +153,9 @@ export class Renderer {
   private slotCap8 = 0;
   private readonly bindLayout: GPUBindGroupLayout;
   private readonly materialBuffer: GPUBuffer;
+  private readonly lightBuffer: GPUBuffer;
+  private readonly lightData = new Float32Array(MAX_LIGHTS * LIGHT_FLOATS);
+  private lightCount = 0;
   private materialsEnabled = 0;
   // Generic selection highlight: when mode=1, voxels with a palette slot in
   // [slotMin,slotMax] keep colour + edge glow while the rest greys out.
@@ -231,6 +237,13 @@ export class Renderer {
       device.queue.writeBuffer(this.materialBuffer, 0, new Float32Array(MATERIAL_FLOATS));
     }
 
+    // Point lights (always bound; lightCount 0 means none are read).
+    this.lightBuffer = device.createBuffer({
+      size: MAX_LIGHTS * LIGHT_FLOATS * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(this.lightBuffer, 0, this.lightData);
+
     this.uniformBuffer = device.createBuffer({
       size: UNIFORM_FLOATS * 4,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -270,6 +283,11 @@ export class Renderer {
         },
         {
           binding: 6,
+          visibility: GPUShaderStage.FRAGMENT,
+          buffer: { type: "read-only-storage" },
+        },
+        {
+          binding: 7,
           visibility: GPUShaderStage.FRAGMENT,
           buffer: { type: "read-only-storage" },
         },
@@ -323,6 +341,7 @@ export class Renderer {
         { binding: 4, resource: { buffer: this.materialBuffer } },
         { binding: 5, resource: { buffer: this.brickPal } },
         { binding: 6, resource: { buffer: this.brickVox8 } },
+        { binding: 7, resource: { buffer: this.lightBuffer } },
       ],
     });
   }
@@ -330,6 +349,17 @@ export class Renderer {
   /** Re-upload the 256-entry colour palette (e.g. after a carpet swap). */
   updatePalette(palette: Float32Array): void {
     this.gpu.device.queue.writeBuffer(this.paletteBuffer, 0, palette);
+  }
+
+  /**
+   * Replace the point lights (up to MAX_LIGHTS; extras are ignored). Cheap: it
+   * rewrites a 1.5 KB buffer, so moving a lamp every frame is fine. Invalidate
+   * the frame loop afterwards.
+   */
+  setLights(lights: readonly PointLight[]): void {
+    const { count } = packLights(lights, this.lightData);
+    this.lightCount = count;
+    this.gpu.device.queue.writeBuffer(this.lightBuffer, 0, this.lightData);
   }
 
   /** Upload per-slot materials (256×8 f32) and enable material shading. */
@@ -381,6 +411,7 @@ export class Renderer {
     this.brickVox8.destroy();
     this.paletteBuffer.destroy();
     this.materialBuffer.destroy();
+    this.lightBuffer.destroy();
     this.uniformBuffer.destroy();
   }
 
@@ -606,6 +637,7 @@ export class Renderer {
     u[27] = this.highlight.slotMin;
     u[28] = this.highlight.slotMax;
     u[29] = this.materialsEnabled;
+    u[30] = this.lightCount;
     // Environment/sky block (each vec3 on a 16-byte boundary; mirrors WGSL).
     const w3 = (o: number, v: Vec3) => { u[o] = v[0]; u[o + 1] = v[1]; u[o + 2] = v[2]; };
     w3(32, p.sunDir); w3(36, p.moonDir);

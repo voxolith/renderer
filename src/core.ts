@@ -23,6 +23,12 @@ export type { DirtyBox } from "./box";
 export { makeCamera, firstPersonFrame, chaseFrame } from "./camera";
 export type { CameraFrame, CameraConfig, ChaseOptions } from "./camera";
 
+export { MAX_LIGHTS, packLights } from "./lights";
+export type { PointLight } from "./lights";
+
+export { dayNight } from "./daynight";
+export type { DayNightOptions, Lighting } from "./daynight";
+
 export { makePerf } from "./perf";
 export type { Perf, PerfOptions } from "./perf";
 

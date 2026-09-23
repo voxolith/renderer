@@ -10,6 +10,7 @@ import package::ao::faceAO;
 import package::background::background;
 import package::highlight::highlightEdge;
 import package::materials::matOf;
+import package::lights::{pointLighting, lightGlow};
 
 struct VsOut {
   @builtin(position) pos : vec4<f32>,
@@ -32,7 +33,8 @@ fn traceLit(ro : vec3<f32>, rd : vec3<f32>) -> vec3<f32> {
   let ndl = max(dot(n, L), 0.0);
   let up = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
   let ambient = mix(U.ambientGround, U.ambientSky, up) * 0.85;
-  var c = h.color * (ambient + ndl * 0.6 * U.lightColor);
+  let p = vec3<f32>(h.cell) + vec3<f32>(0.5) + n * 0.5;
+  var c = h.color * (ambient + ndl * 0.6 * U.lightColor + pointLighting(p, n, false));
   if (U.materialsEnabled > 0.5) { c += h.color * matOf(h.mat).emit; }
   return c;
 }
@@ -64,12 +66,12 @@ fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
   let box = intersectBox(ro, dir);
   let tNear = max(box.x, 0.0);
   if (box.y < tNear) {
-    return vec4<f32>(background(ro, dir, vec2<f32>(uv.x, -uv.y)), 1.0);
+    return vec4<f32>(background(ro, dir, vec2<f32>(uv.x, -uv.y)) + lightGlow(ro, dir, 1e6), 1.0);
   }
 
   let h = traverse(ro, dir, tNear);
   if (!h.hit) {
-    return vec4<f32>(background(ro, dir, vec2<f32>(uv.x, -uv.y)), 1.0);
+    return vec4<f32>(background(ro, dir, vec2<f32>(uv.x, -uv.y)) + lightGlow(ro, dir, 1e6), 1.0);
   }
 
   let L = normalize(U.lightDir);
@@ -98,6 +100,10 @@ fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
 
   // Key light tinted by the sun/moon colour.
   var color = h.color * (ambient + (ndl * 0.55 * shadow + fill) * U.lightColor) * ao;
+  // Point lights, each with its own range-limited shadow ray.
+  if (U.lightCount > 0.5) {
+    color += h.color * pointLighting(hitCenter, n, true) * ao;
+  }
 
   // Material shading (emissive / metal reflection / glass transmission). Gated by
   // materialsEnabled so flat-palette scenes are byte-for-byte unchanged.
@@ -143,6 +149,11 @@ fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
       let g = dot(color, vec3<f32>(0.299, 0.587, 0.114));
       color = mix(vec3<f32>(g), color, 0.12) * 0.5;
     }
+  }
+
+  // Lamps in front of the hit glow over it.
+  if (U.lightCount > 0.5) {
+    color += lightGlow(ro, dir, length(hitCenter - ro));
   }
 
   // Subtle vignette.
