@@ -23,12 +23,6 @@ export type { DirtyBox } from "./box";
 export { makeCamera, firstPersonFrame, chaseFrame } from "./camera";
 export type { CameraFrame, CameraConfig, ChaseOptions } from "./camera";
 
-export { makeOrbitControl } from "./orbitControl";
-export type { OrbitControl } from "./orbitControl";
-
-export { makePanControl } from "./panControl";
-export type { PanControl, PanOptions } from "./panControl";
-
 export { makePerf } from "./perf";
 export type { Perf, PerfOptions } from "./perf";
 

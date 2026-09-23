@@ -99,7 +99,9 @@ Grouped as in `src/index.ts`:
 - **Formats**: `parseVox`, `writeVox`, `parseVoxScene`, `decodeVoxRotation`, `voxSceneAnimator`,
   `packMaterials`, `buildMinecraftRegion`
 - **Acceleration**: `OccupancyGrid`, `COARSE_B`, `GridStamper` (`stamp` for movers, `writeBase` for permanent edits such as carving or rubble)
-- **Cameras and input**: `makeCamera`, `firstPersonFrame`, `chaseFrame`, `makeOrbitControl`, `makePanControl`
+- **Cameras**: `makeCamera`, `firstPersonFrame`, `chaseFrame`. Input (orbit and first-person
+  controllers, gestures, keys, gamepad, touch controls) lives in
+  [`@voxolith/engine/input`](https://github.com/voxolith/engine#input); the renderer only draws.
 - **Effects**: `makeExplosion`, `makeMuzzleFlash`
 - **Utilities**: `rayAABB`, `makeRay`, `voxelRaycast` (CPU DDA for hit tests), `seededRandom` / `hashSeed`, `makePerf` (adaptive render scale + overlay)
 
@@ -117,8 +119,8 @@ Everything below is a runtime knob; nothing needs a rebuild.
   these. `initGpu(canvas, { maxPixelRatio: 1 })` caps HiDPI; `makePerf({ minScale, targetMs })`
   adapts the scale to hit a frame-time target, or pin it with `perf.setScale()` or `setRenderScale()`.
 - **Render on demand** (`makeFrameLoop`): a raymarcher redraws the whole screen every frame, so
-  only render when something changed. Call `loop.invalidate()` from your controls (the built-in
-  orbit and pan controls take an `onChange` callback), `observeResize(canvas, loop)` for viewport
+  only render when something changed. Call `loop.invalidate()` from your controls (the engine's
+  input takes the loop and does it for you), `observeResize(canvas, loop)` for viewport
   changes, and `loop.setContinuous(true)` only while something animates.
 - **Adapter check**: `gpu.adapterInfo` is what the browser reported and `gpu.software` is true for
   CPU implementations (SwiftShader, llvmpipe, lavapipe, fallback adapters). `initGpu` logs the
@@ -138,11 +140,12 @@ const loop = makeFrameLoop({
     perf.frame(now);
     gpu.renderScale = perf.scale();
     resizeToDisplay(gpu);
-    renderer.render({ ...camera(orbit.yaw()), ...ENV });
+    renderer.render({ ...camera(orbit.yaw(), orbit.distance(), undefined, orbit.pitch()), ...ENV });
   },
 });
 observeResize(canvas, loop);
-const orbit = makeOrbitControl(canvas, { start: 35, min: -180, max: 180, onChange: () => loop.invalidate() });
+// From @voxolith/engine/input: every input event invalidates the loop.
+const orbit = makeOrbitController(createInput(canvas, { loop }), { distance: 120, distanceLimits: [20, 600] });
 loop.invalidate();
 ```
 
