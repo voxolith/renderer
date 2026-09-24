@@ -486,6 +486,42 @@ export class Renderer {
     this.uploadSlots(edit.slots4, edit.slots8);
   }
 
+  /**
+   * Edit many separate boxes (typically single bricks) with one upload at the
+   * end, instead of one per box. What moving things need: a crowd touches a
+   * few thousand scattered bricks a frame, and a box around all of them would
+   * visit most of the world.
+   */
+  editMany(boxes: readonly DirtyBox[], fill: (cells: Uint8Array, ox: number, oy: number, oz: number) => boolean): void {
+    if (!boxes.length) return;
+    const index: DirtyBox[] = [];
+    const slots4: number[] = [], slots8: number[] = [];
+    for (const box of boxes) {
+      const edit = this.bricks.editBox(box, fill);
+      if (edit.index) index.push(edit.index);
+      for (const s of edit.slots4) slots4.push(s);
+      for (const s of edit.slots8) slots8.push(s);
+    }
+    if (this.growPools()) {
+      this.uploadIndex();
+      return;
+    }
+    // Index regions are merged per 4x4x4-brick tile: one tiny upload per
+    // tile touched, rather than one per brick or one box around a whole crowd.
+    const tiles = new Map<number, DirtyBox>();
+    for (const b of index) {
+      const key = (b.x0 >> 2) + (b.y0 >> 2) * 4096 + (b.z0 >> 2) * 16777216; // exact: brick dims are far below 4096 * 4
+      const t = tiles.get(key);
+      if (!t) tiles.set(key, { ...b });
+      else {
+        t.x0 = Math.min(t.x0, b.x0); t.y0 = Math.min(t.y0, b.y0); t.z0 = Math.min(t.z0, b.z0);
+        t.x1 = Math.max(t.x1, b.x1); t.y1 = Math.max(t.y1, b.y1); t.z1 = Math.max(t.z1, b.z1);
+      }
+    }
+    for (const t of tiles.values()) this.uploadIndex(t);
+    this.uploadSlots(slots4, slots8);
+  }
+
   /** Free every brick in `box` — see BrickGrid.clearBox. */
   clear(box: DirtyBox): void {
     const edit = this.bricks.clearBox(box);
