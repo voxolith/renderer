@@ -14,6 +14,8 @@ import backgroundWesl from "./shaders/background.wesl?raw";
 import materialsWesl from "./shaders/materials.wesl?raw";
 import lightsWesl from "./shaders/lights.wesl?raw";
 import waterWesl from "./shaders/water.wesl?raw";
+import fogWesl from "./shaders/fog.wesl?raw";
+import precipWesl from "./shaders/precip.wesl?raw";
 import raymarchWesl from "./shaders/raymarch.wesl?raw";
 import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
@@ -21,6 +23,7 @@ import type { DirtyBox } from "./box";
 export type { DirtyBox };
 import { BrickGrid, BRICK_B, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS } from "./brick";
 import { LIGHT_FLOATS, MAX_LIGHTS, packLights, type PointLight } from "./lights";
+import type { AtmosphereParams } from "./atmosphere";
 
 // WESL modules of the raymarch pass, linked once into the final WGSL. Keys are
 // the modules' relative paths (./foo.wesl → import path `package::foo`).
@@ -38,6 +41,8 @@ const WESL_SRC: Record<string, string> = {
   "./materials.wesl": materialsWesl,
   "./lights.wesl": lightsWesl,
   "./water.wesl": waterWesl,
+  "./fog.wesl": fogWesl,
+  "./precip.wesl": precipWesl,
   "./raymarch.wesl": raymarchWesl,
 };
 
@@ -54,10 +59,10 @@ export function raymarchShaderCode(): Promise<string> {
   return shaderCodePromise;
 }
 
-// Uniform buffer layout: 104 f32 (416 bytes). See struct Uniforms in the shader
+// Uniform buffer layout: 132 f32 (528 bytes). See struct Uniforms in the shader
 // for the exact float map (camera 0..31, environment/sky 32..71, occ/coarse
-// 76..91, optional ground-plane floor 92..103).
-const UNIFORM_FLOATS = 104;
+// 76..91, optional ground-plane floor 92..103, atmosphere 104..131).
+const UNIFORM_FLOATS = 132;
 
 /** Minimal scene data the renderer needs to build/upload the voxel grid. */
 export interface RenderScene {
@@ -82,7 +87,7 @@ export interface RenderTarget {
 
 type Vec3 = [number, number, number];
 
-export interface FrameParams {
+export interface FrameParams extends AtmosphereParams {
   // Camera (from camera.ts).
   camPos: Vec3;
   camRight: Vec3;
@@ -663,6 +668,17 @@ export class Renderer {
     u[93] = this.floor.y;
     w3(96, this.floor.colorA);
     w3(100, this.floor.colorB);
+    // Atmosphere (104..131); every effect is off at zero.
+    const fog = p.fog, cl = p.clouds, pr = p.precipitation, sf = p.surface;
+    w3(104, fog?.color ?? [0, 0, 0]); u[107] = fog ? Math.max(0, fog.density) : 0;
+    w3(108, cl?.color ?? [0, 0, 0]); u[111] = cl ? Math.max(0, Math.min(1, cl.cover)) : 0;
+    w3(112, pr?.fall ?? [0, -1, 0]); u[115] = pr ? Math.max(0, Math.min(1, pr.density)) : 0;
+    w3(116, pr?.color ?? [0.8, 0.82, 0.86]); u[119] = pr ? (pr.kind === "snow" ? 2 : 1) : 0;
+    w3(120, sf?.coverColor ?? [0.92, 0.94, 0.97]); u[123] = sf ? Math.max(0, Math.min(1, sf.cover)) : 0;
+    u[124] = sf ? Math.max(0, Math.min(1, sf.wet)) : 0;
+    u[125] = fog?.heightFalloff ?? 0;
+    u[126] = cl?.drift[0] ?? 0; u[127] = cl?.drift[1] ?? 0;
+    u[128] = p.waterWind?.[0] ?? 0; u[129] = p.waterWind?.[1] ?? 0;
 
     const { device } = this.gpu;
     device.queue.writeBuffer(this.uniformBuffer, 0, u);

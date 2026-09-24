@@ -103,8 +103,9 @@ Grouped as in `src/index.ts`:
   controllers, gestures, keys, gamepad, touch controls) lives in
   [`@voxolith/engine/input`](https://github.com/voxolith/engine#input); the renderer only draws.
 - **Lighting**: `renderer.setLights()` (point lights with range-limited shadows and a visible
-  glow, up to `MAX_LIGHTS`), `dayNight(phase)` (every lighting field of `FrameParams` from a time
-  of day)
+  glow, up to `MAX_LIGHTS`)
+- **Atmosphere**: optional `FrameParams` fields `fog`, `clouds`, `precipitation`, `surface`,
+  `waterWind` (types `AtmosphereParams` and friends)
 - **Effects**: `makeExplosion`, `makeMuzzleFlash`
 - **Utilities**: `rayAABB`, `makeRay`, `voxelRaycast` (CPU DDA for hit tests), `seededRandom` / `hashSeed`, `makePerf` (adaptive render scale + overlay)
 
@@ -181,14 +182,30 @@ the scene by Fresnel, refract down to the bed (found by a second walk that treat
 fade into the water's colour with depth (`att`) and catch moving caustics. The water stays voxels,
 so it streams, clips and edits like everything else.
 
-`dayNight(phase)` returns the lighting half of `FrameParams`: 0 is midnight, 0.25 sunrise, 0.5 noon
-and 0.75 sunset. By day the key light follows the sun; at night it becomes a dim blue moonlight
-and the ambient drops low enough for point lights to carry the scene. The sun and moon discs
-only paint the sky; they do not light anything themselves. Animate `phase` for a transition.
+The sun and moon discs only paint the sky; the key light, its colour and the ambient do the
+lighting. Turning a time of day into those values is not the renderer's job: see `timeOfDay` in
+[`@voxolith/engine/atmosphere`](https://github.com/voxolith/engine#atmosphere).
 
-```ts
-renderer.render({ ...camera(yaw), ...dayNight(0.5) }); // noon
-```
+## Atmosphere
+
+Raw effects, each off until its amount is above zero, so a scene that sets none renders as
+before. The renderer knows nothing about weather; `@voxolith/engine/atmosphere` turns "rain" or
+"a blizzard" into these.
+
+- `fog`: exponential extinction towards a colour, optionally thinning with height; applied to
+  hits by distance and to the sky, so the horizon dissolves.
+- `clouds`: a drifting noise layer over the sky gradient; `cover` 1 is overcast and hides the sun,
+  moon and stars.
+- `precipitation`: rain streaks or snowflakes as analytic particles along each primary ray,
+  stopped by whatever the ray hit (so roofs and trees occlude them), tilted by `fall`, never
+  uploaded and unlimited in extent. Particles are kept at least a pixel wide at distance.
+- `surface`: `wet` darkens the ground and adds a sheen to upward faces; `cover` blends upward
+  faces towards a snow colour. On medium and high quality a short upward ray keeps it off ground
+  under canopies and roofs; `low` skips that ray.
+- `waterWind`: drifts and raises the ripples on water.
+
+Cost: fog and clouds are a few arithmetic ops per pixel; precipitation is 8 hash samples; snow
+shelter is one short ray per upward pixel while `cover > 0`.
 
 ## Development
 

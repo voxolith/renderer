@@ -48,6 +48,17 @@ struct Uniforms {
   _f0          : vec2<f32>,             // 94,95  pad
   floorColorA  : vec3<f32>, _f1 : f32,  // 96-99
   floorColorB  : vec3<f32>, _f2 : f32,  // 100-103
+  // --- atmosphere (all off at zero; see src/atmosphere.ts) ---
+  fogColor     : vec3<f32>, fogDensity : f32,     // 104-107
+  cloudColor   : vec3<f32>, cloudCover : f32,     // 108-111
+  precipFall   : vec3<f32>, precipDensity : f32,  // 112-115  fall velocity, voxels/s
+  precipColor  : vec3<f32>, precipKind : f32,     // 116-119  0 none, 1 rain, 2 snow
+  coverColor   : vec3<f32>, cover : f32,          // 120-123
+  wet          : f32,                             // 124
+  fogFalloff   : f32,                             // 125
+  cloudDrift   : vec2<f32>,                       // 126,127
+  waterWind    : vec2<f32>,                       // 128,129
+  _w0          : vec2<f32>,                       // 130,131
 };
 
 @group(0) @binding(0) var<uniform> U : Uniforms;

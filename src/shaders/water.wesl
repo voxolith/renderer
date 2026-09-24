@@ -21,11 +21,14 @@ fn ripple(p : vec2<f32>, t : f32) -> f32 {
        + 0.025 * sin(dot(p, vec2<f32>(0.47, -0.36)) + t * 2.7);
 }
 
-fn rippleNormal(p : vec2<f32>, t : f32) -> vec3<f32> {
+fn rippleNormal(p0 : vec2<f32>, t : f32) -> vec3<f32> {
+  // Wind drifts the pattern downwind and raises it.
+  let p = p0 - U.waterWind * t * 1.5;
+  let gust = 1.0 + length(U.waterWind) * 1.2;
   let e = 0.35;
   let dx = ripple(p + vec2<f32>(e, 0.0), t) - ripple(p - vec2<f32>(e, 0.0), t);
   let dz = ripple(p + vec2<f32>(0.0, e), t) - ripple(p - vec2<f32>(0.0, e), t);
-  return normalize(vec3<f32>(-dx / (2.0 * e) * 4.0, 1.0, -dz / (2.0 * e) * 4.0));
+  return normalize(vec3<f32>(-dx / (2.0 * e) * 4.0 * gust, 1.0, -dz / (2.0 * e) * 4.0 * gust));
 }
 
 // Bright moving lines on the bed where the ripples focus the light.

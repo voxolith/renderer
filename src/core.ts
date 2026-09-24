@@ -26,8 +26,7 @@ export type { CameraFrame, CameraConfig, ChaseOptions } from "./camera";
 export { MAX_LIGHTS, packLights } from "./lights";
 export type { PointLight } from "./lights";
 
-export { dayNight } from "./daynight";
-export type { DayNightOptions, Lighting } from "./daynight";
+export type { AtmosphereParams, CloudParams, FogParams, PrecipitationParams, SurfaceParams } from "./atmosphere";
 
 export { makePerf } from "./perf";
 export type { Perf, PerfOptions } from "./perf";

@@ -12,6 +12,9 @@ import package::highlight::highlightEdge;
 import package::materials::matOf;
 import package::lights::{pointLighting, lightGlow};
 import package::water::shadeWater;
+import package::fog::{applyFog, applySkyFog};
+import package::precip::precipitation;
+import package::shadow::occludedTo;
 
 struct VsOut {
   @builtin(position) pos : vec4<f32>,
@@ -38,6 +41,15 @@ fn traceLit(ro : vec3<f32>, rd : vec3<f32>) -> vec3<f32> {
   var c = h.color * (ambient + ndl * 0.6 * U.lightColor + pointLighting(p, n, false));
   if (U.materialsEnabled > 0.5) { c += h.color * matOf(h.mat).emit; }
   return c;
+}
+
+// A ray that hits nothing: sky (or the optional floor), lamp glows, fog and
+// the rain or snow in front of it.
+fn missColor(ro : vec3<f32>, rd : vec3<f32>, uv : vec2<f32>) -> vec3<f32> {
+  var c = background(ro, rd, uv) + lightGlow(ro, rd, 1e6);
+  c = applySkyFog(c, ro, rd);
+  let pr = precipitation(ro, rd, 1e6);
+  return mix(c, pr.rgb, pr.a);
 }
 
 // Fullscreen triangle.
@@ -67,12 +79,12 @@ fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
   let box = intersectBox(ro, dir);
   let tNear = max(box.x, 0.0);
   if (box.y < tNear) {
-    return vec4<f32>(background(ro, dir, vec2<f32>(uv.x, -uv.y)) + lightGlow(ro, dir, 1e6), 1.0);
+    return vec4<f32>(missColor(ro, dir, vec2<f32>(uv.x, -uv.y)), 1.0);
   }
 
   let h = traverse(ro, dir, tNear);
   if (!h.hit) {
-    return vec4<f32>(background(ro, dir, vec2<f32>(uv.x, -uv.y)) + lightGlow(ro, dir, 1e6), 1.0);
+    return vec4<f32>(missColor(ro, dir, vec2<f32>(uv.x, -uv.y)), 1.0);
   }
 
   let L = normalize(U.lightDir);
@@ -99,11 +111,37 @@ fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
   // Soft fill from the camera side so the shadowed half doesn't go muddy.
   let fill = max(dot(n, -U.camFwd), 0.0) * 0.14;
 
+  // Surface state: wet ground is darker; settled snow covers upward faces
+  // that are open to the sky. Water is neither.
+  let isWater = U.materialsEnabled > 0.5 && abs(matOf(h.mat).kind - 4.0) < 0.5;
+  var albedo = h.color;
+  var coverAmt = 0.0;
+  if (!isWater) {
+    if (U.cover > 0.0 && n.y > 0.5) {
+      let jitter = hash31(vec3<f32>(f32(h.cell.x), 0.0, f32(h.cell.z))) - 0.5;
+      coverAmt = smoothstep(0.1, 0.7, U.cover + jitter * 0.35);
+      // Sheltered ground (under a canopy or a roof) stays mostly bare. The
+      // upward check costs a short ray, so it follows the shadow budget.
+      if (coverAmt > 0.0 && U.shadowSteps > 0.5 && occludedTo(hitCenter, vec3<f32>(0.0, 1.0, 0.0), 48.0)) {
+        coverAmt *= 0.12;
+      }
+      albedo = mix(albedo, U.coverColor, coverAmt);
+    }
+    if (U.wet > 0.0) {
+      albedo *= 1.0 - 0.3 * U.wet * (1.0 - coverAmt);
+    }
+  }
+
   // Key light tinted by the sun/moon colour.
-  var color = h.color * (ambient + (ndl * 0.55 * shadow + fill) * U.lightColor) * ao;
+  var color = albedo * (ambient + (ndl * 0.55 * shadow + fill) * U.lightColor) * ao;
   // Point lights, each with its own range-limited shadow ray.
   if (U.lightCount > 0.5) {
-    color += h.color * pointLighting(hitCenter, n, true) * ao;
+    color += albedo * pointLighting(hitCenter, n, true) * ao;
+  }
+  // Wet upward faces pick up a soft sheen from the key light.
+  if (U.wet > 0.0 && !isWater && n.y > 0.5) {
+    let sheen = pow(max(dot(reflect(dir, n), L), 0.0), 24.0);
+    color += U.lightColor * sheen * 0.35 * U.wet * shadow * (1.0 - coverAmt);
   }
 
   // Material shading (emissive / metal reflection / glass transmission). Gated by
@@ -162,9 +200,15 @@ fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
   }
 
   // Lamps in front of the hit glow over it.
+  let tHit = length(hitCenter - ro);
   if (U.lightCount > 0.5) {
-    color += lightGlow(ro, dir, length(hitCenter - ro));
+    color += lightGlow(ro, dir, tHit);
   }
+
+  // Atmosphere in front of the hit: fog, then falling rain or snow.
+  color = applyFog(color, ro, dir, tHit);
+  let pr = precipitation(ro, dir, tHit);
+  color = mix(color, pr.rgb, pr.a);
 
   // Subtle vignette.
   let v = 1.0 - 0.16 * dot(uv, uv);
