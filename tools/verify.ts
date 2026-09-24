@@ -5,6 +5,7 @@
 import { BrickGrid, BRICK_B, PALETTE_ENTRIES } from "../src/brick";
 import { OccupancyGrid } from "../src/occupancy";
 import { seededRandom } from "../src/random";
+import { makePerf } from "../src/perf";
 
 let failed = 0;
 let checks = 0;
@@ -163,6 +164,38 @@ console.log("brick storage:");
     `  terrain sample: ${st.used} bricks, ${st.wide} wide, ` +
       `${(st.payloadBytes / 1024).toFixed(0)} KB payload vs ${(st.denseBytes / 1024).toFixed(0)} KB dense`,
   );
+}
+
+console.log("adaptive render scale:");
+{
+  // A GPU whose frame cost grows with the pixel count, behind a 60 Hz vsync:
+  // rAF only reports whole refresh intervals, so a 17 ms frame shows as 33 ms.
+  // A controller that climbs whenever it sees 16.7 ms and drops when it sees
+  // 33 ms hunts between two scales forever, and every change resamples the
+  // image — a visible shimmer on a still scene.
+  const simulate = (costAtFull: number, seconds: number, retryAfterMs?: number) => {
+    const perf = makePerf({ enabled: false, scale: 0.5, minScale: 0.3, maxScale: 1, retryAfterMs });
+    const vsync = 1000 / 60;
+    let now = 0, changes = 0, lateChanges = 0, prev = perf.scale();
+    while (now < seconds * 1000) {
+      const cost = costAtFull * perf.scale() * perf.scale();
+      now += Math.ceil(cost / vsync - 1e-9) * vsync;
+      perf.frame(now);
+      if (perf.scale() !== prev) {
+        changes++;
+        if (now > 20000 && now < 50000) lateChanges++;
+        prev = perf.scale();
+      }
+    }
+    return { scale: perf.scale(), changes, lateChanges };
+  };
+  const r = simulate(28, 60);
+  ok(r.lateChanges <= 2, `settles instead of hunting: ${r.lateChanges} scale changes between 20 s and 50 s`, `ended at ${r.scale}`);
+  ok(r.scale >= 0.6 && 28 * r.scale * r.scale <= 1000 / 60, `and settles near the best scale that fits the frame (${r.scale})`);
+  const still = simulate(28, 60, Infinity);
+  ok(still.lateChanges === 0, `with timed retries off, a still view never changes scale once settled (${still.lateChanges})`);
+  const fast = simulate(8, 20);
+  ok(fast.scale === 1, "a cheap scene still climbs to full resolution");
 }
 
 console.log(`\n${failed ? `${failed} of ${checks} checks FAILED` : `ALL ${checks} CHECKS PASSED`}`);

@@ -11,6 +11,12 @@ export interface Perf {
   scale(): number;
   /** Pin the scale (adaptation continues from here). */
   setScale(s: number): void;
+  /**
+   * Forget which scales proved too slow, so the controller may try them
+   * again. Call it when the view moves (a probe is invisible then), and pass
+   * `retryAfterMs: Infinity` so a still view never re-probes on its own.
+   */
+  reprobe(): void;
   /** Smoothed frame time in ms. */
   frameMs(): number;
   /** Change the overlay's extra label (e.g. adapter name). */
@@ -29,6 +35,14 @@ export interface PerfOptions {
   targetMs?: number;
   /** How often the controller may change the scale (default 500 ms). */
   adaptEveryMs?: number;
+  /**
+   * After a step up proves too slow, that scale is off limits for this long
+   * (default 30 s). Frame times arrive in whole vsync intervals, so a frame
+   * that fits reads the same as one with room to spare; without this memory
+   * the controller climbs, misses, drops and climbs again every second, and
+   * each change visibly resamples the image.
+   */
+  retryAfterMs?: number;
   /** Fixed scale: disables adaptation when true. */
   locked?: boolean;
   /**
@@ -49,6 +63,11 @@ export function makePerf(opts: PerfOptions): Perf {
   const targetMs = opts.targetMs ?? 1000 / 60;
   const adaptEvery = opts.adaptEveryMs ?? 500;
   const maxSample = opts.maxSampleMs ?? 250;
+  const retryAfter = opts.retryAfterMs ?? 30000;
+  const STEP = 0.05;
+  /** Lowest scale known to be too slow, and when that was learnt. */
+  let ceiling = Infinity;
+  let ceilingAt = 0;
   let scale = Math.max(minScale, Math.min(maxScale, opts.scale));
   let label = opts.label ?? "";
   let emaMs = targetMs;
@@ -80,12 +99,21 @@ export function makePerf(opts: PerfOptions): Perf {
 
     if (!opts.locked && samples >= 8 && now - lastAdapt > adaptEvery) {
       lastAdapt = now;
+      if (ceiling !== Infinity && now - ceilingAt > retryAfter) ceiling = Infinity;
       if (emaMs > targetMs * 1.25 && scale > minScale) {
-        // Over budget: drop proportionally (resolution cost is ~quadratic in scale).
-        const want = scale * Math.sqrt(targetMs / emaMs);
-        scale = Math.max(minScale, round(Math.min(scale - 0.05, want)));
-      } else if (emaMs < targetMs * 1.05 && scale < maxScale) {
-        scale = Math.min(maxScale, round(scale + 0.05));
+        // Over budget: remember this scale was too much, then drop
+        // proportionally (resolution cost is ~quadratic in scale).
+        ceiling = Math.min(ceiling, scale);
+        ceilingAt = now;
+        // Under vsync a frame that barely misses reads as two intervals, so a
+        // reading up to about twice the budget means "just over": one step.
+        // Only a clearly slower frame justifies a proportional cut.
+        const want = emaMs < targetMs * 2.3 ? scale - STEP : scale * Math.sqrt(targetMs / emaMs);
+        scale = Math.max(minScale, round(Math.min(scale - STEP, want)));
+        samples = 0; // judge the new scale on its own frames
+      } else if (emaMs < targetMs * 1.05 && scale < maxScale && round(scale + STEP) < ceiling - 1e-6) {
+        scale = Math.min(maxScale, round(scale + STEP));
+        samples = 0;
       }
     }
 
@@ -101,6 +129,10 @@ export function makePerf(opts: PerfOptions): Perf {
     scale: () => scale,
     setScale: (s) => {
       scale = Math.max(minScale, Math.min(maxScale, s));
+      ceiling = Infinity; // an explicit choice clears what was learnt
+    },
+    reprobe: () => {
+      ceiling = Infinity;
     },
     frameMs: () => emaMs,
     setLabel: (l) => {
