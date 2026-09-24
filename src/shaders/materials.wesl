@@ -1,6 +1,6 @@
 // Per-palette-slot material lookup. The host packs 256 × 2 vec4 into the
 // `materials` storage buffer (uniforms.wesl binding 4); this decodes one slot.
-//   a = (kind, rough, metal, emit)   kind: 0 diffuse, 1 metal, 2 glass, 3 emit
+//   a = (kind, rough, metal, emit)   kind: 0 diffuse, 1 metal, 2 glass, 3 emit, 4 water
 //   b = (ior, alpha, att, spec)      alpha: opacity (glass < 1)
 
 import package::uniforms::materials;

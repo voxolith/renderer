@@ -13,6 +13,7 @@ import aoWesl from "./shaders/ao.wesl?raw";
 import backgroundWesl from "./shaders/background.wesl?raw";
 import materialsWesl from "./shaders/materials.wesl?raw";
 import lightsWesl from "./shaders/lights.wesl?raw";
+import waterWesl from "./shaders/water.wesl?raw";
 import raymarchWesl from "./shaders/raymarch.wesl?raw";
 import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
@@ -36,6 +37,7 @@ const WESL_SRC: Record<string, string> = {
   "./background.wesl": backgroundWesl,
   "./materials.wesl": materialsWesl,
   "./lights.wesl": lightsWesl,
+  "./water.wesl": waterWesl,
   "./raymarch.wesl": raymarchWesl,
 };
 
@@ -102,6 +104,8 @@ export interface FrameParams {
   nightFactor: number;
   sunIntensity: number;
   moonIntensity: number;
+  /** Seconds, for animated materials (water ripples). Leave it constant and nothing moves. */
+  time?: number;
 }
 
 /** Optional infinite ground-plane drawn on ray-miss below `y` (off by default). */
@@ -629,7 +633,7 @@ export class Renderer {
     u[12] = p.camFwd[0]; u[13] = p.camFwd[1]; u[14] = p.camFwd[2];
     u[15] = p.tanHalfFov;
     u[16] = this.gridSize[0]; u[17] = this.gridSize[1]; u[18] = this.gridSize[2];
-    u[19] = 0;
+    u[19] = p.time ?? 0;
     u[20] = p.lightDir[0]; u[21] = p.lightDir[1]; u[22] = p.lightDir[2];
     u[23] = width / height;
     u[24] = width; u[25] = height;

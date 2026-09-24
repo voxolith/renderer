@@ -175,6 +175,12 @@ loop.invalidate();
 - Metal and glass reflections pick up the lights, unshadowed.
 - `setLights` rewrites a 1.5 KB buffer, so moving a lamp every frame is cheap.
 
+**Water** is a material kind, not a separate system: voxels whose material is `water` (kind 4)
+ripple over time (pass `time` in seconds in `FrameParams`; a constant time freezes them), reflect
+the scene by Fresnel, refract down to the bed (found by a second walk that treats water as empty),
+fade into the water's colour with depth (`att`) and catch moving caustics. The water stays voxels,
+so it streams, clips and edits like everything else.
+
 `dayNight(phase)` returns the lighting half of `FrameParams`: 0 is midnight, 0.25 sunrise, 0.5 noon
 and 0.75 sunset. By day the key light follows the sun; at night it becomes a dim blue moonlight
 and the ambient drops low enough for point lights to carry the scene. The sun and moon discs

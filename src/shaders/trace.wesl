@@ -5,6 +5,7 @@
 import package::uniforms::{U, palette};
 import package::grid::{sampleVoxel, coarseSolid};
 import package::dda::{stepMask, seedSideDist, skipBlock};
+import package::materials::matOf;
 
 struct Hit {
   hit    : bool,
@@ -26,6 +27,16 @@ struct Hit {
 const MAX_STEPS : i32 = 4096;
 
 fn traverse(ro : vec3<f32>, rd : vec3<f32>, tStart : f32) -> Hit {
+  return walk(ro, rd, tStart, false);
+}
+
+// The same walk, but water voxels count as empty: what a ray that has entered
+// water sees below the surface (the bed, a sunken rock, the far bank).
+fn traverseUnderWater(ro : vec3<f32>, rd : vec3<f32>, tStart : f32) -> Hit {
+  return walk(ro, rd, tStart, true);
+}
+
+fn walk(ro : vec3<f32>, rd : vec3<f32>, tStart : f32, skipWater : bool) -> Hit {
   var h : Hit;
   h.hit = false;
 
@@ -52,7 +63,8 @@ fn traverse(ro : vec3<f32>, rd : vec3<f32>, tStart : f32) -> Hit {
       continue;
     }
     let c = sampleVoxel(cell);
-    if (c != 0u) {
+    let water = skipWater && U.materialsEnabled > 0.5 && c != 0u && abs(matOf(c).kind - 4.0) < 0.5;
+    if (c != 0u && !water) {
       h.hit = true;
       h.cell = cell;
       h.normal = normal;

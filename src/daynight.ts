@@ -1,7 +1,7 @@
 // Day and night: every lighting field of FrameParams from one number.
 //
 // `phase` runs 0..1 over a day: 0 midnight, 0.25 sunrise, 0.5 noon, 0.75
-// sunset. The sun rises in +X, arcs overhead and sets in -X, tilted towards +Z;
+// sunset. The sun rises in +X and sets in -X on a tilted arc towards +Z;
 // the moon is opposite. By day the key light follows the sun (never lower than
 // a flattering elevation); at night it becomes a dim blue moonlight, and the
 // ambient drops low enough for point lights to carry the scene. Around dusk
@@ -55,8 +55,10 @@ export function dayNight(phase: number, opts: DayNightOptions = {}): Lighting {
   const p = ((phase % 1) + 1) % 1;
   const a = (p - 0.25) * Math.PI * 2;
   const elev = Math.sin(a);
-  const sunDir = norm([Math.cos(a), elev, 0.35]);
-  const moonDir = norm([-Math.cos(a), -elev, -0.35]);
+  // The arc is tilted, as at mid latitudes: the noon sun stands about 55°
+  // up and off to one side, so walls are lit rather than only roofs.
+  const sunDir = norm([Math.cos(a) + 0.35, elev * 0.9, 0.5]);
+  const moonDir = norm([-Math.cos(a) - 0.35, -elev * 0.9, -0.5]);
 
   const dayness = smooth(-0.12, 0.2, elev); // 0 night → 1 day
   const night = 1 - dayness;

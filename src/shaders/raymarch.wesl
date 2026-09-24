@@ -11,6 +11,7 @@ import package::background::background;
 import package::highlight::highlightEdge;
 import package::materials::matOf;
 import package::lights::{pointLighting, lightGlow};
+import package::water::shadeWater;
 
 struct VsOut {
   @builtin(position) pos : vec4<f32>,
@@ -109,6 +110,15 @@ fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
   // materialsEnabled so flat-palette scenes are byte-for-byte unchanged.
   if (U.materialsEnabled > 0.5) {
     let m = matOf(h.mat);
+    // Water: its own shading replaces the diffuse one entirely.
+    if (abs(m.kind - 4.0) < 0.5) {
+      let w = shadeWater(ro, dir, h.cell, n, h.color, m.att);
+      // The reflection is the one bounce this pass allows; skip it when it
+      // would barely show, which is most of a surface seen from above.
+      var reflCol = background(w.point, w.reflectDir, vec2<f32>(0.0));
+      if (w.fresnel > 0.06) { reflCol = traceLit(w.point + w.normal * 0.6, w.reflectDir); }
+      color = mix(w.under, reflCol, clamp(w.fresnel, 0.0, 1.0)) + w.glint * shadow;
+    }
     // Emissive self-glow.
     color += h.color * m.emit;
     // Metal: a single (optionally roughened) reflection bounce.
