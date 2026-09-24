@@ -327,27 +327,33 @@ export class BrickGrid {
   }
 
   /** Encode 512 voxels into the brick at (bxi,byi,bzi); returns its index entry. */
+  private readonly lut = new Uint8Array(256);
+  private readonly used = new Uint8Array(256);
+
   private encodeBrick(bxi: number, byi: number, bzi: number, cells: Uint8Array): number {
     const [bx, by] = this.dim;
     const ii = bxi + byi * bx + bzi * bx * by;
     const prev = this.index[ii];
 
-    const seen = new Map<number, number>(); // value -> palette entry (1-based)
-    let any = false;
+    // Local palette via a reused lookup table (value -> 1-based entry) rather
+    // than a Map: this runs for every brick a moving thing touches, every frame.
+    const lut = this.lut, used = this.used;
+    let count = 0;
     for (let i = 0; i < BRICK_VOXELS; i++) {
       const v = cells[i];
-      if (v === 0) continue;
-      any = true;
-      if (!seen.has(v)) seen.set(v, seen.size + 1);
+      if (v === 0 || lut[v]) continue;
+      used[count++] = v;
+      lut[v] = count;
     }
+    const reset = () => { for (let k = 0; k < count; k++) lut[used[k]] = 0; };
 
-    if (!any) {
+    if (count === 0) {
       this.release(prev);
       this.index[ii] = 0;
       return 0;
     }
 
-    const wide = seen.size > PALETTE_ENTRIES;
+    const wide = count > PALETTE_ENTRIES;
     // Reuse the existing slot when the tier is unchanged, so a repeated edit in
     // one place does not churn the free list.
     let slot: number;
@@ -359,6 +365,7 @@ export class BrickGrid {
     }
 
     if (wide) {
+      reset();
       const base = slot * BRICK_WORDS_8;
       this.voxels8.fill(0, base, base + BRICK_WORDS_8);
       for (let i = 0; i < BRICK_VOXELS; i++) {
@@ -373,15 +380,13 @@ export class BrickGrid {
     const pbase = slot * PALETTE_WORDS;
     this.voxels4.fill(0, vbase, vbase + BRICK_WORDS_4);
     this.palettes.fill(0, pbase, pbase + PALETTE_WORDS);
-    for (const [value, entry] of seen) {
-      const e = entry - 1;
-      this.palettes[pbase + (e >> 1)] |= (value & 0xffff) << ((e & 1) * 16);
-    }
+    for (let e = 0; e < count; e++) this.palettes[pbase + (e >> 1)] |= (used[e] & 0xffff) << ((e & 1) * 16);
     for (let i = 0; i < BRICK_VOXELS; i++) {
       const v = cells[i];
       if (!v) continue;
-      this.voxels4[vbase + (i >> 3)] |= seen.get(v)! << ((i & 7) * 4);
+      this.voxels4[vbase + (i >> 3)] |= lut[v] << ((i & 7) * 4);
     }
+    reset();
     this.index[ii] = slot + 1;
     return this.index[ii];
   }
