@@ -74,11 +74,13 @@ struct Uniforms {
 // instance lists per world top cell, instances and models. The null entries
 // double as the empty-space-skip structure at both levels.
 @group(0) @binding(1) var<storage, read> idx : array<u32>;
-@group(0) @binding(2) var<storage, read> palette : array<vec4<f32>, 256>;
+// Colours by palette slot. World voxels are 8-bit, so they use the first
+// 256; instances map roles to slots (base + r - 1) and may use the rest.
+@group(0) @binding(2) var<storage, read> palette : array<vec4<f32>>;
 // 4-bit brick payloads: 64 u32 per slot, 8 voxels per word.
 @group(0) @binding(3) var<storage, read> brickVox4 : array<u32>;
-// Per-slot materials: 256 × 2 vec4. See materials.wesl for the field packing.
-@group(0) @binding(4) var<storage, read> materials : array<vec4<f32>, 512>;
+// Per-slot materials: 2 vec4 per palette slot. See materials.wesl for the field packing.
+@group(0) @binding(4) var<storage, read> materials : array<vec4<f32>>;
 // Per-brick palettes: 8 u32 per slot, two u16 global indices per word.
 @group(0) @binding(5) var<storage, read> brickPal : array<u32>;
 // 8-bit fallback payloads for bricks with more than 15 distinct values:

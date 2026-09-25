@@ -15,7 +15,7 @@ export {
 } from "./device";
 export type { GpuContext, GpuOptions, AdapterInfo, UnsupportedOpts } from "./device";
 
-export { Renderer, createRenderer, raymarchShaderCode, QUALITY_PRESETS } from "./renderer";
+export { Renderer, createRenderer, raymarchShaderCode, QUALITY_PRESETS, PALETTE_SLOTS } from "./renderer";
 export type {
   RenderScene,
   DirtyBox,

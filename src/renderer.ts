@@ -47,8 +47,14 @@ const WESL_SRC: Record<string, string> = {
   "./raymarch.wesl": raymarchWesl,
 };
 
-// Material storage buffer: 256 slots × 2 vec4 (8 f32 each). See materials.wesl.
-const MATERIAL_FLOATS = 256 * 8;
+/**
+ * Palette slots the GPU holds. World voxels are 8-bit and so use slots below
+ * 256; instanced models map their roles to any slot, which is what lets a
+ * scene of many refined models have more colours than a world could.
+ */
+export const PALETTE_SLOTS = 1024;
+// Material storage buffer: 2 vec4 (8 f32) per slot. See materials.wesl.
+const MATERIAL_FLOATS = PALETTE_SLOTS * 8;
 
 let shaderCodePromise: Promise<string> | null = null;
 /** Link the WESL modules into WGSL (once; cached for all renderers). */
@@ -277,10 +283,10 @@ export class Renderer {
     });
 
     const paletteBuffer = device.createBuffer({
-      size: scene.palette.byteLength,
+      size: PALETTE_SLOTS * 16,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
-    device.queue.writeBuffer(paletteBuffer, 0, scene.palette);
+    device.queue.writeBuffer(paletteBuffer, 0, scene.palette, 0, Math.min(scene.palette.length, PALETTE_SLOTS * 4));
     this.paletteBuffer = paletteBuffer;
 
     // Brick pools, sized with headroom: entities stamped in after construction
@@ -300,7 +306,7 @@ export class Renderer {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
     if (scene.materials) {
-      device.queue.writeBuffer(this.materialBuffer, 0, scene.materials);
+      device.queue.writeBuffer(this.materialBuffer, 0, scene.materials, 0, Math.min(scene.materials.length, MATERIAL_FLOATS));
       this.materialsEnabled = 1;
     } else {
       device.queue.writeBuffer(this.materialBuffer, 0, new Float32Array(MATERIAL_FLOATS));
@@ -426,9 +432,9 @@ export class Renderer {
     });
   }
 
-  /** Re-upload the 256-entry colour palette (e.g. after a carpet swap). */
+  /** Re-upload the colour palette (256 entries, or up to PALETTE_SLOTS). */
   updatePalette(palette: Float32Array): void {
-    this.gpu.device.queue.writeBuffer(this.paletteBuffer, 0, palette);
+    this.gpu.device.queue.writeBuffer(this.paletteBuffer, 0, palette, 0, Math.min(palette.length, PALETTE_SLOTS * 4));
   }
 
   /**
@@ -444,7 +450,7 @@ export class Renderer {
 
   /** Upload per-slot materials (256×8 f32) and enable material shading. */
   updateMaterials(materials: Float32Array): void {
-    this.gpu.device.queue.writeBuffer(this.materialBuffer, 0, materials);
+    this.gpu.device.queue.writeBuffer(this.materialBuffer, 0, materials, 0, Math.min(materials.length, MATERIAL_FLOATS));
     this.materialsEnabled = 1;
   }
 
