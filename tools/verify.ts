@@ -2,7 +2,8 @@
 //
 //   bun run --cwd renderer verify
 
-import { BrickGrid, BRICK_B, PALETTE_ENTRIES } from "../src/brick";
+import { BrickGrid, BrickPool, BRICK_B, NEAR_BIT, PALETTE_ENTRIES } from "../src/brick";
+import { makeSparse, sparseCount, sparseFromDense, sparseGet, sparseSet, sparseToDense } from "../src/sparse";
 import { OccupancyGrid } from "../src/occupancy";
 import { seededRandom } from "../src/random";
 import { makePerf } from "../src/perf";
@@ -130,10 +131,53 @@ console.log("brick storage:");
     data.fill(0);
     bricks.rebuildBox(data, box);
     data.fill(3 + (i % 4));
+    data[0] = 9; // not uniform, so the brick needs a payload slot
     bricks.rebuildBox(data, box);
   }
   ok(bricks.slotCount4 === 1, "clearing and refilling reuses one slot", `slots=${bricks.slotCount4}`);
   ok(bricks.get(1, 2, 3) === 3 + 19 % 4, "  value after reuse is correct");
+}
+
+console.log("two-level index, uniform bricks:");
+{
+  // A tall, wide, empty world costs only its top level.
+  const size: Size = { x: 12800, y: 2048, z: 12800 };
+  const g = new BrickGrid(size);
+  ok(g.top.length === 200 * 32 * 200 && g.stats().blocks === 0, `a 12800x2048x12800 world starts as a ${(g.top.length * 4 / 1048576).toFixed(1)} MB top level`);
+  // Solid ground far apart: blocks appear only where things are.
+  g.editBox({ x0: 0, y0: 0, z0: 0, x1: 63, y1: 15, z1: 63 }, (c) => { c.fill(5); return true; });
+  g.editBox({ x0: 12000, y0: 100, z0: 9000, x1: 12003, y1: 101, z1: 9001 }, (c, ox, oy, oz) => {
+    for (let i = 0; i < 512; i++) { const x = ox + (i & 7), y = oy + ((i >> 3) & 7), z = oz + (i >> 6); if (x >= 12000 && x <= 12003 && y >= 100 && y <= 101 && z >= 9000 && z <= 9001) c[i] = 7; }
+    return true;
+  });
+  const st = g.stats();
+  ok(st.blocks === 2 && st.uniform === 128 && st.used === 129, `two places, two blocks; the solid slab is ${st.uniform} uniform bricks with no payload (${st.used} used)`);
+  ok(g.pool.slots4 === 1 && g.get(10, 3, 10) === 5 && g.get(12001, 100, 9000) === 7 && g.get(12005, 100, 9000) === 0, "  values read back through both levels");
+  g.clearBox({ x0: 11968, y0: 64, z0: 8960, x1: 12031, y1: 127, z1: 9023 });
+  ok(g.stats().blocks === 1 && g.get(12001, 100, 9000) === 0, "  clearing a region frees its block");
+  // Uniform brick edited back to mixed gets a payload again.
+  g.editBox({ x0: 0, y0: 0, z0: 0, x1: 0, y1: 0, z1: 0 }, (c) => { c[0] = 0; return true; });
+  ok(g.get(0, 0, 0) === 0 && g.get(1, 0, 0) === 5 && g.stats().uniform === 127, "  a uniform brick edited becomes a payload brick");
+}
+
+console.log("model grids and sparse volumes:");
+{
+  const size: Size = { x: 40, y: 20, z: 30 };
+  const s = makeSparse(size);
+  for (let x = 5; x < 35; x++) sparseSet(s, x, 3, 12, 2);
+  sparseSet(s, 39, 19, 29, 4);
+  ok(sparseCount(s) === 31 && sparseGet(s, 20, 3, 12) === 2 && sparseGet(s, 39, 19, 29) === 4, "sparse set/get/count");
+  const dense = sparseToDense(s);
+  const back = sparseFromDense(size, dense);
+  ok(back.bricks.size === s.bricks.size && sparseToDense(back).every((v, i) => v === dense[i]), "  dense round trip");
+  const pool = new BrickPool();
+  const world = new BrickGrid({ x: 64, y: 64, z: 64 }, undefined, pool);
+  const model = new BrickGrid(size, dense, pool);
+  const edit = { slots4: [], slots8: [], blocks: [], tops: [] };
+  model.markNear(edit);
+  const near = (bx: number, by: number, bz: number) => (model.entry(bx, by, bz) & NEAR_BIT) !== 0;
+  ok(model.get(20, 3, 12) === 2 && near(0, 1, 1) && near(3, 0, 2) && !near(0, 2, 3), "  a model grid marks empty bricks next to content as near, and only those");
+  ok(world.stats().blocks === 0 && pool.blockCount >= 1, "  grids share one pool of blocks and bricks");
 }
 
 // The sparse form must agree with OccupancyGrid about what is empty, since the

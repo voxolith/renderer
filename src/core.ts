@@ -16,7 +16,9 @@ export { buildMinecraftRegion } from "./formats/minecraft/scene";
 export type { MinecraftScene, MinecraftBuildOpts } from "./formats/minecraft/scene";
 
 export { OccupancyGrid, COARSE_B } from "./occupancy";
-export { BrickGrid, BRICK_B, PALETTE_ENTRIES } from "./brick";
+export { BrickGrid, BrickPool, BRICK_B, TOP_B, PALETTE_ENTRIES, UNIFORM_BIT, NEAR_BIT } from "./brick";
+export { SPARSE_B, makeSparse, sparseGet, sparseSet, sparseDims, sparseFromDense, sparseToDense, sparseCount } from "./sparse";
+export type { SparseVoxels } from "./sparse";
 export type { BrickStats, BrickEdit } from "./brick";
 export type { DirtyBox } from "./box";
 

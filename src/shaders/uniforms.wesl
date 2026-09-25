@@ -59,13 +59,20 @@ struct Uniforms {
   cloudDrift   : vec2<f32>,                       // 126,127
   waterWind    : vec2<f32>,                       // 128,129
   _w0          : vec2<f32>,                       // 130,131
+  // --- index regions (u32 word offsets into idx; see renderer.ts) ---
+  topDim       : vec3<u32>, instanceCount : u32,  // 132-135  world top-level dims
+  blocksOff    : u32, cellOff : u32, listOff : u32, instOff : u32, // 136-139
+  modelsOff    : u32, topsOff : u32, _i0 : u32, _i1 : u32,         // 140-143
 };
 
 @group(0) @binding(0) var<uniform> U : Uniforms;
-// Brick index volume, one texel per 8^3 brick: 0 = empty, else (slot + 1) with
-// bit 31 set when the brick stores 8 bits per voxel instead of 4. It doubles as
-// the empty-space-skip structure, so there is no separate occupancy texture.
-@group(0) @binding(1) var indexTex : texture_3d<u32>;
+// Every index table, in regions (offsets in U): the top levels of the world
+// and of each model (one entry per 64^3 cell: 0 = nothing, else block + 1),
+// index blocks (512 brick entries per block: 0 = empty, else slot + 1 with bit
+// 31 for 8-bit bricks, or bit 30 and a value for a uniform brick), the
+// instance lists per world top cell, instances and models. The null entries
+// double as the empty-space-skip structure at both levels.
+@group(0) @binding(1) var<storage, read> idx : array<u32>;
 @group(0) @binding(2) var<storage, read> palette : array<vec4<f32>, 256>;
 // 4-bit brick payloads: 64 u32 per slot, 8 voxels per word.
 @group(0) @binding(3) var<storage, read> brickVox4 : array<u32>;

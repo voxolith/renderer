@@ -7,8 +7,6 @@
 // because then |rd.x| == |rd.z| for a whole line of pixels and every one of
 // them ties on every step.
 
-import package::grid::COARSE_B;
-
 struct Seed {
   cell     : vec3<i32>,
   sideDist : vec3<f32>,
@@ -33,17 +31,17 @@ fn seedSideDist(cell : vec3<i32>, p : vec3<f32>, rd : vec3<f32>, deltaDist : vec
   return (sign(rd) * (vec3<f32>(cell) - p) + sign(rd) * 0.5 + 0.5) * deltaDist;
 }
 
-// Jump a ray across a provably-empty coarse block, landing on the first cell
-// past the block's exit plane.
+// Jump a ray across a provably-empty block of edge `B` (a brick, or a whole
+// top-level cell), landing on the first cell past the block's exit plane.
 //
 // Only the one axis that actually reaches the plane is stepped. Re-seeding from
 // `ro + rd * (tExit + eps)` instead — a fixed nudge along the ray — also pushes
 // any *other* axis that happens to be grazing its own boundary at that instant
 // across it, so the cell diagonally past the corner is skipped entirely. When
 // that cell is solid the ray passes straight through it.
-fn skipBlock(ro : vec3<f32>, rd : vec3<f32>, cell : vec3<i32>, deltaDist : vec3<f32>) -> Seed {
-  let cc = floor(vec3<f32>(cell) / f32(COARSE_B));
-  let planeF = (cc + step(vec3<f32>(0.0), rd)) * f32(COARSE_B);
+fn skipBlock(ro : vec3<f32>, rd : vec3<f32>, cell : vec3<i32>, deltaDist : vec3<f32>, B : i32) -> Seed {
+  let cc = floor(vec3<f32>(cell) / f32(B));
+  let planeF = (cc + step(vec3<f32>(0.0), rd)) * f32(B);
   let tP = (planeF - ro) / rd;
   let tExit = min(min(tP.x, tP.y), tP.z);
   // Land exactly on the plane, not past it.

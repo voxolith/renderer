@@ -21,7 +21,8 @@ import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
 
 export type { DirtyBox };
-import { BrickGrid, BRICK_B, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS } from "./brick";
+import { BrickGrid, BrickPool, BLOCK_ENTRIES, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS, TOP_B, emptyEdit, type BrickEdit } from "./brick";
+import { sparseDims, type SparseVoxels } from "./sparse";
 import { LIGHT_FLOATS, MAX_LIGHTS, packLights, type PointLight } from "./lights";
 import type { AtmosphereParams } from "./atmosphere";
 
@@ -59,10 +60,53 @@ export function raymarchShaderCode(): Promise<string> {
   return shaderCodePromise;
 }
 
-// Uniform buffer layout: 132 f32 (528 bytes). See struct Uniforms in the shader
-// for the exact float map (camera 0..31, environment/sky 32..71, occ/coarse
-// 76..91, optional ground-plane floor 92..103, atmosphere 104..131).
-const UNIFORM_FLOATS = 132;
+// Uniform buffer layout: 144 words (576 bytes). See struct Uniforms in the shader
+// for the exact map (camera 0..31, environment/sky 32..71, occ/coarse 76..91,
+// optional ground-plane floor 92..103, atmosphere 104..131, index regions
+// 132..143 as u32).
+const UNIFORM_FLOATS = 144;
+
+// The index buffer (binding 1) holds every u32 table the traversal reads, in
+// regions: top levels of the world and of each model, index blocks, the
+// per-top-cell instance lists, instances and models. One buffer keeps the pass
+// within the default limit of 8 storage buffers per stage.
+type RegionName = "tops" | "blocks" | "cells" | "list" | "inst" | "models";
+const REGIONS: RegionName[] = ["tops", "blocks", "cells", "list", "inst", "models"];
+/** u32 words per instance: position, cos, anchor, sin, model, palette base, 2 pad. */
+const INST_WORDS = 12;
+/** u32 words per model: top offset, top dims, size, pad. */
+const MODEL_WORDS = 8;
+/** Instances per top cell list; more are dropped (with a console warning). */
+const MAX_CELL_INSTANCES = 255;
+
+/** A model drawn by instances; see Renderer.addModel. */
+export interface ModelSource {
+  size: { x: number; y: number; z: number };
+  /** Dense role values, `x + y*sx + z*sx*sy`; or `sparse`. */
+  data?: Uint8Array;
+  sparse?: SparseVoxels;
+}
+
+/** One placement of a model: its anchor at a world position, turned about y. */
+export interface Instance {
+  model: number;
+  /** World position of the model's anchor (voxels, fractional allowed). */
+  x: number;
+  y: number;
+  z: number;
+  /** Model anchor, in model voxels (default the base centre: size.x/2, 0, size.z/2). */
+  anchor?: Vec3;
+  /** Radians about +y; 0 leaves the model as authored. */
+  yaw?: number;
+  /** Palette slot of role 1: a voxel of role r draws slot base + r - 1. */
+  base: number;
+}
+
+interface GpuModel {
+  grid: BrickGrid;
+  topOff: number;
+  size: { x: number; y: number; z: number };
+}
 
 /** Minimal scene data the renderer needs to build/upload the voxel grid. */
 export interface RenderScene {
@@ -152,7 +196,21 @@ export class Renderer {
   private occMax: Vec3;
   /** Sparse mirror of the caller's dense grid; see src/brick.ts. */
   private readonly bricks: BrickGrid;
-  private readonly indexTexture: GPUTexture;
+  /** Bricks and index blocks for the world and every model. */
+  private readonly pool: BrickPool;
+  private idxBuffer: GPUBuffer;
+  private layout: Record<RegionName, { off: number; cap: number }>;
+  private models: (GpuModel | null)[] = [];
+  private modelData = new Uint32Array(MODEL_WORDS * 16);
+  /** Free ranges of the tops region after the world's own top level: [offset, length]. */
+  private topFree: [number, number][] = [];
+  private topEnd = 0;
+  private instData = new Uint32Array(INST_WORDS * 64);
+  private instCount = 0;
+  private cellData: Uint32Array;
+  private cellTouched: number[] = [];
+  private listData = new Uint32Array(1024);
+  private listLen = 0;
   /** Brick-space dims, also the bounds test for the empty-space skip. */
   private readonly coarseDim: Vec3;
   private brickVox4: GPUBuffer;
@@ -190,31 +248,15 @@ export class Renderer {
 
     const module = device.createShaderModule({ code: shaderCode });
 
-    // The only 3D texture is the brick index, one texel per BRICK_B^3 voxels, so
-    // the per-axis ceiling is maxTextureDimension3D * BRICK_B voxels — eight
-    // times what a dense grid could reach on the same adapter.
-    const maxDim = gpu.limits?.maxTextureDimension3D ?? 2048;
-    const maxVoxels = maxDim * BRICK_B;
-    const biggest = Math.max(scene.size.x, scene.size.y, scene.size.z);
-    if (biggest > maxVoxels) {
-      throw new Error(
-        `Scene is ${scene.size.x}x${scene.size.y}x${scene.size.z}, but this adapter's ` +
-          `maxTextureDimension3D of ${maxDim} caps a grid at ${maxVoxels} voxels per axis. ` +
-          `Reduce the grid, or raise the limit via initGpu({ limits: { maxTextureDimension3D } }) ` +
-          `if the adapter supports more.`,
-      );
-    }
-
     // Sparse brick form of the grid. The caller's dense array stays the source
     // of truth; this is the mirror the GPU reads.
-    this.bricks = new BrickGrid(scene.size, scene.data);
+    this.pool = new BrickPool();
+    this.bricks = new BrickGrid(scene.size, scene.data, this.pool);
     this.coarseDim = [...this.bricks.dim] as Vec3;
-    this.indexTexture = device.createTexture({
-      size: this.bricks.dim,
-      dimension: "3d",
-      format: "r32uint",
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    });
+    this.topEnd = this.bricks.top.length;
+    this.cellData = new Uint32Array(this.bricks.top.length);
+    this.layout = this.planLayout();
+    this.idxBuffer = this.makeIdxBuffer();
 
     const paletteBuffer = device.createBuffer({
       size: scene.palette.byteLength,
@@ -268,7 +310,7 @@ export class Renderer {
         {
           binding: 1,
           visibility: GPUShaderStage.FRAGMENT,
-          texture: { sampleType: "uint", viewDimension: "3d" },
+          buffer: { type: "read-only-storage" },
         },
         {
           binding: 2,
@@ -316,7 +358,7 @@ export class Renderer {
     });
 
     this.bindGroup = this.makeBindGroup();
-    this.uploadIndex();
+    this.uploadIndexAll();
     this.uploadSlots(null, null);
   }
 
@@ -326,14 +368,13 @@ export class Renderer {
    */
   stats(): { bricks: number; wide: number; bytes: number; dense: number } {
     const st = this.bricks.stats();
-    const [bx, by, bz] = this.coarseDim;
     return {
       bricks: st.used,
       wide: st.wide,
       bytes:
         this.slotCap4 * (BRICK_WORDS_4 + PALETTE_WORDS) * 4 +
         this.slotCap8 * BRICK_WORDS_8 * 4 +
-        bx * by * bz * 4,
+        this.idxBuffer.size,
       dense: st.denseBytes,
     };
   }
@@ -344,7 +385,7 @@ export class Renderer {
       layout: this.bindLayout,
       entries: [
         { binding: 0, resource: { buffer: this.uniformBuffer } },
-        { binding: 1, resource: this.indexTexture.createView() },
+        { binding: 1, resource: { buffer: this.idxBuffer } },
         { binding: 2, resource: { buffer: this.paletteBuffer } },
         { binding: 3, resource: { buffer: this.brickVox4 } },
         { binding: 4, resource: { buffer: this.materialBuffer } },
@@ -414,7 +455,7 @@ export class Renderer {
    * unusable afterwards.
    */
   destroy(): void {
-    this.indexTexture.destroy();
+    this.idxBuffer.destroy();
     this.brickVox4.destroy();
     this.brickPal.destroy();
     this.brickVox8.destroy();
@@ -451,22 +492,7 @@ export class Renderer {
    * the box selects a region of it, it is not a standalone sub-grid.
    */
   updateVoxels(data: Uint8Array, box?: DirtyBox): void {
-    if (!box) {
-      this.bricks.rebuildAll(data);
-      this.growPools();
-      this.uploadIndex();
-      this.uploadSlots(null, null);
-      return;
-    }
-    const edit = this.bricks.rebuildBox(data, box);
-    // Growing reallocates and re-uploads everything, so there is nothing left
-    // to send afterwards.
-    if (this.growPools()) {
-      this.uploadIndex();
-      return;
-    }
-    this.uploadIndex(edit.index);
-    this.uploadSlots(edit.slots4, edit.slots8);
+    this.commit(box ? this.bricks.rebuildBox(data, box) : this.bricks.rebuildAll(data));
   }
 
   /**
@@ -477,13 +503,7 @@ export class Renderer {
    * returns.
    */
   edit(box: DirtyBox, fill: (cells: Uint8Array, ox: number, oy: number, oz: number) => boolean): void {
-    const edit = this.bricks.editBox(box, fill);
-    if (this.growPools()) {
-      this.uploadIndex();
-      return;
-    }
-    this.uploadIndex(edit.index);
-    this.uploadSlots(edit.slots4, edit.slots8);
+    this.commit(this.bricks.editBox(box, fill));
   }
 
   /**
@@ -494,39 +514,169 @@ export class Renderer {
    */
   editMany(boxes: readonly DirtyBox[], fill: (cells: Uint8Array, ox: number, oy: number, oz: number) => boolean): void {
     if (!boxes.length) return;
-    const index: DirtyBox[] = [];
-    const slots4: number[] = [], slots8: number[] = [];
-    for (const box of boxes) {
-      const edit = this.bricks.editBox(box, fill);
-      if (edit.index) index.push(edit.index);
-      for (const s of edit.slots4) slots4.push(s);
-      for (const s of edit.slots8) slots8.push(s);
-    }
-    if (this.growPools()) {
-      this.uploadIndex();
-      return;
-    }
-    // Index regions are merged per 4x4x4-brick tile: one tiny upload per
-    // tile touched, rather than one per brick or one box around a whole crowd.
-    const tiles = new Map<number, DirtyBox>();
-    for (const b of index) {
-      const key = (b.x0 >> 2) + (b.y0 >> 2) * 4096 + (b.z0 >> 2) * 16777216; // exact: brick dims are far below 4096 * 4
-      const t = tiles.get(key);
-      if (!t) tiles.set(key, { ...b });
-      else {
-        t.x0 = Math.min(t.x0, b.x0); t.y0 = Math.min(t.y0, b.y0); t.z0 = Math.min(t.z0, b.z0);
-        t.x1 = Math.max(t.x1, b.x1); t.y1 = Math.max(t.y1, b.y1); t.z1 = Math.max(t.z1, b.z1);
-      }
-    }
-    for (const t of tiles.values()) this.uploadIndex(t);
-    this.uploadSlots(slots4, slots8);
+    const edit = emptyEdit();
+    for (const box of boxes) this.bricks.editBox(box, fill, edit);
+    this.commit(edit);
   }
 
   /** Free every brick in `box` — see BrickGrid.clearBox. */
   clear(box: DirtyBox): void {
-    const edit = this.bricks.clearBox(box);
-    this.uploadIndex(edit.index);
+    this.commit(this.bricks.clearBox(box));
+  }
+
+  // --- models and instances ----------------------------------------------------
+
+  /**
+   * Upload a model once, to be drawn any number of times by `setInstances`.
+   * Its voxels are role values (1..), mapped to palette slots per instance.
+   * Returns the model id.
+   */
+  addModel(src: ModelSource): number {
+    const grid = new BrickGrid(src.size, undefined, this.pool);
+    const edit = emptyEdit();
+    if (src.sparse) {
+      const [dx, dy] = sparseDims(src.size);
+      for (const [key, cells] of src.sparse.bricks) {
+        const bx = key % dx, by = Math.floor(key / dx) % dy, bz = Math.floor(key / (dx * dy));
+        const e = this.pool.encode(0, cells, edit);
+        if (e) grid.setEntry(bx, by, bz, e, edit);
+      }
+    } else if (src.data) {
+      const g = grid.rebuildAll(src.data);
+      for (const k of ["slots4", "slots8", "blocks", "tops"] as const) for (const v of g[k]) edit[k].push(v);
+    }
+    grid.markNear(edit);
+    const topOff = this.claimTops(grid.top.length);
+    let id = this.models.indexOf(null);
+    if (id < 0) id = this.models.push(null) - 1;
+    this.models[id] = { grid, topOff, size: { ...src.size } };
+    if (this.modelData.length < (id + 1) * MODEL_WORDS) this.modelData = growU32(this.modelData, (id + 1) * MODEL_WORDS);
+    const m = id * MODEL_WORDS;
+    this.modelData.set([topOff, grid.topDim[0], grid.topDim[1], grid.topDim[2], src.size.x, src.size.y, src.size.z, 0], m);
+    const grewPools = this.growPools();
+    if (this.ensureLayout() || grewPools) {
+      this.uploadIndexAll();
+      return id;
+    }
     this.uploadSlots(edit.slots4, edit.slots8);
+    this.uploadBlocks(edit.blocks);
+    this.writeRegion("tops", topOff, grid.top, 0, grid.top.length);
+    this.writeRegion("models", m, this.modelData, m, MODEL_WORDS);
+    return id;
+  }
+
+  /** Free a model's bricks. Instances still naming it must be replaced first. */
+  removeModel(id: number): void {
+    const m = this.models[id];
+    if (!m) return;
+    m.grid.free();
+    this.topFree.push([m.topOff, m.grid.top.length]);
+    this.models[id] = null;
+  }
+
+  /**
+   * Replace every instance. Cheap enough to call per frame for a few thousand:
+   * it rewrites the instance table and the lists of the top cells they cover.
+   */
+  setInstances(list: readonly Instance[]): void {
+    const [tx, ty, tz] = this.bricks.topDim;
+    if (this.instData.length < list.length * INST_WORDS) this.instData = growU32(this.instData, list.length * INST_WORDS);
+    const f = new Float32Array(this.instData.buffer);
+    const perCell = new Map<number, number[]>();
+    let dropped = 0;
+    this.instCount = 0;
+    for (const inst of list) {
+      const m = this.models[inst.model];
+      if (!m) continue;
+      const k = this.instCount++;
+      const o = k * INST_WORDS;
+      const yaw = inst.yaw ?? 0, c = Math.cos(yaw), sn = Math.sin(yaw);
+      const an = inst.anchor ?? [m.size.x / 2, 0, m.size.z / 2];
+      f[o] = inst.x; f[o + 1] = inst.y; f[o + 2] = inst.z; f[o + 3] = c;
+      f[o + 4] = an[0]; f[o + 5] = an[1]; f[o + 6] = an[2]; f[o + 7] = sn;
+      this.instData[o + 8] = inst.model;
+      this.instData[o + 9] = inst.base;
+      this.instData[o + 10] = 0; this.instData[o + 11] = 0;
+      // World box of the turned model: world = R (m - anchor) + pos, with
+      // R = [c 0 s; 0 1 0; -s 0 c] (the same turn as bakePose).
+      let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+      for (const mx of [0, m.size.x]) for (const mz of [0, m.size.z]) {
+        const dx = mx - an[0], dz = mz - an[2];
+        const wx = c * dx + sn * dz + inst.x, wz = -sn * dx + c * dz + inst.z;
+        x0 = Math.min(x0, wx); x1 = Math.max(x1, wx); z0 = Math.min(z0, wz); z1 = Math.max(z1, wz);
+      }
+      const y0 = inst.y - an[1], y1 = y0 + m.size.y;
+      const cx0 = Math.max(0, Math.floor((x0 - 1) / TOP_B)), cx1 = Math.min(tx - 1, Math.floor((x1 + 1) / TOP_B));
+      const cy0 = Math.max(0, Math.floor((y0 - 1) / TOP_B)), cy1 = Math.min(ty - 1, Math.floor((y1 + 1) / TOP_B));
+      const cz0 = Math.max(0, Math.floor((z0 - 1) / TOP_B)), cz1 = Math.min(tz - 1, Math.floor((z1 + 1) / TOP_B));
+      for (let cz = cz0; cz <= cz1; cz++)
+        for (let cy = cy0; cy <= cy1; cy++)
+          for (let cx = cx0; cx <= cx1; cx++) {
+            const ci = cx + cy * tx + cz * tx * ty;
+            let l = perCell.get(ci);
+            if (!l) perCell.set(ci, (l = []));
+            if (l.length < MAX_CELL_INSTANCES) l.push(k);
+            else dropped++;
+          }
+    }
+    if (dropped) console.warn(`setInstances: ${dropped} cell entries over the ${MAX_CELL_INSTANCES}-per-cell limit were dropped`);
+    // Lists, and the cell entries pointing into them.
+    let total = 0;
+    for (const l of perCell.values()) total += l.length;
+    if (this.listData.length < total) this.listData = growU32(this.listData, total);
+    const touched: number[] = [];
+    for (const ci of this.cellTouched) this.cellData[ci] = 0;
+    let at = 0;
+    for (const [ci, l] of perCell) {
+      this.cellData[ci] = (at << 8) | l.length;
+      for (const k of l) this.listData[at++] = k;
+      touched.push(ci);
+    }
+    const dirty = [...this.cellTouched, ...touched];
+    this.cellTouched = touched;
+    this.listLen = total;
+    if (this.ensureLayout()) {
+      this.uploadIndexAll();
+      return;
+    }
+    this.writeRegion("inst", 0, this.instData, 0, this.instCount * INST_WORDS);
+    this.writeRegion("list", 0, this.listData, 0, this.listLen);
+    for (const [lo, hi] of runs(dirty, 64)) this.writeRegion("cells", lo, this.cellData, lo, hi - lo + 1);
+  }
+
+  /** Models uploaded and instances placed, for overlays and budgets. */
+  instanceStats(): { models: number; instances: number; blocks: number; bytes: number } {
+    return {
+      models: this.models.filter(Boolean).length,
+      instances: this.instCount,
+      blocks: this.pool.blockCount,
+      bytes: this.slotCap4 * (BRICK_WORDS_4 + PALETTE_WORDS) * 4 + this.slotCap8 * BRICK_WORDS_8 * 4 + this.idxBuffer.size,
+    };
+  }
+
+  private claimTops(n: number): number {
+    const i = this.topFree.findIndex(([, len]) => len >= n);
+    if (i >= 0) {
+      const [off, len] = this.topFree[i];
+      if (len === n) this.topFree.splice(i, 1);
+      else this.topFree[i] = [off + n, len - n];
+      return off;
+    }
+    const off = this.topEnd;
+    this.topEnd += n;
+    return off;
+  }
+
+  /** Upload what an edit of the world grid changed. */
+  private commit(edit: BrickEdit): void {
+    const grewPools = this.growPools();
+    if (this.ensureLayout() || grewPools) {
+      this.uploadIndexAll();
+      return;
+    }
+    this.uploadSlots(edit.slots4, edit.slots8);
+    this.uploadBlocks(edit.blocks);
+    for (const [lo, hi] of runs(edit.tops, 16)) this.writeRegion("tops", lo, this.bricks.top, lo, hi - lo + 1);
   }
 
   // --- brick pool plumbing ---------------------------------------------------
@@ -587,34 +737,75 @@ export class Renderer {
     return true;
   }
 
-  /** Upload the brick index volume, whole or a brick-space sub-box. */
-  private uploadIndex(box?: DirtyBox): void {
-    const [bx, by, bz] = this.coarseDim;
-    const { device } = this.gpu;
-    const data = this.bricks.index;
-    if (!box) {
-      device.queue.writeTexture(
-        { texture: this.indexTexture },
-        data,
-        { bytesPerRow: bx * 4, rowsPerImage: by },
-        { width: bx, height: by, depthOrArrayLayers: bz },
-      );
-      return;
+  /** Region sizes wanted now, in words. */
+  private needs(): Record<RegionName, number> {
+    return {
+      tops: this.topEnd,
+      blocks: this.pool.blockCount * BLOCK_ENTRIES,
+      cells: this.cellData.length,
+      list: this.listLen,
+      inst: this.instCount * INST_WORDS,
+      models: this.models.length * MODEL_WORDS,
+    };
+  }
+
+  /** Offsets with headroom; regions are laid out in REGIONS order. */
+  private planLayout(): Record<RegionName, { off: number; cap: number }> {
+    const need = this.needs();
+    const floor: Record<RegionName, number> = { tops: 0, blocks: BLOCK_ENTRIES * 16, cells: 0, list: 256, inst: INST_WORDS * 16, models: MODEL_WORDS * 8 };
+    const out = {} as Record<RegionName, { off: number; cap: number }>;
+    let off = 0;
+    for (const r of REGIONS) {
+      // The world's cells never grow; everything else gets 1.5x headroom.
+      const cap = r === "cells" ? need.cells : Math.max(floor[r], Math.ceil(need[r] * 1.5));
+      out[r] = { off, cap };
+      off += cap;
     }
-    const w = box.x1 - box.x0 + 1;
-    const h = box.y1 - box.y0 + 1;
-    const d = box.z1 - box.z0 + 1;
-    if (w <= 0 || h <= 0 || d <= 0) return;
-    device.queue.writeTexture(
-      { texture: this.indexTexture, origin: { x: box.x0, y: box.y0, z: box.z0 } },
-      data,
-      {
-        offset: (box.x0 + box.y0 * bx + box.z0 * bx * by) * 4,
-        bytesPerRow: bx * 4,
-        rowsPerImage: by,
-      },
-      { width: w, height: h, depthOrArrayLayers: d },
-    );
+    return out;
+  }
+
+  private makeIdxBuffer(): GPUBuffer {
+    const words = REGIONS.reduce((n, r) => n + this.layout[r].cap, 0);
+    const limit = this.gpu.limits?.maxStorageBufferBindingSize ?? 134217728;
+    if (words * 4 > limit) {
+      throw new Error(
+        `Scene needs a ${(words * 4 / 1048576).toFixed(0)} MiB index buffer but this device caps a storage binding at ` +
+          `${(limit / 1048576).toFixed(0)} MiB. Raise it via initGpu({ limits: { maxStorageBufferBindingSize } }).`,
+      );
+    }
+    return this.gpu.device.createBuffer({ size: Math.max(4, words * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  }
+
+  /** Reallocate the index buffer when a region outgrows it. Returns true when it did (re-upload everything). */
+  private ensureLayout(): boolean {
+    const need = this.needs();
+    if (REGIONS.every((r) => need[r] <= this.layout[r].cap)) return false;
+    this.layout = this.planLayout();
+    this.idxBuffer.destroy();
+    this.idxBuffer = this.makeIdxBuffer();
+    this.bindGroup = this.makeBindGroup();
+    return true;
+  }
+
+  private writeRegion(r: RegionName, at: number, src: Uint32Array, from: number, n: number): void {
+    if (n <= 0) return;
+    this.gpu.device.queue.writeBuffer(this.idxBuffer, (this.layout[r].off + at) * 4, src, from, n);
+  }
+
+  private uploadBlocks(ids: number[]): void {
+    for (const [lo, hi] of runs(ids)) this.writeRegion("blocks", lo * BLOCK_ENTRIES, this.pool.blocks, lo * BLOCK_ENTRIES, (hi - lo + 1) * BLOCK_ENTRIES);
+  }
+
+  /** Upload every index region. */
+  private uploadIndexAll(): void {
+    this.writeRegion("tops", 0, this.bricks.top, 0, this.bricks.top.length);
+    for (const m of this.models) if (m) this.writeRegion("tops", m.topOff, m.grid.top, 0, m.grid.top.length);
+    this.writeRegion("blocks", 0, this.pool.blocks, 0, this.pool.blockCount * BLOCK_ENTRIES);
+    this.writeRegion("cells", 0, this.cellData, 0, this.cellData.length);
+    this.writeRegion("list", 0, this.listData, 0, this.listLen);
+    this.writeRegion("inst", 0, this.instData, 0, this.instCount * INST_WORDS);
+    this.writeRegion("models", 0, this.modelData, 0, this.models.length * MODEL_WORDS);
+    this.uploadSlots(null, null);
   }
 
   /**
@@ -628,32 +819,32 @@ export class Renderer {
     if (slots4 === null) {
       // The CPU pools are sized to the slots actually claimed, which is less
       // than the GPU capacity; only send what exists.
-      const nv = Math.min(this.slotCap4 * BRICK_WORDS_4, this.bricks.voxels4.length);
-      const np = Math.min(this.slotCap4 * PALETTE_WORDS, this.bricks.palettes.length);
-      device.queue.writeBuffer(this.brickVox4, 0, this.bricks.voxels4, 0, nv);
-      device.queue.writeBuffer(this.brickPal, 0, this.bricks.palettes, 0, np);
+      const nv = Math.min(this.slotCap4 * BRICK_WORDS_4, this.pool.voxels4.length);
+      const np = Math.min(this.slotCap4 * PALETTE_WORDS, this.pool.palettes.length);
+      device.queue.writeBuffer(this.brickVox4, 0, this.pool.voxels4, 0, nv);
+      device.queue.writeBuffer(this.brickPal, 0, this.pool.palettes, 0, np);
     } else {
       for (const [lo, hi] of runs(slots4)) {
         const n = hi - lo + 1;
         device.queue.writeBuffer(
           this.brickVox4, lo * BRICK_WORDS_4 * 4,
-          this.bricks.voxels4, lo * BRICK_WORDS_4, n * BRICK_WORDS_4,
+          this.pool.voxels4, lo * BRICK_WORDS_4, n * BRICK_WORDS_4,
         );
         device.queue.writeBuffer(
           this.brickPal, lo * PALETTE_WORDS * 4,
-          this.bricks.palettes, lo * PALETTE_WORDS, n * PALETTE_WORDS,
+          this.pool.palettes, lo * PALETTE_WORDS, n * PALETTE_WORDS,
         );
       }
     }
     if (slots8 === null) {
-      const n = Math.min(this.slotCap8 * BRICK_WORDS_8, this.bricks.voxels8.length);
-      device.queue.writeBuffer(this.brickVox8, 0, this.bricks.voxels8, 0, n);
+      const n = Math.min(this.slotCap8 * BRICK_WORDS_8, this.pool.voxels8.length);
+      device.queue.writeBuffer(this.brickVox8, 0, this.pool.voxels8, 0, n);
     } else {
       for (const [lo, hi] of runs(slots8)) {
         const n = hi - lo + 1;
         device.queue.writeBuffer(
           this.brickVox8, lo * BRICK_WORDS_8 * 4,
-          this.bricks.voxels8, lo * BRICK_WORDS_8, n * BRICK_WORDS_8,
+          this.pool.voxels8, lo * BRICK_WORDS_8, n * BRICK_WORDS_8,
         );
       }
     }
@@ -715,6 +906,12 @@ export class Renderer {
     u[125] = fog?.heightFalloff ?? 0;
     u[126] = cl?.drift[0] ?? 0; u[127] = cl?.drift[1] ?? 0;
     u[128] = p.waterWind?.[0] ?? 0; u[129] = p.waterWind?.[1] ?? 0;
+    // Index regions (132..143), as u32.
+    const w = new Uint32Array(u.buffer);
+    const [tx, ty, tz] = this.bricks.topDim;
+    w[132] = tx; w[133] = ty; w[134] = tz; w[135] = this.instCount;
+    w[136] = this.layout.blocks.off; w[137] = this.layout.cells.off; w[138] = this.layout.list.off; w[139] = this.layout.inst.off;
+    w[140] = this.layout.models.off; w[141] = this.layout.tops.off; w[142] = 0; w[143] = 0;
 
     const { device } = this.gpu;
     device.queue.writeBuffer(this.uniformBuffer, 0, u);
@@ -773,7 +970,7 @@ function occupiedBounds(
 }
 
 /** Sort and coalesce slot indices into inclusive contiguous [lo, hi] runs. */
-function runs(slots: number[]): [number, number][] {
+function runs(slots: number[], gap = 1): [number, number][] {
   if (slots.length === 0) return [];
   const sorted = [...new Set(slots)].sort((a, b) => a - b);
   const out: [number, number][] = [];
@@ -781,11 +978,20 @@ function runs(slots: number[]): [number, number][] {
   let prev = lo;
   for (let i = 1; i < sorted.length; i++) {
     const v = sorted[i];
-    if (v === prev + 1) { prev = v; continue; }
+    // Indices within `gap` of the run join it: one larger write beats many tiny ones.
+    if (v <= prev + gap) { prev = v; continue; }
     out.push([lo, prev]);
     lo = v;
     prev = v;
   }
   out.push([lo, prev]);
   return out;
+}
+
+function growU32(a: Uint32Array, need: number): Uint32Array<ArrayBuffer> {
+  let len = Math.max(a.length * 2, 64);
+  while (len < need) len *= 2;
+  const next = new Uint32Array(len);
+  next.set(a);
+  return next;
 }

@@ -2,7 +2,7 @@
 // the light. Skips provably-empty coarse blocks but stays fine-exact.
 
 import package::uniforms::U;
-import package::grid::{isSolid, coarseSolid};
+import package::grid::{isSolid, coarseSolid, skipSize};
 import package::dda::{stepMask, seedSideDist, skipBlock};
 
 // Hard ceiling; the effective cap is U.shadowSteps (0 disables shadows upstream).
@@ -20,7 +20,7 @@ fn inShadow(origin : vec3<f32>, rd : vec3<f32>) -> bool {
       return false;
     }
     if (U.debug < 0.5 && !coarseSolid(cell)) {
-      let seed = skipBlock(origin, rd, cell, deltaDist);
+      let seed = skipBlock(origin, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
       sideDist = seed.sideDist;
       continue;
@@ -55,7 +55,7 @@ fn occludedTo(origin : vec3<f32>, rd : vec3<f32>, maxT : f32) -> bool {
       return false;
     }
     if (U.debug < 0.5 && !coarseSolid(cell)) {
-      let seed = skipBlock(origin, rd, cell, deltaDist);
+      let seed = skipBlock(origin, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
       sideDist = seed.sideDist;
       continue;

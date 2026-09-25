@@ -3,7 +3,7 @@
 // face normal, palette colour, and material index.
 
 import package::uniforms::{U, palette};
-import package::grid::{sampleVoxel, coarseSolid};
+import package::grid::{sampleVoxel, coarseSolid, skipSize};
 import package::dda::{stepMask, seedSideDist, skipBlock};
 import package::materials::matOf;
 
@@ -56,7 +56,7 @@ fn walk(ro : vec3<f32>, rd : vec3<f32>, tStart : f32, skipWater : bool) -> Hit {
     // Empty-space skip: if the coarse block is empty, jump the ray to that
     // block's far plane in one hop (re-seed exactly like the entry above).
     if (U.debug < 0.5 && !coarseSolid(cell)) {
-      let seed = skipBlock(ro, rd, cell, deltaDist);
+      let seed = skipBlock(ro, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
       sideDist = seed.sideDist;
       normal = seed.axis * -sign(rd);

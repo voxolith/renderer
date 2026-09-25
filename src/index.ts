@@ -24,6 +24,8 @@ export type {
   FloorParams,
   RenderQuality,
   QualityPreset,
+  ModelSource,
+  Instance,
 } from "./renderer";
 
 // Render-on-demand loop (browser only; not part of ./core).
