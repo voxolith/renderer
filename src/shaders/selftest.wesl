@@ -45,7 +45,7 @@ fn selfTest(frag : vec2<f32>) -> vec3<f32> {
 // tell a shader-compiler fault apart from missing data.
 //   1 top texel via signed shift (b >> 3)   2 via signed division (b / 8)
 //   3 via unsigned division                4 signed mask (b & 7) == unsigned (b % 8)
-//   5 worldEntry finds an entry            6 sampleVoxel finds a voxel
+//   5 worldEntry finds an entry (voxel input)            6 sampleVoxel finds a voxel
 //   7 a ray down the column hits           8 (always green: reference)
 fn selfTest2(frag : vec2<f32>) -> vec3<f32> {
   let band = i32(floor(frag.x / U.resolution.x * 8.0));
@@ -60,7 +60,7 @@ fn selfTest2(frag : vec2<f32>) -> vec3<f32> {
       ok = true;
       for (var y = 0; y < ny; y++) { let b = vec3<i32>(c.x + y, y, c.z + 2 * y); ok = ok && all(vec3<u32>(b & vec3<i32>(7)) == vec3<u32>(b) % 8u); }
     }
-    case 4: { for (var y = 0; y < ny && !ok; y += 8) { ok = worldEntry(vec3<i32>(c.x, y, c.z) / 8) != 0u; } }
+    case 4: { for (var y = 0; y < ny && !ok; y += 8) { ok = worldEntry(vec3<i32>(c.x, y, c.z)) != 0u; } }
     case 5: { for (var y = 0; y < ny && !ok; y++) { ok = sampleVoxel(vec3<i32>(c.x, y, c.z)) != 0u; } }
     case 6: {
       let ro = vec3<f32>(f32(c.x) + 0.5, U.gridSize.y + 1.0, f32(c.z) + 0.5);
@@ -75,8 +75,8 @@ fn selfTest2(frag : vec2<f32>) -> vec3<f32> {
 }
 
 // setDebug(9): the vector conversion suspected on Adreno, and the walk's own lookups.
-//   1 vec3<u32>(v) == toU(v) for computed v   2 worldEntry of a computed brick finds one
-//   3 queryBrick(brickOf(p)) marks a column solid   4 a ray down the column hits
+//   1 vec3<u32>(v) == toU(v) for computed v   2 worldEntry finds a brick in the column
+//   3 queryBrick(p) marks a column solid           4 a ray down the column hits
 //   5..8 reference (green)
 fn selfTest3(frag : vec2<f32>) -> vec3<f32> {
   let band = i32(floor(frag.x / U.resolution.x * 8.0));
@@ -88,8 +88,8 @@ fn selfTest3(frag : vec2<f32>) -> vec3<f32> {
       ok = true;
       for (var y = 0; y < ny; y++) { let v = vec3<i32>(c.x + y, y * 3, c.z + y / 2); ok = ok && all(vec3<u32>(v) == toU(v)); }
     }
-    case 1: { for (var y = 0; y < ny && !ok; y += 8) { ok = worldEntry(vec3<i32>(c.x, y, c.z) / 8) != 0u; } }
-    case 2: { for (var y = 0; y < ny && !ok; y++) { ok = queryBrick(brickOf(vec3<i32>(c.x, y, c.z))).solid; } }
+    case 1: { for (var y = 0; y < ny && !ok; y += 8) { ok = worldEntry(vec3<i32>(c.x, y, c.z)) != 0u; } }
+    case 2: { for (var y = 0; y < ny && !ok; y++) { ok = queryBrick(vec3<i32>(c.x, y, c.z)).solid; } }
     case 3: {
       let ro = vec3<f32>(f32(c.x) + 0.5, U.gridSize.y + 1.0, f32(c.z) + 0.5);
       ok = traverse(ro, vec3<f32>(0.0001, -1.0, 0.0002), 0.0).hit;

@@ -59,7 +59,7 @@ fn walk(ro : vec3<f32>, rd : vec3<f32>, tStart : f32, skipWater : bool) -> Hit {
     let b = brickOf(cell);
     if (any(b != qb)) {
       qb = b;
-      q = queryBrick(b);
+      q = queryBrick(cell);
     }
     // Empty-space skip: if the brick (or its whole 64^3 block) is empty,
     // jump the ray to that block's far plane in one hop.

@@ -48,9 +48,14 @@ fn toI(v : vec3<u32>) -> vec3<i32> {
   return vec3<i32>(i32(v.x), i32(v.y), i32(v.z));
 }
 
-/** Brick entry of a grid whose top level is at `topOff` with dims `td`; `b` in range. */
-fn gridEntry(topOff : u32, td : vec3<u32>, bi : vec3<i32>) -> u32 {
-  let b = toU(bi);
+/**
+ * Brick entry, in a grid whose top level is at `topOff` with dims `td`, of
+ * the brick containing voxel `v` (in range). Every lookup takes a voxel and
+ * divides it here, unsigned: on Adreno 7xx, lookups handed brick coordinates
+ * computed elsewhere (a floor, a signed divide) came back empty.
+ */
+fn gridEntry(topOff : u32, td : vec3<u32>, v : vec3<i32>) -> u32 {
+  let b = toU(v) / 8u;
   let t = b / 8u;
   let blk = idx[U.topsOff + topOff + t.x + t.y * td.x + t.z * td.x * td.y];
   if (blk == 0u) {
@@ -60,9 +65,9 @@ fn gridEntry(topOff : u32, td : vec3<u32>, bi : vec3<i32>) -> u32 {
   return idx[U.blocksOff + (blk - 1u) * 512u + l.x + l.y * 8u + l.z * 64u];
 }
 
-/** World brick entry for brick `b` (in range), through the top-level texture. */
-fn worldEntry(bi : vec3<i32>) -> u32 {
-  let b = toU(bi);
+/** World brick entry of the brick containing voxel `v` (in range), through the top-level texture. */
+fn worldEntry(v : vec3<i32>) -> u32 {
+  let b = toU(v) / 8u;
   let blk = textureLoad(topTex, b / 8u, 0).r;
   if (blk == 0u) {
     return 0u;
@@ -143,7 +148,7 @@ fn instanceVoxel(p : vec3<i32>) -> u32 {
       continue;
     }
     let qu = toU(q);
-    let e = gridEntry(idx[mi], vec3<u32>(idx[mi + 1u], idx[mi + 2u], idx[mi + 3u]), toI(qu / 8u));
+    let e = gridEntry(idx[mi], vec3<u32>(idx[mi + 1u], idx[mi + 2u], idx[mi + 3u]), q);
     let v = brickVoxel(e, toI(qu % 8u));
     if (v != 0u) {
       return idx[o + 9u] + v - 1u;
@@ -157,7 +162,7 @@ fn sampleVoxel(p : vec3<i32>) -> u32 {
     return 0u;
   }
   let pu = toU(p);
-  let e = worldEntry(toI(pu / 8u));
+  let e = worldEntry(p);
   if (e != 0u) {
     let v = brickVoxel(e, toI(pu % 8u));
     if (v != 0u || (!INSTANCES || U.instanceCount == 0u)) {
@@ -203,7 +208,7 @@ fn instanceNear(c : vec3<i32>) -> bool {
       continue;
     }
     let cb = clamp(qb, vec3<i32>(0), bdim - vec3<i32>(1));
-    if (gridEntry(idx[mi], vec3<u32>(idx[mi + 1u], idx[mi + 2u], idx[mi + 3u]), cb) != 0u) {
+    if (gridEntry(idx[mi], vec3<u32>(idx[mi + 1u], idx[mi + 2u], idx[mi + 3u]), cb * COARSE_B) != 0u) {
       return true;
     }
   }
@@ -219,7 +224,7 @@ fn coarseSolid(p : vec3<i32>) -> bool {
   if (any(c < vec3<i32>(0)) || any(c >= vec3<i32>(U.coarseDim))) {
     return true;
   }
-  if (worldEntry(c) != 0u) {
+  if (worldEntry(p) != 0u) {
     return true;
   }
   return (INSTANCES && U.instanceCount != 0u) && instanceNear(c);
@@ -261,7 +266,14 @@ fn brickOf(p : vec3<i32>) -> vec3<i32> {
   return vec3<i32>(floor(vec3<f32>(p) / f32(COARSE_B)));
 }
 
-fn queryBrick(c : vec3<i32>) -> BrickQuery {
+/**
+ * Look up the brick containing fine cell `p`. Takes the cell, not the brick:
+ * on Adreno 7xx a lookup fed with brick coordinates computed first (a floor
+ * or a signed divide) came back empty, while one derived from the voxel's
+ * own coordinates, as sampleVoxel does, works.
+ */
+fn queryBrick(p : vec3<i32>) -> BrickQuery {
+  let c = brickOf(p);
   var q : BrickQuery;
   q.inGrid = all(c >= vec3<i32>(0)) && all(c < vec3<i32>(U.coarseDim));
   if (!q.inGrid) {
@@ -271,7 +283,7 @@ fn queryBrick(c : vec3<i32>) -> BrickQuery {
     q.solid = true;
     return q;
   }
-  q.entry = worldEntry(c);
+  q.entry = worldEntry(p);
   q.near = q.entry == 0u && (INSTANCES && U.instanceCount != 0u) && instanceNear(c);
   q.solid = q.entry != 0u || q.near;
   return q;

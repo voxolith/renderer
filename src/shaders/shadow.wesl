@@ -22,7 +22,7 @@ fn inShadow(origin : vec3<f32>, rd : vec3<f32>) -> bool {
       return false;
     }
     let b = brickOf(cell);
-    if (any(b != qb)) { qb = b; q = queryBrick(b); }
+    if (any(b != qb)) { qb = b; q = queryBrick(cell); }
     if (U.debug < 0.5 && !q.solid) {
       let seed = skipBlock(origin, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
@@ -33,7 +33,7 @@ fn inShadow(origin : vec3<f32>, rd : vec3<f32>) -> bool {
     sideDist += mask * deltaDist;
     cell += vec3<i32>(mask) * stepDir;
     let nb = brickOf(cell);
-    if (any(nb != qb)) { qb = nb; q = queryBrick(nb); }
+    if (any(nb != qb)) { qb = nb; q = queryBrick(cell); }
     if (voxelIn(q, cell) != 0u) {
       return true;
     }
@@ -63,7 +63,7 @@ fn occludedTo(origin : vec3<f32>, rd : vec3<f32>, maxT : f32) -> bool {
       return false;
     }
     let b = brickOf(cell);
-    if (any(b != qb)) { qb = b; q = queryBrick(b); }
+    if (any(b != qb)) { qb = b; q = queryBrick(cell); }
     if (U.debug < 0.5 && !q.solid) {
       let seed = skipBlock(origin, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
@@ -77,7 +77,7 @@ fn occludedTo(origin : vec3<f32>, rd : vec3<f32>, maxT : f32) -> bool {
       return false;
     }
     let nb = brickOf(cell);
-    if (any(nb != qb)) { qb = nb; q = queryBrick(nb); }
+    if (any(nb != qb)) { qb = nb; q = queryBrick(cell); }
     if (voxelIn(q, cell) != 0u) {
       return true;
     }
