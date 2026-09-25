@@ -16,6 +16,7 @@ import lightsWesl from "./shaders/lights.wesl?raw";
 import waterWesl from "./shaders/water.wesl?raw";
 import fogWesl from "./shaders/fog.wesl?raw";
 import precipWesl from "./shaders/precip.wesl?raw";
+import selftestWesl from "./shaders/selftest.wesl?raw";
 import raymarchWesl from "./shaders/raymarch.wesl?raw";
 import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
@@ -44,6 +45,7 @@ const WESL_SRC: Record<string, string> = {
   "./water.wesl": waterWesl,
   "./fog.wesl": fogWesl,
   "./precip.wesl": precipWesl,
+  "./selftest.wesl": selftestWesl,
   "./raymarch.wesl": raymarchWesl,
 };
 

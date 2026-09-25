@@ -15,6 +15,7 @@ import package::water::shadeWater;
 import package::fog::{applyFog, applySkyFog};
 import package::precip::precipitation;
 import package::shadow::occludedTo;
+import package::selftest::selfTest;
 
 struct VsOut {
   @builtin(position) pos : vec4<f32>,
@@ -67,6 +68,9 @@ fn vs(@builtin(vertex_index) vi : u32) -> VsOut {
 
 @fragment
 fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
+  if (U.debug > 6.5 && U.debug < 7.5) {
+    return vec4<f32>(selfTest(fragCoord.xy), 1.0);
+  }
   // NDC in [-1, 1], y up.
   let uv = (fragCoord.xy / U.resolution) * 2.0 - 1.0;
   let dir = normalize(
