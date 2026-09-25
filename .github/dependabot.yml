@@ -1,0 +1,11 @@
+# Keeps the GitHub Actions used by the workflows current. Package versions are
+# bumped by hand across the workspace, since the repos build against each other.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
