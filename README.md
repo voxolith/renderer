@@ -95,7 +95,7 @@ Grouped as in `src/index.ts`:
 - **Device**: `initGpu(canvas, GpuOptions?)`, `resizeToDisplay`, `setRenderScale`, `showUnsupportedScreen` (options `appName`, `emoji`, `iconHtml`), `WebGPUUnsupportedError`, `GpuContext` (includes `adapterInfo` and a `software` flag)
 - **Renderer**: `createRenderer`, `Renderer` (`render`, `updateVoxels`, `edit`, `editMany`, `clear`, `setFloor`,
   `setClipBounds`, `setQuality`, `getQuality`, `setDebug`, `stats`), `QUALITY_PRESETS`, `RenderQuality`, `RenderScene`, `FrameParams`, `FloorParams`, `DirtyBox`, `raymarchShaderCode`
-- **Instances**: `renderer.addModel`, `removeModel`, `setInstances` (static, or `{ dynamic: true }` per frame), `instanceStats`; `ModelSource`, `Instance`
+- **Instances**: `renderer.addModel`, `removeModel`, `setInstances` (static, or `{ dynamic: true }` per frame), `addPalette`, `setPaletteColors`, `removePalette`, `instanceStats`; `ModelSource`, `Instance`, `WORLD_SLOTS`
 - **Sparse volumes**: `SparseVoxels`, `makeSparse`, `sparseGet`, `sparseSet`, `sparseFromDense`, `sparseToDense`, `sparseCount`
 - **Storage**: `BrickGrid`, `BrickPool`, `BRICK_B`, `TOP_B`
 - **Frame loop**: `makeFrameLoop` (render on demand), `observeResize`
@@ -139,6 +139,11 @@ looked up in them, turned into model space (pivoting on the anchor voxel's centr
 turn is exact). That is resampling at world voxel centres: a turned instance still reads as
 axis-aligned cubes, and shadows, AO, lights and water need nothing special. Empty model bricks
 next to content are flagged so rays still skip through turned models safely.
+
+Instances draw from palettes of their own: `addPalette(rgba, materials?)` returns a base slot
+after the world's 256 (`WORLD_SLOTS`; world voxels are 8-bit), `setPaletteColors` restyles one
+in place and `removePalette` frees it. The buffer grows as needed, so a scene is not limited to
+255 colours: every species, or every placement, can have its own.
 
 Instance sampling is a pipeline constant: a scene that never places an instance runs a shader
 with that code compiled away (it costs even untaken), and the instanced pipeline is built the

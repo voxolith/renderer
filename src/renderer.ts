@@ -48,13 +48,13 @@ const WESL_SRC: Record<string, string> = {
 };
 
 /**
- * Palette slots the GPU holds. World voxels are 8-bit and so use slots below
- * 256; instanced models map their roles to any slot, which is what lets a
- * scene of many refined models have more colours than a world could.
+ * The world's palette: voxels in the world are 8-bit, so their colours are
+ * slots 0..255. Instances draw from palettes of their own (addPalette),
+ * stored after these in the same buffer, as many as a scene needs.
  */
-export const PALETTE_SLOTS = 1024;
-// Material storage buffer: 2 vec4 (8 f32) per slot. See materials.wesl.
-const MATERIAL_FLOATS = PALETTE_SLOTS * 8;
+export const WORLD_SLOTS = 256;
+/** f32 per material slot: 2 vec4. See materials.wesl. */
+const MATERIAL_WORDS = 8;
 
 let shaderCodePromise: Promise<string> | null = null;
 /** Link the WESL modules into WGSL (once; cached for all renderers). */
@@ -110,7 +110,7 @@ export interface Instance {
    * with orientation o would. `anchor` stays the unmirrored model's.
    */
   mirror?: boolean;
-  /** Palette slot of role 1: a voxel of role r draws slot base + r - 1. */
+  /** Palette slot of role 1 (from addPalette, or the world's): a voxel of role r draws slot base + r - 1. */
   base: number;
 }
 
@@ -206,7 +206,14 @@ export class Renderer {
   private readonly uniformData = new Float32Array(UNIFORM_FLOATS);
   private bindGroup: GPUBindGroup;
   private readonly gridSize: [number, number, number];
-  private readonly paletteBuffer: GPUBuffer;
+  private paletteBuffer: GPUBuffer;
+  /** CPU mirror of every palette slot: the world's, then the instance palettes'. */
+  private paletteData = new Float32Array(WORLD_SLOTS * 2 * 4);
+  private materialData = new Float32Array(WORLD_SLOTS * 2 * MATERIAL_WORDS);
+  /** Slots claimed so far (the world's 256 always). */
+  private paletteEnd = WORLD_SLOTS;
+  /** Freed instance palettes: [first slot, length]. */
+  private paletteFree: [number, number][] = [];
   private occMin: Vec3;
   private occMax: Vec3;
   /** Sparse mirror of the caller's dense grid; see src/brick.ts. */
@@ -236,7 +243,7 @@ export class Renderer {
   private slotCap4 = 0;
   private slotCap8 = 0;
   private readonly bindLayout: GPUBindGroupLayout;
-  private readonly materialBuffer: GPUBuffer;
+  private materialBuffer: GPUBuffer;
   private readonly lightBuffer: GPUBuffer;
   private readonly lightData = new Float32Array(MAX_LIGHTS * LIGHT_FLOATS);
   private lightCount = 0;
@@ -282,12 +289,8 @@ export class Renderer {
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
 
-    const paletteBuffer = device.createBuffer({
-      size: PALETTE_SLOTS * 16,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(paletteBuffer, 0, scene.palette, 0, Math.min(scene.palette.length, PALETTE_SLOTS * 4));
-    this.paletteBuffer = paletteBuffer;
+    this.paletteData.set(scene.palette.subarray(0, Math.min(scene.palette.length, WORLD_SLOTS * 4)));
+    this.paletteBuffer = this.makePaletteBuffer(4);
 
     // Brick pools, sized with headroom: entities stamped in after construction
     // claim more bricks, and growPools() reallocates when they run out. The
@@ -301,16 +304,13 @@ export class Renderer {
 
     // Material buffer (always bound). Populated from scene.materials, else zero
     // (materialsEnabled=0 → the shader keeps the flat-palette path unchanged).
-    this.materialBuffer = device.createBuffer({
-      size: MATERIAL_FLOATS * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
+    this.materialBuffer = this.makePaletteBuffer(MATERIAL_WORDS);
     if (scene.materials) {
-      device.queue.writeBuffer(this.materialBuffer, 0, scene.materials, 0, Math.min(scene.materials.length, MATERIAL_FLOATS));
+      this.materialData.set(scene.materials.subarray(0, Math.min(scene.materials.length, WORLD_SLOTS * MATERIAL_WORDS)));
       this.materialsEnabled = 1;
-    } else {
-      device.queue.writeBuffer(this.materialBuffer, 0, new Float32Array(MATERIAL_FLOATS));
     }
+    device.queue.writeBuffer(this.paletteBuffer, 0, this.paletteData);
+    device.queue.writeBuffer(this.materialBuffer, 0, this.materialData);
 
     // Point lights (always bound; lightCount 0 means none are read).
     this.lightBuffer = device.createBuffer({
@@ -432,9 +432,11 @@ export class Renderer {
     });
   }
 
-  /** Re-upload the colour palette (256 entries, or up to PALETTE_SLOTS). */
+  /** Re-upload the world's 256-entry colour palette (e.g. after a carpet swap). */
   updatePalette(palette: Float32Array): void {
-    this.gpu.device.queue.writeBuffer(this.paletteBuffer, 0, palette, 0, Math.min(palette.length, PALETTE_SLOTS * 4));
+    const n = Math.min(palette.length, WORLD_SLOTS * 4);
+    this.paletteData.set(palette.subarray(0, n));
+    this.gpu.device.queue.writeBuffer(this.paletteBuffer, 0, this.paletteData, 0, n);
   }
 
   /**
@@ -450,8 +452,81 @@ export class Renderer {
 
   /** Upload per-slot materials (256×8 f32) and enable material shading. */
   updateMaterials(materials: Float32Array): void {
-    this.gpu.device.queue.writeBuffer(this.materialBuffer, 0, materials, 0, Math.min(materials.length, MATERIAL_FLOATS));
+    const n = Math.min(materials.length, WORLD_SLOTS * MATERIAL_WORDS);
+    this.materialData.set(materials.subarray(0, n));
+    this.gpu.device.queue.writeBuffer(this.materialBuffer, 0, this.materialData, 0, n);
     this.materialsEnabled = 1;
+  }
+
+  // --- instance palettes -------------------------------------------------------
+
+  /**
+   * A palette of its own for instances: `colors` is RGBA per entry (a role's
+   * colour at index r - 1), `materials` optionally 8 floats per entry (see
+   * PaletteAllocator.buildMaterials). Returns the slot of entry 0, the
+   * `base` an instance uses. There is no budget beyond GPU memory: a
+   * species, or a single placement, can have its own.
+   */
+  addPalette(colors: Float32Array, materials?: Float32Array): number {
+    const n = Math.max(1, Math.floor(colors.length / 4));
+    const i = this.paletteFree.findIndex(([, len]) => len >= n);
+    let base: number;
+    if (i >= 0) {
+      const [at, len] = this.paletteFree[i];
+      base = at;
+      if (len === n) this.paletteFree.splice(i, 1);
+      else this.paletteFree[i] = [at + n, len - n];
+    } else {
+      base = this.paletteEnd;
+      this.paletteEnd += n;
+    }
+    this.growPalette();
+    this.writePalette(base, colors, materials);
+    return base;
+  }
+
+  /** Recolour a palette in place (restyle every instance that uses it). */
+  setPaletteColors(base: number, colors: Float32Array, materials?: Float32Array): void {
+    if (base < WORLD_SLOTS) throw new Error("setPaletteColors is for instance palettes; use updatePalette for the world's");
+    this.writePalette(base, colors, materials);
+  }
+
+  /** Free a palette from addPalette. Instances still naming it draw garbage colours. */
+  removePalette(base: number, entries: number): void {
+    if (base < WORLD_SLOTS) return;
+    this.paletteFree.push([base, entries]);
+  }
+
+  private writePalette(base: number, colors: Float32Array, materials?: Float32Array): void {
+    const n = Math.floor(colors.length / 4);
+    this.paletteData.set(colors.subarray(0, n * 4), base * 4);
+    this.gpu.device.queue.writeBuffer(this.paletteBuffer, base * 16, this.paletteData, base * 4, n * 4);
+    const m = this.materialData;
+    if (materials) {
+      m.set(materials.subarray(0, n * MATERIAL_WORDS), base * MATERIAL_WORDS);
+      this.materialsEnabled = 1;
+    } else m.fill(0, base * MATERIAL_WORDS, (base + n) * MATERIAL_WORDS);
+    this.gpu.device.queue.writeBuffer(this.materialBuffer, base * MATERIAL_WORDS * 4, m, base * MATERIAL_WORDS, n * MATERIAL_WORDS);
+  }
+
+  private makePaletteBuffer(wordsPerSlot: number): GPUBuffer {
+    const slots = this.paletteData.length / 4;
+    return this.gpu.device.createBuffer({ size: slots * wordsPerSlot * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  }
+
+  /** Make room for every claimed slot: reallocate both buffers with headroom and rebind. */
+  private growPalette(): void {
+    if (this.paletteEnd * 4 <= this.paletteData.length) return;
+    const slots = Math.ceil(this.paletteEnd * 1.5);
+    const p = new Float32Array(slots * 4); p.set(this.paletteData); this.paletteData = p;
+    const m = new Float32Array(slots * MATERIAL_WORDS); m.set(this.materialData); this.materialData = m;
+    this.paletteBuffer.destroy();
+    this.materialBuffer.destroy();
+    this.paletteBuffer = this.makePaletteBuffer(4);
+    this.materialBuffer = this.makePaletteBuffer(MATERIAL_WORDS);
+    this.gpu.device.queue.writeBuffer(this.paletteBuffer, 0, this.paletteData);
+    this.gpu.device.queue.writeBuffer(this.materialBuffer, 0, this.materialData);
+    this.bindGroup = this.makeBindGroup();
   }
 
   /** Toggle/parameterise selection-highlight shading (greyout + edge highlight). */
