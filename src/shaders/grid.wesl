@@ -37,9 +37,20 @@ const MODEL_WORDS : u32 = 8u;
 // the bounds tests. Signed shifts and masks (b >> 3, b & 7 on vec3<i32>)
 // read wrong on Adreno 7xx, where every voxel came back empty.
 
+// Signed <-> unsigned vector conversions are done a component at a time:
+// on Adreno 7xx, vec3<u32>(v) of a computed vec3<i32> read wrong (brick
+// lookups whose coordinates came from the ray walk all came back empty),
+// while scalar conversions were fine.
+fn toU(v : vec3<i32>) -> vec3<u32> {
+  return vec3<u32>(u32(v.x), u32(v.y), u32(v.z));
+}
+fn toI(v : vec3<u32>) -> vec3<i32> {
+  return vec3<i32>(i32(v.x), i32(v.y), i32(v.z));
+}
+
 /** Brick entry of a grid whose top level is at `topOff` with dims `td`; `b` in range. */
 fn gridEntry(topOff : u32, td : vec3<u32>, bi : vec3<i32>) -> u32 {
-  let b = vec3<u32>(bi);
+  let b = toU(bi);
   let t = b / 8u;
   let blk = idx[U.topsOff + topOff + t.x + t.y * td.x + t.z * td.x * td.y];
   if (blk == 0u) {
@@ -51,7 +62,7 @@ fn gridEntry(topOff : u32, td : vec3<u32>, bi : vec3<i32>) -> u32 {
 
 /** World brick entry for brick `b` (in range), through the top-level texture. */
 fn worldEntry(bi : vec3<i32>) -> u32 {
-  let b = vec3<u32>(bi);
+  let b = toU(bi);
   let blk = textureLoad(topTex, b / 8u, 0).r;
   if (blk == 0u) {
     return 0u;
@@ -62,7 +73,7 @@ fn worldEntry(bi : vec3<i32>) -> u32 {
 
 /** Voxel at local cell `l` (0..7) of a brick with entry `e`. */
 fn brickVoxel(e : u32, li3 : vec3<i32>) -> u32 {
-  let l = vec3<u32>(li3);
+  let l = toU(li3);
   if ((e & UNIFORM_BIT) != 0u) {
     return e & 0xffffu;
   }
@@ -88,7 +99,7 @@ fn brickVoxel(e : u32, li3 : vec3<i32>) -> u32 {
 
 /** The instance list of the world top cell containing `p` (in range): count in the low 8 bits. */
 fn cellList(p : vec3<i32>) -> u32 {
-  let t = vec3<u32>(p) / u32(TOP_B);
+  let t = toU(p) / u32(TOP_B);
   return idx[U.cellOff + t.x + t.y * U.topDim.x + t.z * U.topDim.x * U.topDim.y];
 }
 
@@ -131,9 +142,9 @@ fn instanceVoxel(p : vec3<i32>) -> u32 {
     if (any(q < vec3<i32>(0)) || any(q >= size)) {
       continue;
     }
-    let qu = vec3<u32>(q);
-    let e = gridEntry(idx[mi], vec3<u32>(idx[mi + 1u], idx[mi + 2u], idx[mi + 3u]), vec3<i32>(qu / 8u));
-    let v = brickVoxel(e, vec3<i32>(qu % 8u));
+    let qu = toU(q);
+    let e = gridEntry(idx[mi], vec3<u32>(idx[mi + 1u], idx[mi + 2u], idx[mi + 3u]), toI(qu / 8u));
+    let v = brickVoxel(e, toI(qu % 8u));
     if (v != 0u) {
       return idx[o + 9u] + v - 1u;
     }
@@ -145,10 +156,10 @@ fn sampleVoxel(p : vec3<i32>) -> u32 {
   if (any(p < vec3<i32>(0)) || any(p >= vec3<i32>(U.gridSize))) {
     return 0u;
   }
-  let pu = vec3<u32>(p);
-  let e = worldEntry(vec3<i32>(pu / 8u));
+  let pu = toU(p);
+  let e = worldEntry(toI(pu / 8u));
   if (e != 0u) {
-    let v = brickVoxel(e, vec3<i32>(pu % 8u));
+    let v = brickVoxel(e, toI(pu % 8u));
     if (v != 0u || (!INSTANCES || U.instanceCount == 0u)) {
       return v;
     }
@@ -218,7 +229,7 @@ fn coarseSolid(p : vec3<i32>) -> bool {
 // that holds nothing at all (no world block, no instances), else the brick.
 // Call only where coarseSolid(p) is false, so `p` is in range.
 fn skipSize(p : vec3<i32>) -> i32 {
-  if (textureLoad(topTex, vec3<u32>(p) / u32(TOP_B), 0).r != 0u) {
+  if (textureLoad(topTex, toU(p) / u32(TOP_B), 0).r != 0u) {
     return COARSE_B;
   }
   if ((INSTANCES && U.instanceCount != 0u) && (cellList(p) & 0xffu) != 0u) {
@@ -272,7 +283,7 @@ fn voxelIn(q : BrickQuery, p : vec3<i32>) -> u32 {
     return 0u;
   }
   if (q.entry != 0u) {
-    let v = brickVoxel(q.entry, vec3<i32>(vec3<u32>(p) % 8u));
+    let v = brickVoxel(q.entry, toI(toU(p) % 8u));
     if (v != 0u || (!INSTANCES || U.instanceCount == 0u)) {
       return v;
     }

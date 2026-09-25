@@ -8,7 +8,7 @@
 //   8 a ray straight down that column hits it (traverse)
 
 import package::uniforms::{U, idx, topTex, brickVox4, palette};
-import package::grid::worldEntry;
+import package::grid::{worldEntry, toU, brickOf, queryBrick};
 import package::grid::sampleVoxel;
 import package::trace::traverse;
 
@@ -72,4 +72,32 @@ fn selfTest2(frag : vec2<f32>) -> vec3<f32> {
   let edge = fract(frag.x / U.resolution.x * 8.0) < 0.02;
   // A blue strip along the top marks this as the second test.
   return select(select(col, vec3<f32>(0.1, 0.3, 0.9), frag.y < 24.0), vec3<f32>(0.05), edge);
+}
+
+// setDebug(9): the vector conversion suspected on Adreno, and the walk's own lookups.
+//   1 vec3<u32>(v) == toU(v) for computed v   2 worldEntry of a computed brick finds one
+//   3 queryBrick(brickOf(p)) marks a column solid   4 a ray down the column hits
+//   5..8 reference (green)
+fn selfTest3(frag : vec2<f32>) -> vec3<f32> {
+  let band = i32(floor(frag.x / U.resolution.x * 8.0));
+  var ok = false;
+  let c = vec3<i32>(U.gridSize) / 2;
+  let ny = i32(U.gridSize.y);
+  switch band {
+    case 0: {
+      ok = true;
+      for (var y = 0; y < ny; y++) { let v = vec3<i32>(c.x + y, y * 3, c.z + y / 2); ok = ok && all(vec3<u32>(v) == toU(v)); }
+    }
+    case 1: { for (var y = 0; y < ny && !ok; y += 8) { ok = worldEntry(vec3<i32>(c.x, y, c.z) / 8) != 0u; } }
+    case 2: { for (var y = 0; y < ny && !ok; y++) { ok = queryBrick(brickOf(vec3<i32>(c.x, y, c.z))).solid; } }
+    case 3: {
+      let ro = vec3<f32>(f32(c.x) + 0.5, U.gridSize.y + 1.0, f32(c.z) + 0.5);
+      ok = traverse(ro, vec3<f32>(0.0001, -1.0, 0.0002), 0.0).hit;
+    }
+    default: { ok = true; }
+  }
+  let col = select(vec3<f32>(0.85, 0.12, 0.1), vec3<f32>(0.1, 0.75, 0.2), ok);
+  let edge = fract(frag.x / U.resolution.x * 8.0) < 0.02;
+  // A yellow strip along the top marks this as the third test.
+  return select(select(col, vec3<f32>(0.9, 0.8, 0.1), frag.y < 24.0), vec3<f32>(0.05), edge);
 }
