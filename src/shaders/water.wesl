@@ -22,8 +22,11 @@ fn ripple(p : vec2<f32>, t : f32) -> f32 {
 }
 
 fn rippleNormal(p0 : vec2<f32>, t : f32) -> vec3<f32> {
-  // Wind drifts the pattern downwind and raises it.
-  let p = p0 - U.waterWind * t * 1.5;
+  // Wind drifts the pattern downwind and raises it. At a finer voxel scale
+  // the waves keep their size in the world: coordinates shrink by
+  // effectScale, and the slope (which is what the normal sees) is unchanged.
+  let es = max(U.effectScale, 1e-3);
+  let p = p0 / es - U.waterWind * t * 1.5;
   let gust = 1.0 + length(U.waterWind) * 1.2;
   let e = 0.35;
   let dx = ripple(p + vec2<f32>(e, 0.0), t) - ripple(p - vec2<f32>(e, 0.0), t);
@@ -76,9 +79,10 @@ fn shadeWater(ro : vec3<f32>, rd : vec3<f32>, cell : vec3<i32>, n : vec3<f32>, w
     let depth = length(bc - hp);
     let lit = bed.color * lightDiffuse(bc, bed.normal);
     let sunUp = clamp(normalize(U.lightDir).y, 0.0, 1.0);
-    let caus = caustic(bc.xz, U.time) * 0.55 * sunUp * exp(-depth * 0.25);
+    let es = max(U.effectScale, 1e-3);
+    let caus = caustic(bc.xz / es, U.time) * 0.55 * sunUp * exp(-depth / es * 0.25);
     let seen = lit * (1.0 + caus * U.lightColor);
-    under = mix(body, seen, exp(-depth * max(att, 0.01)));
+    under = mix(body, seen, exp(-depth / es * max(att, 0.01)));
   }
   out.under = under;
 

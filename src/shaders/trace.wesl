@@ -3,7 +3,7 @@
 // face normal, palette colour, and material index.
 
 import package::uniforms::{U, palette};
-import package::grid::{sampleVoxel, coarseSolid, skipSize};
+import package::grid::{skipSize, brickOf, queryBrick, voxelIn, BrickQuery};
 import package::dda::{stepMask, seedSideDist, skipBlock};
 import package::materials::matOf;
 
@@ -49,20 +49,28 @@ fn walk(ro : vec3<f32>, rd : vec3<f32>, tStart : f32, skipWater : bool) -> Hit {
   var normal = vec3<f32>(0.0);
 
   let steps = min(i32(U.maxSteps), MAX_STEPS);
+  // The current brick's lookup, reused while the ray stays in it.
+  var qb = vec3<i32>(-2147483647);
+  var q : BrickQuery;
   for (var i = 0; i < steps; i = i + 1) {
     if (any(cell < vec3<i32>(-1)) || any(cell > vec3<i32>(U.gridSize))) {
       break;
     }
-    // Empty-space skip: if the coarse block is empty, jump the ray to that
-    // block's far plane in one hop (re-seed exactly like the entry above).
-    if (U.debug < 0.5 && !coarseSolid(cell)) {
+    let b = brickOf(cell);
+    if (any(b != qb)) {
+      qb = b;
+      q = queryBrick(b);
+    }
+    // Empty-space skip: if the brick (or its whole 64^3 block) is empty,
+    // jump the ray to that block's far plane in one hop.
+    if (U.debug < 0.5 && !q.solid) {
       let seed = skipBlock(ro, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
       sideDist = seed.sideDist;
       normal = seed.axis * -sign(rd);
       continue;
     }
-    let c = sampleVoxel(cell);
+    let c = voxelIn(q, cell);
     let water = skipWater && U.materialsEnabled > 0.5 && c != 0u && abs(matOf(c).kind - 4.0) < 0.5;
     if (c != 0u && !water) {
       h.hit = true;

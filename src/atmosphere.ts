@@ -50,4 +50,12 @@ export interface AtmosphereParams {
   surface?: SurfaceParams;
   /** Wind on water: ripple drift (x, z); its length also raises the ripples. */
   waterWind?: [number, number];
+  /**
+   * How many voxels the effects' own sizes are measured in (default 1): water
+   * wavelengths and bed fade, rain and snow particle size and layering, the
+   * sky's fog distance and the snow-shelter test. A world at k times the
+   * resolution passes k so they keep their size in it. Fog density and fall
+   * speeds are already per voxel and are scaled by whoever sets them.
+   */
+  effectScale?: number;
 }

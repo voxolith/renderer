@@ -122,7 +122,7 @@ fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
       coverAmt = smoothstep(0.1, 0.7, U.cover + jitter * 0.35);
       // Sheltered ground (under a canopy or a roof) stays mostly bare. The
       // upward check costs a short ray, so it follows the shadow budget.
-      if (coverAmt > 0.0 && U.shadowSteps > 0.5 && occludedTo(hitCenter, vec3<f32>(0.0, 1.0, 0.0), 48.0)) {
+      if (coverAmt > 0.0 && U.shadowSteps > 0.5 && occludedTo(hitCenter, vec3<f32>(0.0, 1.0, 0.0), 48.0 * max(U.effectScale, 1e-3))) {
         coverAmt *= 0.12;
       }
       albedo = mix(albedo, U.coverColor, coverAmt);

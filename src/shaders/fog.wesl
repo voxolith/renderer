@@ -23,5 +23,5 @@ fn applyFog(color : vec3<f32>, ro : vec3<f32>, rd : vec3<f32>, t : f32) -> vec3<
 }
 
 fn applySkyFog(color : vec3<f32>, ro : vec3<f32>, rd : vec3<f32>) -> vec3<f32> {
-  return mix(color, U.fogColor, fogAmount(ro, rd, SKY_DISTANCE));
+  return mix(color, U.fogColor, fogAmount(ro, rd, SKY_DISTANCE * max(U.effectScale, 1e-3)));
 }

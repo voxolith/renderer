@@ -23,14 +23,17 @@ fn precipitation(ro : vec3<f32>, rd : vec3<f32>, tMax : f32) -> vec4<f32> {
   let shear = fall.xz / min(fall.y, -0.001);
   let stretch = select(7.0, 1.0, snow);
   var acc = 0.0;
+  // Layer distances and particle sizes are in native voxels; effectScale
+  // keeps drops their size in the world at a finer voxel scale.
+  let es = max(U.effectScale, 1e-3);
   for (var k = 0; k < 8; k = k + 1) {
-    let t = 2.5 * pow(1.55, f32(k));
+    let t = 2.5 * pow(1.55, f32(k)) * es;
     if (t > tMax) { break; }
     let p = ro + rd * t;
     // Where this point was when the particle field started falling.
     let q = p - fall * U.time;
     let qs = vec3<f32>(q.x - shear.x * q.y, q.y / stretch, q.z - shear.y * q.y);
-    let size = select(1.3, 2.2, snow) * (1.0 + f32(k) * 0.35);
+    let size = select(1.3, 2.2, snow) * (1.0 + f32(k) * 0.35) * es;
     let cell = floor(qs / size);
     let h = hash3(cell + vec3<f32>(f32(k) * 17.0));
     if (h > U.precipDensity * 0.7) { continue; }
@@ -43,15 +46,15 @@ fn precipitation(ro : vec3<f32>, rd : vec3<f32>, tMax : f32) -> vec4<f32> {
     let pix = t * 2.0 * U.tanHalfFov / U.resolution.y;
     var a : f32;
     if (snow) {
-      let r = max(0.28, pix * 1.2);
-      a = smoothstep(r, r * 0.35, length(local)) * min(1.0, 0.28 / r * 1.5);
+      let r = max(0.28 * es, pix * 1.2);
+      a = smoothstep(r, r * 0.35, length(local)) * min(1.0, 0.28 * es / r * 1.5);
     } else {
-      let r = max(0.07, pix * 1.1);
+      let r = max(0.07 * es, pix * 1.1);
       let len = size * 0.35;
-      a = smoothstep(r, r * 0.3, length(local.xz)) * smoothstep(len, len * 0.4, abs(local.y)) * min(1.0, 0.07 / r * 2.5);
+      a = smoothstep(r, r * 0.3, length(local.xz)) * smoothstep(len, len * 0.4, abs(local.y)) * min(1.0, 0.07 * es / r * 2.5);
     }
     // Far layers are fainter; very near ones too, so drops do not smear the lens.
-    acc += a * (1.0 - f32(k) / 9.0) * smoothstep(3.0, 9.0, t);
+    acc += a * (1.0 - f32(k) / 9.0) * smoothstep(3.0 * es, 9.0 * es, t);
   }
   let alpha = clamp(acc * select(0.95, 0.95, snow), 0.0, 0.85);
   return vec4<f32>(U.precipColor, alpha);

@@ -14,7 +14,7 @@
 // instances skips 64 voxels, a null brick 8 (for instances, only where the
 // model's brick neighbourhood is empty too: NEAR_BIT).
 
-import package::uniforms::{U, idx, brickVox4, brickPal, brickVox8};
+import package::uniforms::{U, idx, brickVox4, brickPal, brickVox8, topTex};
 
 /** Brick edge in voxels. Must match BRICK_B in brick.ts. */
 const COARSE_B : i32 = 8;
@@ -25,12 +25,28 @@ const TIER_BIT : u32 = 0x80000000u;
 const UNIFORM_BIT : u32 = 0x40000000u;
 const SLOT_MASK : u32 = 0x1fffffffu;
 const INST_WORDS : u32 = 12u;
+
+// Pipeline constant: whether this pipeline samples instances at all. The
+// renderer builds the instanced variant only once a scene places one, so a
+// scene without instances runs a shader with that code compiled away (it
+// costs even when never taken: several times the frame on SwiftShader).
+@id(0) override INSTANCES : bool = false;
 const MODEL_WORDS : u32 = 8u;
 
 /** Brick entry of a grid whose top level is at `topOff` with dims `td`; `b` in range. */
 fn gridEntry(topOff : u32, td : vec3<u32>, b : vec3<i32>) -> u32 {
   let t = vec3<u32>(b >> vec3<u32>(3u));
   let blk = idx[U.topsOff + topOff + t.x + t.y * td.x + t.z * td.x * td.y];
+  if (blk == 0u) {
+    return 0u;
+  }
+  let l = vec3<u32>(b & vec3<i32>(7));
+  return idx[U.blocksOff + (blk - 1u) * 512u + l.x + l.y * 8u + l.z * 64u];
+}
+
+/** World brick entry for brick `b` (in range), through the top-level texture. */
+fn worldEntry(b : vec3<i32>) -> u32 {
+  let blk = textureLoad(topTex, b >> vec3<u32>(3u), 0).r;
   if (blk == 0u) {
     return 0u;
   }
@@ -76,13 +92,18 @@ fn toModel(k : u32, wp : vec3<f32>) -> vec3<f32> {
   let c = bitcast<f32>(idx[o + 3u]);
   let anchor = vec3<f32>(bitcast<f32>(idx[o + 4u]), bitcast<f32>(idx[o + 5u]), bitcast<f32>(idx[o + 6u]));
   let s = bitcast<f32>(idx[o + 7u]);
-  let d = wp - pos;
+  // The turn pivots on the anchor voxel's centre, so a quarter turn maps
+  // voxel centres onto voxel centres exactly (as a stamped orientation does).
+  let d = wp - pos - vec3<f32>(0.5, 0.0, 0.5);
   // Inverse of world = R (m - anchor) + pos, R = [c 0 s; 0 1 0; -s 0 c].
-  return vec3<f32>(c * d.x - s * d.z, d.y, s * d.x + c * d.z) + anchor;
+  return vec3<f32>(c * d.x - s * d.z, d.y, s * d.x + c * d.z) + anchor + vec3<f32>(0.5, 0.0, 0.5);
 }
 
 /** Palette slot of the instanced voxel at world cell `p`, or 0. */
 fn instanceVoxel(p : vec3<i32>) -> u32 {
+  if (!INSTANCES) {
+    return 0u;
+  }
   let cl = cellList(p);
   let n = cl & 0xffu;
   if (n == 0u) {
@@ -95,7 +116,11 @@ fn instanceVoxel(p : vec3<i32>) -> u32 {
     let o = U.instOff + k * INST_WORDS;
     let mi = U.modelsOff + idx[o + 8u] * MODEL_WORDS;
     let size = vec3<i32>(i32(idx[mi + 4u]), i32(idx[mi + 5u]), i32(idx[mi + 6u]));
-    let q = vec3<i32>(floor(toModel(k, wp)));
+    var q = vec3<i32>(floor(toModel(k, wp)));
+    // Mirrored instances flip the voxel index along x, after the turn.
+    if ((idx[o + 10u] & 1u) != 0u) {
+      q.x = size.x - 1 - q.x;
+    }
     if (any(q < vec3<i32>(0)) || any(q >= size)) {
       continue;
     }
@@ -112,14 +137,14 @@ fn sampleVoxel(p : vec3<i32>) -> u32 {
   if (any(p < vec3<i32>(0)) || any(p >= vec3<i32>(U.gridSize))) {
     return 0u;
   }
-  let e = gridEntry(0u, U.topDim, p / COARSE_B);
+  let e = worldEntry(p / COARSE_B);
   if (e != 0u) {
     let v = brickVoxel(e, p % COARSE_B);
-    if (v != 0u || U.instanceCount == 0u) {
+    if (v != 0u || (!INSTANCES || U.instanceCount == 0u)) {
       return v;
     }
   }
-  if (U.instanceCount == 0u) {
+  if ((!INSTANCES || U.instanceCount == 0u)) {
     return 0u;
   }
   return instanceVoxel(p);
@@ -131,6 +156,9 @@ fn isSolid(p : vec3<i32>) -> bool {
 
 /** May an instance have voxels in the world brick `c` (brick coords, in range)? */
 fn instanceNear(c : vec3<i32>) -> bool {
+  if (!INSTANCES) {
+    return false;
+  }
   let cl = cellList(c * COARSE_B);
   let n = cl & 0xffu;
   if (n == 0u) {
@@ -144,7 +172,11 @@ fn instanceNear(c : vec3<i32>) -> bool {
     let mi = U.modelsOff + idx[o + 8u] * MODEL_WORDS;
     let size = vec3<i32>(i32(idx[mi + 4u]), i32(idx[mi + 5u]), i32(idx[mi + 6u]));
     let bdim = (size + vec3<i32>(COARSE_B - 1)) / COARSE_B;
-    let qb = vec3<i32>(floor(toModel(k, wc) / f32(COARSE_B)));
+    var qm = toModel(k, wc);
+    if ((idx[o + 10u] & 1u) != 0u) {
+      qm.x = f32(size.x) - qm.x;
+    }
+    let qb = vec3<i32>(floor(qm / f32(COARSE_B)));
     // One brick outside the model can still overlap its edge bricks, whose
     // NEAR flags cover their own neighbourhood: clamp onto them.
     if (any(qb < vec3<i32>(-1)) || any(qb > bdim)) {
@@ -167,22 +199,78 @@ fn coarseSolid(p : vec3<i32>) -> bool {
   if (any(c < vec3<i32>(0)) || any(c >= vec3<i32>(U.coarseDim))) {
     return true;
   }
-  if (gridEntry(0u, U.topDim, c) != 0u) {
+  if (worldEntry(c) != 0u) {
     return true;
   }
-  return U.instanceCount != 0u && instanceNear(c);
+  return (INSTANCES && U.instanceCount != 0u) && instanceNear(c);
 }
 
 // How far an empty brick at `p` lets a ray skip: its whole 64^3 top cell when
 // that holds nothing at all (no world block, no instances), else the brick.
 // Call only where coarseSolid(p) is false, so `p` is in range.
 fn skipSize(p : vec3<i32>) -> i32 {
-  let t = vec3<u32>(p / TOP_B);
-  if (idx[U.topsOff + t.x + t.y * U.topDim.x + t.z * U.topDim.x * U.topDim.y] != 0u) {
+  if (textureLoad(topTex, p / TOP_B, 0).r != 0u) {
     return COARSE_B;
   }
-  if (U.instanceCount != 0u && (cellList(p) & 0xffu) != 0u) {
+  if ((INSTANCES && U.instanceCount != 0u) && (cellList(p) & 0xffu) != 0u) {
     return COARSE_B;
   }
   return TOP_B;
+}
+
+// --- per-brick queries for ray walks --------------------------------------------
+//
+// A ray takes several fine steps inside each brick. Looking the brick up
+// once when it enters (world entry, and whether an instance may be there)
+// and reusing that for every step inside is what keeps the two-level index
+// as cheap to walk as a flat one.
+
+struct BrickQuery {
+  /** World brick entry (0 when empty or out of range). */
+  entry : u32,
+  /** False when a ray may skip this brick: nothing of the world or of an instance there. */
+  solid : bool,
+  /** An instance may have voxels here. */
+  near  : bool,
+  /** The brick lies inside the grid. */
+  inGrid : bool,
+};
+
+/** Brick coordinates of a fine cell, flooring (cells may be one outside the grid). */
+fn brickOf(p : vec3<i32>) -> vec3<i32> {
+  return vec3<i32>(floor(vec3<f32>(p) / f32(COARSE_B)));
+}
+
+fn queryBrick(c : vec3<i32>) -> BrickQuery {
+  var q : BrickQuery;
+  q.inGrid = all(c >= vec3<i32>(0)) && all(c < vec3<i32>(U.coarseDim));
+  if (!q.inGrid) {
+    // Out of range: never skip; the walk's own bounds test ends the ray.
+    q.entry = 0u;
+    q.near = false;
+    q.solid = true;
+    return q;
+  }
+  q.entry = worldEntry(c);
+  q.near = q.entry == 0u && (INSTANCES && U.instanceCount != 0u) && instanceNear(c);
+  q.solid = q.entry != 0u || q.near;
+  return q;
+}
+
+/** The voxel at fine cell `p`, which lies in the brick `q` describes. */
+fn voxelIn(q : BrickQuery, p : vec3<i32>) -> u32 {
+  if (!q.inGrid || any(p < vec3<i32>(0)) || any(p >= vec3<i32>(U.gridSize))) {
+    return 0u;
+  }
+  if (q.entry != 0u) {
+    let v = brickVoxel(q.entry, p % COARSE_B);
+    if (v != 0u || (!INSTANCES || U.instanceCount == 0u)) {
+      return v;
+    }
+    return instanceVoxel(p);
+  }
+  if (q.near) {
+    return instanceVoxel(p);
+  }
+  return 0u;
 }

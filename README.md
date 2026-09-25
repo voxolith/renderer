@@ -93,8 +93,11 @@ See [voxolith/examples](https://github.com/voxolith/examples) for complete, runn
 Grouped as in `src/index.ts`:
 
 - **Device**: `initGpu(canvas, GpuOptions?)`, `resizeToDisplay`, `setRenderScale`, `showUnsupportedScreen` (options `appName`, `emoji`, `iconHtml`), `WebGPUUnsupportedError`, `GpuContext` (includes `adapterInfo` and a `software` flag)
-- **Renderer**: `createRenderer`, `Renderer` (`render`, `updateVoxels`, `updateCoarse`, `setFloor`,
-  `setClipBounds`, `setQuality`, `getQuality`, `setDebug`), `QUALITY_PRESETS`, `RenderQuality`, `RenderScene`, `FrameParams`, `FloorParams`, `DirtyBox`, `raymarchShaderCode`
+- **Renderer**: `createRenderer`, `Renderer` (`render`, `updateVoxels`, `edit`, `editMany`, `clear`, `setFloor`,
+  `setClipBounds`, `setQuality`, `getQuality`, `setDebug`, `stats`), `QUALITY_PRESETS`, `RenderQuality`, `RenderScene`, `FrameParams`, `FloorParams`, `DirtyBox`, `raymarchShaderCode`
+- **Instances**: `renderer.addModel`, `removeModel`, `setInstances` (static, or `{ dynamic: true }` per frame), `instanceStats`; `ModelSource`, `Instance`
+- **Sparse volumes**: `SparseVoxels`, `makeSparse`, `sparseGet`, `sparseSet`, `sparseFromDense`, `sparseToDense`, `sparseCount`
+- **Storage**: `BrickGrid`, `BrickPool`, `BRICK_B`, `TOP_B`
 - **Frame loop**: `makeFrameLoop` (render on demand), `observeResize`
 - **Formats**: `parseVox`, `writeVox`, `parseVoxScene`, `decodeVoxRotation`, `voxSceneAnimator`,
   `packMaterials`, `buildMinecraftRegion`
@@ -105,11 +108,45 @@ Grouped as in `src/index.ts`:
 - **Lighting**: `renderer.setLights()` (point lights with range-limited shadows and a visible
   glow, up to `MAX_LIGHTS`)
 - **Atmosphere**: optional `FrameParams` fields `fog`, `clouds`, `precipitation`, `surface`,
-  `waterWind` (types `AtmosphereParams` and friends)
+  `waterWind`, `effectScale` (types `AtmosphereParams` and friends)
 - **Effects**: `makeExplosion`, `makeMuzzleFlash`
 - **Utilities**: `rayAABB`, `makeRay`, `voxelRaycast` (CPU DDA for hit tests), `seededRandom` / `hashSeed`, `makePerf` (adaptive render scale + overlay)
 
-`COARSE_B` is duplicated as a WGSL constant in `src/shaders/raymarch.wesl`. Keep them in sync.
+`BRICK_B` and `TOP_B` are duplicated as WGSL constants (`COARSE_B`, `TOP_B`) in
+`src/shaders/grid.wesl`. Keep them in sync.
+
+## Storage
+
+The world is 8³ bricks, each a 4-bit index into its own 15-entry palette (8-bit when a brick
+holds more values), under a two-level index: blocks of 8³ brick entries (64³ voxels) that exist
+only where something is, below one top-level entry per block. A brick of a single value is kept
+in its index entry with no payload. An empty world of 12800 x 2048 x 12800 voxels costs its
+5 MB top level; what is resident costs its surface. A null block is a 64-voxel empty-space skip
+for rays, a null brick an 8-voxel one.
+
+Every index table sits in one storage buffer in regions (world and model top levels, blocks,
+instance lists, instances, models), so the pass stays within 8 storage buffers per stage; the
+world's top level is mirrored in a small 3D texture, since every ray step starts there. Ray walks
+look a brick up once as they enter it and reuse it for every step inside.
+
+## Instances
+
+`addModel({ size, data | sparse })` uploads a model once into the shared brick pool;
+`setInstances([{ model, x, y, z, anchor?, yaw?, mirror?, base }])` draws it anywhere, at any
+heading, at fractional positions, with its role values mapped to `base + r - 1` per instance.
+Each 64³ top cell lists the instances whose box touches it; a voxel the world leaves empty is
+looked up in them, turned into model space (pivoting on the anchor voxel's centre, so a quarter
+turn is exact). That is resampling at world voxel centres: a turned instance still reads as
+axis-aligned cubes, and shadows, AO, lights and water need nothing special. Empty model bricks
+next to content are flagged so rays still skip through turned models safely.
+
+Instance sampling is a pipeline constant: a scene that never places an instance runs a shader
+with that code compiled away (it costs even untaken), and the instanced pipeline is built the
+first time one is placed.
+
+Scenery is `setInstances(list)` (lists built once); a crowd is
+`setInstances(list, { dynamic: true })` each frame, which costs only the moving instances and the
+cells they touch. The engine's `makeInstanceLayer` and `makeCrowd({ instances })` drive both.
 
 ## Performance controls
 
@@ -203,6 +240,9 @@ before. The renderer knows nothing about weather; `@voxolith/engine/atmosphere` 
   faces towards a snow colour. On medium and high quality a short upward ray keeps it off ground
   under canopies and roofs; `low` skips that ray.
 - `waterWind`: drifts and raises the ripples on water.
+- `effectScale`: how many voxels the effects' own sizes are measured in (default 1). A world at
+  ten times the resolution passes 10 so waves, caustics, drops and snowflakes keep their size in
+  it (`atmosphereFrame(..., { voxelsPerMetre })` sets it).
 
 Cost: fog and clouds are a few arithmetic ops per pixel; precipitation is 8 hash samples; snow
 shelter is one short ray per upward pixel while `cover > 0`.

@@ -58,7 +58,8 @@ struct Uniforms {
   fogFalloff   : f32,                             // 125
   cloudDrift   : vec2<f32>,                       // 126,127
   waterWind    : vec2<f32>,                       // 128,129
-  _w0          : vec2<f32>,                       // 130,131
+  effectScale  : f32,                             // 130  voxels per unit of the effects below (1 = native)
+  _w0          : f32,                             // 131
   // --- index regions (u32 word offsets into idx; see renderer.ts) ---
   topDim       : vec3<u32>, instanceCount : u32,  // 132-135  world top-level dims
   blocksOff    : u32, cellOff : u32, listOff : u32, instOff : u32, // 136-139
@@ -86,3 +87,6 @@ struct Uniforms {
 // Point lights: 3 vec4 each — (position, range), (colour × intensity, 0),
 // (shadows 0/1, glow radius, 0, 0). U.lightCount of them are live.
 @group(0) @binding(7) var<storage, read> lights : array<vec4<f32>>;
+// The world's top level again (one texel per 64^3 block: 0 or block + 1):
+// the lookup every ray step starts with, and texture reads cache better.
+@group(0) @binding(8) var topTex : texture_3d<u32>;

@@ -72,7 +72,7 @@ const UNIFORM_FLOATS = 144;
 // within the default limit of 8 storage buffers per stage.
 type RegionName = "tops" | "blocks" | "cells" | "list" | "inst" | "models";
 const REGIONS: RegionName[] = ["tops", "blocks", "cells", "list", "inst", "models"];
-/** u32 words per instance: position, cos, anchor, sin, model, palette base, 2 pad. */
+/** u32 words per instance: position, cos, anchor, sin, model, palette base, flags (1 = mirror), pad. */
 const INST_WORDS = 12;
 /** u32 words per model: top offset, top dims, size, pad. */
 const MODEL_WORDS = 8;
@@ -96,8 +96,14 @@ export interface Instance {
   z: number;
   /** Model anchor, in model voxels (default the base centre: size.x/2, 0, size.z/2). */
   anchor?: Vec3;
-  /** Radians about +y; 0 leaves the model as authored. */
+  /** Radians about +y; 0 leaves the model as authored. Turns pivot on the anchor voxel's centre. */
   yaw?: number;
+  /**
+   * Mirror the model along its x before turning (the engine's orientation
+   * bit 2): with yaw = -(o & 3) * PI / 2 this draws exactly what stamping
+   * with orientation o would. `anchor` stays the unmirrored model's.
+   */
+  mirror?: boolean;
   /** Palette slot of role 1: a voxel of role r draws slot base + r - 1. */
   base: number;
 }
@@ -162,7 +168,7 @@ export interface FrameParams extends AtmosphereParams {
 export interface RenderQuality {
   /** Primary-ray DDA step cap (16..4096). Lower is cheaper; too low clips far geometry. */
   maxSteps: number;
-  /** Shadow-ray step cap (0..128). 0 disables shadows entirely. */
+  /** Shadow-ray step cap (0..512). 0 disables shadows entirely. */
   shadowSteps: number;
   /** Face ambient occlusion (8 neighbour lookups per hit). */
   ao: boolean;
@@ -187,6 +193,9 @@ export interface FloorParams {
 export class Renderer {
   private readonly gpu: GpuContext;
   private readonly pipeline: GPURenderPipeline;
+  /** The same pass with instance sampling compiled in; made when a scene first places one. */
+  private instancedPipeline: GPURenderPipeline | null = null;
+  private readonly makePipeline: (instances: boolean) => GPURenderPipeline;
   private readonly uniformBuffer: GPUBuffer;
   private readonly uniformData = new Float32Array(UNIFORM_FLOATS);
   private bindGroup: GPUBindGroup;
@@ -199,6 +208,8 @@ export class Renderer {
   /** Bricks and index blocks for the world and every model. */
   private readonly pool: BrickPool;
   private idxBuffer: GPUBuffer;
+  /** The world's top level again, as a 3D texture: the lookup every ray step starts with, and texture reads cache better. */
+  private readonly topTexture: GPUTexture;
   private layout: Record<RegionName, { off: number; cap: number }>;
   private models: (GpuModel | null)[] = [];
   private modelData = new Uint32Array(MODEL_WORDS * 16);
@@ -255,8 +266,15 @@ export class Renderer {
     this.coarseDim = [...this.bricks.dim] as Vec3;
     this.topEnd = this.bricks.top.length;
     this.cellData = new Uint32Array(this.bricks.top.length);
+    this.staticCells = new Uint32Array(this.bricks.top.length);
     this.layout = this.planLayout();
     this.idxBuffer = this.makeIdxBuffer();
+    this.topTexture = device.createTexture({
+      size: this.bricks.topDim,
+      dimension: "3d",
+      format: "r32uint",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
 
     const paletteBuffer = device.createBuffer({
       size: scene.palette.byteLength,
@@ -342,20 +360,31 @@ export class Renderer {
           visibility: GPUShaderStage.FRAGMENT,
           buffer: { type: "read-only-storage" },
         },
+        {
+          binding: 8,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: { sampleType: "uint", viewDimension: "3d" },
+        },
       ],
     });
     this.bindLayout = layout;
 
-    this.pipeline = device.createRenderPipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
-      vertex: { module, entryPoint: "vs" },
-      fragment: {
-        module,
-        entryPoint: "fs",
-        targets: [{ format: gpu.format }],
-      },
-      primitive: { topology: "triangle-list" },
-    });
+    const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] });
+    // Instance sampling is a pipeline constant (grid.wesl INSTANCES), so a
+    // scene without instances never pays for the code.
+    this.makePipeline = (instances) =>
+      device.createRenderPipeline({
+        layout: pipelineLayout,
+        vertex: { module, entryPoint: "vs" },
+        fragment: {
+          module,
+          entryPoint: "fs",
+          targets: [{ format: gpu.format }],
+          constants: { 0: instances ? 1 : 0 },
+        },
+        primitive: { topology: "triangle-list" },
+      });
+    this.pipeline = this.makePipeline(false);
 
     this.bindGroup = this.makeBindGroup();
     this.uploadIndexAll();
@@ -392,6 +421,7 @@ export class Renderer {
         { binding: 5, resource: { buffer: this.brickPal } },
         { binding: 6, resource: { buffer: this.brickVox8 } },
         { binding: 7, resource: { buffer: this.lightBuffer } },
+        { binding: 8, resource: this.topTexture.createView() },
       ],
     });
   }
@@ -434,7 +464,7 @@ export class Renderer {
     const src = typeof q === "string" ? QUALITY_PRESETS[q] : q;
     this.quality = {
       maxSteps: Math.max(16, Math.min(4096, Math.round(src.maxSteps ?? this.quality.maxSteps))),
-      shadowSteps: Math.max(0, Math.min(128, Math.round(src.shadowSteps ?? this.quality.shadowSteps))),
+      shadowSteps: Math.max(0, Math.min(512, Math.round(src.shadowSteps ?? this.quality.shadowSteps))),
       ao: src.ao ?? this.quality.ao,
     };
   }
@@ -456,6 +486,7 @@ export class Renderer {
    */
   destroy(): void {
     this.idxBuffer.destroy();
+    this.topTexture.destroy();
     this.brickVox4.destroy();
     this.brickPal.destroy();
     this.brickVox8.destroy();
@@ -575,72 +606,153 @@ export class Renderer {
   }
 
   /**
-   * Replace every instance. Cheap enough to call per frame for a few thousand:
-   * it rewrites the instance table and the lists of the top cells they cover.
+   * Place instances. Static ones (the default: scenery) replace the static
+   * set and build its per-cell lists once. `{ dynamic: true }` replaces only
+   * the moving set, which is what a crowd calls every frame: its cost is the
+   * moving instances and the cells they touch, however much scenery there is.
    */
-  setInstances(list: readonly Instance[]): void {
-    const [tx, ty, tz] = this.bricks.topDim;
-    if (this.instData.length < list.length * INST_WORDS) this.instData = growU32(this.instData, list.length * INST_WORDS);
-    const f = new Float32Array(this.instData.buffer);
+  setInstances(list: readonly Instance[], opts: { dynamic?: boolean } = {}): void {
+    if (opts.dynamic) {
+      this.dynamicList = list;
+      this.rebuildDynamic();
+      return;
+    }
+    // Static: instances [0, n), lists [0, total), and the cell entries they give.
     const perCell = new Map<number, number[]>();
-    let dropped = 0;
-    this.instCount = 0;
+    this.staticCount = 0;
     for (const inst of list) {
-      const m = this.models[inst.model];
-      if (!m) continue;
-      const k = this.instCount++;
-      const o = k * INST_WORDS;
-      const yaw = inst.yaw ?? 0, c = Math.cos(yaw), sn = Math.sin(yaw);
-      const an = inst.anchor ?? [m.size.x / 2, 0, m.size.z / 2];
-      f[o] = inst.x; f[o + 1] = inst.y; f[o + 2] = inst.z; f[o + 3] = c;
-      f[o + 4] = an[0]; f[o + 5] = an[1]; f[o + 6] = an[2]; f[o + 7] = sn;
-      this.instData[o + 8] = inst.model;
-      this.instData[o + 9] = inst.base;
-      this.instData[o + 10] = 0; this.instData[o + 11] = 0;
-      // World box of the turned model: world = R (m - anchor) + pos, with
-      // R = [c 0 s; 0 1 0; -s 0 c] (the same turn as bakePose).
-      let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
-      for (const mx of [0, m.size.x]) for (const mz of [0, m.size.z]) {
-        const dx = mx - an[0], dz = mz - an[2];
-        const wx = c * dx + sn * dz + inst.x, wz = -sn * dx + c * dz + inst.z;
-        x0 = Math.min(x0, wx); x1 = Math.max(x1, wx); z0 = Math.min(z0, wz); z1 = Math.max(z1, wz);
-      }
-      const y0 = inst.y - an[1], y1 = y0 + m.size.y;
-      const cx0 = Math.max(0, Math.floor((x0 - 1) / TOP_B)), cx1 = Math.min(tx - 1, Math.floor((x1 + 1) / TOP_B));
-      const cy0 = Math.max(0, Math.floor((y0 - 1) / TOP_B)), cy1 = Math.min(ty - 1, Math.floor((y1 + 1) / TOP_B));
-      const cz0 = Math.max(0, Math.floor((z0 - 1) / TOP_B)), cz1 = Math.min(tz - 1, Math.floor((z1 + 1) / TOP_B));
-      for (let cz = cz0; cz <= cz1; cz++)
-        for (let cy = cy0; cy <= cy1; cy++)
-          for (let cx = cx0; cx <= cx1; cx++) {
-            const ci = cx + cy * tx + cz * tx * ty;
-            let l = perCell.get(ci);
-            if (!l) perCell.set(ci, (l = []));
-            if (l.length < MAX_CELL_INSTANCES) l.push(k);
-            else dropped++;
-          }
+      const k = this.writeInstance(inst, this.staticCount);
+      if (k < 0) continue;
+      this.cellsOf(k, (ci) => {
+        let l = perCell.get(ci);
+        if (!l) perCell.set(ci, (l = []));
+        l.push(k);
+      });
+      this.staticCount++;
+    }
+    for (const ci of this.staticTouched) this.staticCells[ci] = 0;
+    this.staticTouched = [];
+    let total = 0;
+    for (const l of perCell.values()) total += Math.min(MAX_CELL_INSTANCES, l.length);
+    if (this.listData.length < total) this.listData = growU32(this.listData, total);
+    let at = 0, dropped = 0;
+    for (const [ci, l] of perCell) {
+      const n = Math.min(MAX_CELL_INSTANCES, l.length);
+      dropped += l.length - n;
+      this.staticCells[ci] = (at << 8) | n;
+      for (let i = 0; i < n; i++) this.listData[at++] = l[i];
+      this.staticTouched.push(ci);
     }
     if (dropped) console.warn(`setInstances: ${dropped} cell entries over the ${MAX_CELL_INSTANCES}-per-cell limit were dropped`);
-    // Lists, and the cell entries pointing into them.
-    let total = 0;
-    for (const l of perCell.values()) total += l.length;
-    if (this.listData.length < total) this.listData = growU32(this.listData, total);
+    this.staticListLen = total;
+    this.cellData.set(this.staticCells);
+    this.cellTouched = [];
+    this.staticDirty = true;
+    this.rebuildDynamic();
+  }
+
+  private dynamicList: readonly Instance[] = [];
+  private staticCount = 0;
+  private staticListLen = 0;
+  private staticCells = new Uint32Array(0);
+  private staticTouched: number[] = [];
+  private staticDirty = false;
+
+  /** Write instance `k`'s words; returns k, or -1 when its model is gone. */
+  private writeInstance(inst: Instance, k: number): number {
+    const m = this.models[inst.model];
+    if (!m) return -1;
+    if (this.instData.length < (k + 1) * INST_WORDS) this.instData = growU32(this.instData, (k + 1) * INST_WORDS);
+    const f = new Float32Array(this.instData.buffer);
+    const o = k * INST_WORDS;
+    const yaw = inst.yaw ?? 0, c = Math.cos(yaw), sn = Math.sin(yaw);
+    const a0 = inst.anchor ?? [m.size.x / 2, 0, m.size.z / 2];
+    // In the mirrored model the anchor voxel is the reflected one.
+    const an: Vec3 = inst.mirror ? [m.size.x - 1 - a0[0], a0[1], a0[2]] : [a0[0], a0[1], a0[2]];
+    f[o] = inst.x; f[o + 1] = inst.y; f[o + 2] = inst.z; f[o + 3] = c;
+    f[o + 4] = an[0]; f[o + 5] = an[1]; f[o + 6] = an[2]; f[o + 7] = sn;
+    this.instData[o + 8] = inst.model;
+    this.instData[o + 9] = inst.base;
+    this.instData[o + 10] = inst.mirror ? 1 : 0; this.instData[o + 11] = 0;
+    // World box of the turned model: world = R (m - anchor) + pos, with
+    // R = [c 0 s; 0 1 0; -s 0 c] (the same turn as bakePose), pivoting on
+    // the anchor voxel's centre.
+    let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+    for (const mx of [0, m.size.x]) for (const mz of [0, m.size.z]) {
+      const dx = mx - an[0] - 0.5, dz = mz - an[2] - 0.5;
+      const wx = c * dx + sn * dz + inst.x + 0.5, wz = -sn * dx + c * dz + inst.z + 0.5;
+      x0 = Math.min(x0, wx); x1 = Math.max(x1, wx); z0 = Math.min(z0, wz); z1 = Math.max(z1, wz);
+    }
+    const y0 = inst.y - an[1], y1 = y0 + m.size.y;
+    if (this.instBox.length < (k + 1) * 6) { const nb = new Float64Array(Math.max(64, (k + 1) * 12)); nb.set(this.instBox); this.instBox = nb; }
+    this.instBox.set([x0, y0, z0, x1, y1, z1], k * 6);
+    return k;
+  }
+  private instBox = new Float64Array(64 * 6);
+
+  /** Every world top cell instance `k`'s box touches. */
+  private cellsOf(k: number, visit: (ci: number) => void): void {
+    const [tx, ty, tz] = this.bricks.topDim;
+    const b = this.instBox, o = k * 6;
+    const cx0 = Math.max(0, Math.floor((b[o] - 1) / TOP_B)), cx1 = Math.min(tx - 1, Math.floor((b[o + 3] + 1) / TOP_B));
+    const cy0 = Math.max(0, Math.floor((b[o + 1] - 1) / TOP_B)), cy1 = Math.min(ty - 1, Math.floor((b[o + 4] + 1) / TOP_B));
+    const cz0 = Math.max(0, Math.floor((b[o + 2] - 1) / TOP_B)), cz1 = Math.min(tz - 1, Math.floor((b[o + 5] + 1) / TOP_B));
+    for (let cz = cz0; cz <= cz1; cz++)
+      for (let cy = cy0; cy <= cy1; cy++)
+        for (let cx = cx0; cx <= cx1; cx++) visit(cx + cy * tx + cz * tx * ty);
+  }
+
+  /**
+   * Moving instances go after the static ones. Each cell they touch gets a
+   * fresh list (its static instances, then the moving ones) after the static
+   * lists; cells they left get their static entry back.
+   */
+  private rebuildDynamic(): void {
+    let n = this.staticCount;
+    const perCell = new Map<number, number[]>();
+    for (const inst of this.dynamicList) {
+      const k = this.writeInstance(inst, n);
+      if (k < 0) continue;
+      this.cellsOf(k, (ci) => {
+        let l = perCell.get(ci);
+        if (!l) perCell.set(ci, (l = []));
+        l.push(k);
+      });
+      n++;
+    }
+    const dynCount = n - this.staticCount;
+    let at = this.staticListLen;
     const touched: number[] = [];
-    for (const ci of this.cellTouched) this.cellData[ci] = 0;
-    let at = 0;
+    for (const ci of this.cellTouched) this.cellData[ci] = this.staticCells[ci];
     for (const [ci, l] of perCell) {
-      this.cellData[ci] = (at << 8) | l.length;
-      for (const k of l) this.listData[at++] = k;
+      const st = this.staticCells[ci];
+      const sn = st & 0xff, ss = st >>> 8;
+      const count = Math.min(MAX_CELL_INSTANCES, sn + l.length);
+      if (this.listData.length < at + count) this.listData = growU32(this.listData, at + count);
+      this.cellData[ci] = (at << 8) | count;
+      for (let i = 0; i < sn && i < count; i++) this.listData[at + i] = this.listData[ss + i];
+      for (let i = sn; i < count; i++) this.listData[at + i] = l[i - sn];
+      at += count;
       touched.push(ci);
     }
     const dirty = [...this.cellTouched, ...touched];
     this.cellTouched = touched;
-    this.listLen = total;
+    this.instCount = n;
+    this.listLen = at;
     if (this.ensureLayout()) {
+      this.staticDirty = false;
       this.uploadIndexAll();
       return;
     }
-    this.writeRegion("inst", 0, this.instData, 0, this.instCount * INST_WORDS);
-    this.writeRegion("list", 0, this.listData, 0, this.listLen);
+    if (this.staticDirty) {
+      this.writeRegion("inst", 0, this.instData, 0, this.instCount * INST_WORDS);
+      this.writeRegion("list", 0, this.listData, 0, this.listLen);
+      this.writeRegion("cells", 0, this.cellData, 0, this.cellData.length);
+      this.staticDirty = false;
+      return;
+    }
+    this.writeRegion("inst", this.staticCount * INST_WORDS, this.instData, this.staticCount * INST_WORDS, dynCount * INST_WORDS);
+    this.writeRegion("list", this.staticListLen, this.listData, this.staticListLen, this.listLen - this.staticListLen);
     for (const [lo, hi] of runs(dirty, 64)) this.writeRegion("cells", lo, this.cellData, lo, hi - lo + 1);
   }
 
@@ -677,6 +789,21 @@ export class Renderer {
     this.uploadSlots(edit.slots4, edit.slots8);
     this.uploadBlocks(edit.blocks);
     for (const [lo, hi] of runs(edit.tops, 16)) this.writeRegion("tops", lo, this.bricks.top, lo, hi - lo + 1);
+    this.uploadTopTexture(edit.tops);
+  }
+
+  /** Mirror world top-level entries into the texture: the changed ones, or all. */
+  private uploadTopTexture(changed?: number[]): void {
+    const [tx, ty, tz] = this.bricks.topDim;
+    const top = this.bricks.top;
+    if (!changed || changed.length > 2048) {
+      this.gpu.device.queue.writeTexture({ texture: this.topTexture }, top, { bytesPerRow: tx * 4, rowsPerImage: ty }, { width: tx, height: ty, depthOrArrayLayers: tz });
+      return;
+    }
+    for (const i of new Set(changed)) {
+      const x = i % tx, y = Math.floor(i / tx) % ty, z = Math.floor(i / (tx * ty));
+      this.gpu.device.queue.writeTexture({ texture: this.topTexture, origin: { x, y, z } }, top, { offset: i * 4, bytesPerRow: 4, rowsPerImage: 1 }, { width: 1, height: 1, depthOrArrayLayers: 1 });
+    }
   }
 
   // --- brick pool plumbing ---------------------------------------------------
@@ -799,6 +926,7 @@ export class Renderer {
   /** Upload every index region. */
   private uploadIndexAll(): void {
     this.writeRegion("tops", 0, this.bricks.top, 0, this.bricks.top.length);
+    this.uploadTopTexture();
     for (const m of this.models) if (m) this.writeRegion("tops", m.topOff, m.grid.top, 0, m.grid.top.length);
     this.writeRegion("blocks", 0, this.pool.blocks, 0, this.pool.blockCount * BLOCK_ENTRIES);
     this.writeRegion("cells", 0, this.cellData, 0, this.cellData.length);
@@ -906,6 +1034,7 @@ export class Renderer {
     u[125] = fog?.heightFalloff ?? 0;
     u[126] = cl?.drift[0] ?? 0; u[127] = cl?.drift[1] ?? 0;
     u[128] = p.waterWind?.[0] ?? 0; u[129] = p.waterWind?.[1] ?? 0;
+    u[130] = p.effectScale ?? 1;
     // Index regions (132..143), as u32.
     const w = new Uint32Array(u.buffer);
     const [tx, ty, tz] = this.bricks.topDim;
@@ -928,7 +1057,8 @@ export class Renderer {
         },
       ],
     });
-    pass.setPipeline(this.pipeline);
+    if (this.instCount > 0 && !this.instancedPipeline) this.instancedPipeline = this.makePipeline(true);
+    pass.setPipeline(this.instCount > 0 ? this.instancedPipeline! : this.pipeline);
     pass.setBindGroup(0, this.bindGroup);
     pass.draw(3);
     pass.end();

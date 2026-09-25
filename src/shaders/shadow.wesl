@@ -2,11 +2,11 @@
 // the light. Skips provably-empty coarse blocks but stays fine-exact.
 
 import package::uniforms::U;
-import package::grid::{isSolid, coarseSolid, skipSize};
+import package::grid::{skipSize, brickOf, queryBrick, voxelIn, BrickQuery};
 import package::dda::{stepMask, seedSideDist, skipBlock};
 
 // Hard ceiling; the effective cap is U.shadowSteps (0 disables shadows upstream).
-const SHADOW_STEPS : i32 = 128;
+const SHADOW_STEPS : i32 = 512;
 
 fn inShadow(origin : vec3<f32>, rd : vec3<f32>) -> bool {
   var cell = vec3<i32>(floor(origin));
@@ -15,11 +15,15 @@ fn inShadow(origin : vec3<f32>, rd : vec3<f32>) -> bool {
   var sideDist = seedSideDist(cell, origin, rd, deltaDist);
 
   let steps = min(i32(U.shadowSteps), SHADOW_STEPS);
+  var qb = vec3<i32>(-2147483647);
+  var q : BrickQuery;
   for (var i = 0; i < steps; i = i + 1) {
     if (any(cell < vec3<i32>(0)) || any(cell >= vec3<i32>(U.gridSize))) {
       return false;
     }
-    if (U.debug < 0.5 && !coarseSolid(cell)) {
+    let b = brickOf(cell);
+    if (any(b != qb)) { qb = b; q = queryBrick(b); }
+    if (U.debug < 0.5 && !q.solid) {
       let seed = skipBlock(origin, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
       sideDist = seed.sideDist;
@@ -28,7 +32,9 @@ fn inShadow(origin : vec3<f32>, rd : vec3<f32>) -> bool {
     let mask = stepMask(sideDist);
     sideDist += mask * deltaDist;
     cell += vec3<i32>(mask) * stepDir;
-    if (isSolid(cell)) {
+    let nb = brickOf(cell);
+    if (any(nb != qb)) { qb = nb; q = queryBrick(nb); }
+    if (voxelIn(q, cell) != 0u) {
       return true;
     }
   }
@@ -47,6 +53,8 @@ fn occludedTo(origin : vec3<f32>, rd : vec3<f32>, maxT : f32) -> bool {
   let reach = maxT - 0.87; // stop half a voxel diagonal short of the light
 
   let steps = min(i32(U.shadowSteps), SHADOW_STEPS);
+  var qb = vec3<i32>(-2147483647);
+  var q : BrickQuery;
   for (var i = 0; i < steps; i = i + 1) {
     if (any(cell < vec3<i32>(0)) || any(cell >= vec3<i32>(U.gridSize))) {
       return false;
@@ -54,7 +62,9 @@ fn occludedTo(origin : vec3<f32>, rd : vec3<f32>, maxT : f32) -> bool {
     if (length(vec3<f32>(cell) + vec3<f32>(0.5) - origin) > reach) {
       return false;
     }
-    if (U.debug < 0.5 && !coarseSolid(cell)) {
+    let b = brickOf(cell);
+    if (any(b != qb)) { qb = b; q = queryBrick(b); }
+    if (U.debug < 0.5 && !q.solid) {
       let seed = skipBlock(origin, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
       sideDist = seed.sideDist;
@@ -66,7 +76,9 @@ fn occludedTo(origin : vec3<f32>, rd : vec3<f32>, maxT : f32) -> bool {
     if (length(vec3<f32>(cell) + vec3<f32>(0.5) - origin) > reach) {
       return false;
     }
-    if (isSolid(cell)) {
+    let nb = brickOf(cell);
+    if (any(nb != qb)) { qb = nb; q = queryBrick(nb); }
+    if (voxelIn(q, cell) != 0u) {
       return true;
     }
   }
