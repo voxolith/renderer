@@ -13,6 +13,8 @@ struct Hit {
   normal : vec3<f32>,
   color  : vec3<f32>,
   mat    : u32,
+  /** Loop iterations the walk took (fine steps plus skips), for the step heatmap. */
+  steps  : i32,
 };
 
 // Hard ceiling for the primary-ray DDA. The effective cap is U.maxSteps (set via
@@ -69,7 +71,7 @@ fn walk(ro : vec3<f32>, rd : vec3<f32>, tStart : f32, skipWater : bool) -> Hit {
     }
     // Empty-space skip: if the brick (or its whole 64^3 block) is empty,
     // jump the ray to that block's far plane in one hop.
-    if (U.debug < 0.5 && !q.solid) {
+    if ((U.debug < 0.5 || U.debug > 9.5) && !q.solid) {
       let seed = skipBlock(ro, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
       sideDist = seed.sideDist;
@@ -84,6 +86,7 @@ fn walk(ro : vec3<f32>, rd : vec3<f32>, tStart : f32, skipWater : bool) -> Hit {
       h.normal = normal;
       h.color = palette[c].rgb;
       h.mat = c;
+      h.steps = i;
       return h;
     }
     // Advance along the axis with the smallest accumulated distance.
@@ -91,6 +94,7 @@ fn walk(ro : vec3<f32>, rd : vec3<f32>, tStart : f32, skipWater : bool) -> Hit {
     sideDist += mask * deltaDist;
     cell += vec3<i32>(mask) * stepDir;
     normal = mask * -sign(rd);
+    h.steps = i;
   }
   return h;
 }

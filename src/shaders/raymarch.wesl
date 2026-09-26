@@ -140,6 +140,12 @@ fn shadePixel(fragCoord : vec4<f32>) -> vec4<f32> {
   }
 
   let h = traverse(ro, dir, tNear);
+  if (U.debug > 9.5 && U.debug < 10.5) {
+    // Step heatmap: blue (few) through green and yellow to red (the step cap), for finding what a
+    // scene's primary rays spend their time on.
+    let f = clamp(f32(h.steps) / max(U.maxSteps, 1.0), 0.0, 1.0);
+    return vec4<f32>(clamp(vec3<f32>(2.0 * f - 0.5, 1.5 - abs(2.0 * f - 1.0) * 1.5, 1.0 - 2.0 * f), vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+  }
   if (!h.hit) {
     return vec4<f32>(missColor(ro, dir, vec2<f32>(uv.x, -uv.y)), 1.0);
   }

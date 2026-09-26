@@ -801,7 +801,8 @@ export class Renderer {
    * Diagnostic modes. 0 is normal; 1 forces single-step DDA (no empty-space
    * skip), for exactness checks and for grids that change every frame; 7, 8
    * and 9 replace the picture with self-test bands of the voxel lookup, green
-   * where a stage works (see shaders/selftest.wesl).
+   * where a stage works (see shaders/selftest.wesl); 10 shows how many steps
+   * each primary ray took, blue (few) to red (the `maxSteps` cap).
    */
   setDebug(v: number): void {
     this.debugMode = v;

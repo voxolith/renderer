@@ -23,7 +23,7 @@ fn inShadow(origin : vec3<f32>, rd : vec3<f32>) -> bool {
     }
     let b = brickOf(cell);
     if (any(b != qb)) { qb = b; q = queryBrick(cell); }
-    if (U.debug < 0.5 && !q.solid) {
+    if ((U.debug < 0.5 || U.debug > 9.5) && !q.solid) {
       let seed = skipBlock(origin, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
       sideDist = seed.sideDist;
@@ -64,7 +64,7 @@ fn occludedTo(origin : vec3<f32>, rd : vec3<f32>, maxT : f32) -> bool {
     }
     let b = brickOf(cell);
     if (any(b != qb)) { qb = b; q = queryBrick(cell); }
-    if (U.debug < 0.5 && !q.solid) {
+    if ((U.debug < 0.5 || U.debug > 9.5) && !q.solid) {
       let seed = skipBlock(origin, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
       sideDist = seed.sideDist;
