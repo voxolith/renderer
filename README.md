@@ -7,40 +7,36 @@
 
 # @voxolith/renderer
 
-A WebGPU voxel raymarching engine for the browser. Formerly `voxray`, the engine behind
-[Catagochi](https://github.com/voxolith/games).
-
-- Fullscreen DDA raymarch over a dense `Uint8Array` voxel grid (palette-indexed, 256 slots)
-- Coarse occupancy grid (`COARSE_B = 4`) for empty-space skipping
-- Soft shadows, ambient occlusion, sky/sun/moon lighting, emissive / glass / metal materials
-- Dirty-box partial re-uploads so dynamic scenes stay cheap
-- Full MagicaVoxel `.vox` reader and writer (scene graph, rotations, materials, animation frames)
-- Minecraft Anvil `.mca` region reader (NBT, all three chunk encodings) to a colour-mapped grid
-- Orbit, pan, first-person and chase cameras; explosion and muzzle-flash effects
-- Shaders are WGSL modules (`.wesl`) linked at runtime by [`wesl`](https://wesl-lang.dev)
-
-The engine is **WebGPU only**. It needs a browser with `navigator.gpu` and a secure context
-(HTTPS or `localhost`). There is no WebGL fallback; `showUnsupportedScreen` renders a friendly
-message when WebGPU is missing.
+A WebGPU voxel raymarcher for the browser, formerly `voxray`, the engine behind
+[Catagochi](https://github.com/voxolith/games). One fullscreen DDA pass in WGSL (`.wesl` modules
+linked at runtime by [`wesl`](https://wesl-lang.dev)) walks a world stored as sparse 8³ bricks
+under a two-level index, draws instanced models at any yaw with palettes of their own, and shades
+them with soft shadows, ambient occlusion, up to 32 point lights, emissive, glass, metal and
+animated water materials, fog, clouds, rain and snow. It reads and writes MagicaVoxel `.vox` and
+reads Minecraft `.mca` regions. It is **WebGPU only**: it needs `navigator.gpu` and a secure
+context (HTTPS or `localhost`), and there is no WebGL fallback.
 
 ## Install
+
+The package is **not on npm yet**. Until it is, clone this repo next to your app and link it from
+a bun workspace (`"@voxolith/renderer": "workspace:*"`); the
+[installation guide](https://voxolith.github.io/docs/getting-started/installation/) has the
+layout. Once published:
 
 ```sh
 bun add @voxolith/renderer
 ```
 
-The package ships raw TypeScript. Your bundler compiles it together with your app, so you need:
-
-- Vite (or another bundler that understands `import x from "./file.wesl?raw"`)
-- `typescript`, `@webgpu/types` and `vite` as dev dependencies, with
-  `"types": ["@webgpu/types", "vite/client"]` in your `tsconfig.json`
-- In `vite.config.ts`: `optimizeDeps: { exclude: ["@voxolith/renderer"] }`
+It ships raw TypeScript that your bundler compiles with your app: use Vite (or a bundler that
+understands `?raw` imports), add `typescript`, `@webgpu/types` and `vite` as dev dependencies with
+`"types": ["@webgpu/types", "vite/client"]`, and set
+`optimizeDeps: { exclude: ["@voxolith/renderer"] }` in `vite.config.ts`.
 
 ## Entry points
 
 | import | use from | contents |
 |---|---|---|
-| `@voxolith/renderer` | browser code | everything, including `initGpu`, `createRenderer` |
+| `@voxolith/renderer` | browser code | everything, including `initGpu`, `createRenderer`, `makeFrameLoop` |
 | `@voxolith/renderer/core` | Node/bun tools | everything that does not touch the GPU |
 | `@voxolith/renderer/vox` | Node/bun tools | `.vox` parse/write only |
 | `@voxolith/renderer/ray` | Node/bun tools | ray/AABB helpers only |
@@ -51,217 +47,57 @@ renderer, whose `?raw` shader imports only Vite can resolve.
 ## Quick start
 
 ```ts
-import {
-  initGpu, resizeToDisplay, showUnsupportedScreen, WebGPUUnsupportedError,
-  createRenderer, OccupancyGrid, makeCamera, parseVox,
-} from "@voxolith/renderer";
+import { initGpu, createRenderer, makeCamera, makeFrameLoop, observeResize, resizeToDisplay,
+  showUnsupportedScreen, WebGPUUnsupportedError } from "@voxolith/renderer";
 
 const canvas = document.querySelector("canvas")!;
-let gpu;
-try {
-  gpu = await initGpu(canvas);
-} catch (e) {
-  if (e instanceof WebGPUUnsupportedError) { showUnsupportedScreen(document.body); throw e; }
+const gpu = await initGpu(canvas).catch((e) => {
+  if (e instanceof WebGPUUnsupportedError) showUnsupportedScreen(e.message, { appName: "My app" });
   throw e;
-}
-
-// A 32³ grid with one palette slot filled.
-const size = { x: 32, y: 32, z: 32 };
-const data = new Uint8Array(size.x * size.y * size.z).fill(1);
-const palette = new Float32Array(256 * 4);
-palette.set([0.9, 0.5, 0.2, 1], 4); // slot 1
-
-const renderer = createRenderer(gpu, { size, data, palette });
-const occ = new OccupancyGrid(size, data);
-renderer.updateCoarse(occ.data);
-
-const camera = makeCamera({ target: [16, 16, 16], distance: 80, pitchDeg: 30, fovDeg: 35 });
-
-function frame(t: number) {
-  resizeToDisplay(gpu);
-  renderer.render({ ...camera(t / 40), /* lighting fields, see FrameParams */ });
-  requestAnimationFrame(frame);
-}
-requestAnimationFrame(frame);
-```
-
-See [voxolith/examples](https://github.com/voxolith/examples) for complete, runnable pages and
-[voxolith/viewer](https://github.com/voxolith/viewer) for a full `.vox` / `.mca` viewer.
-
-## API overview
-
-Grouped as in `src/index.ts`:
-
-- **Device**: `initGpu(canvas, GpuOptions?)`, `resizeToDisplay`, `setRenderScale`, `showUnsupportedScreen` (options `appName`, `emoji`, `iconHtml`), `WebGPUUnsupportedError`, `GpuContext` (includes `adapterInfo` and a `software` flag)
-- **Renderer**: `createRenderer`, `Renderer` (`render`, `updateVoxels`, `edit`, `editMany`, `clear`, `setFloor`,
-  `setClipBounds`, `setQuality`, `getQuality`, `setDebug`, `stats`), `QUALITY_PRESETS`, `RenderQuality`, `RenderScene`, `FrameParams`, `FloorParams`, `DirtyBox`, `raymarchShaderCode`
-- **Instances**: `renderer.addModel`, `removeModel`, `setInstances` (static, or `{ dynamic: true }` per frame), `addPalette`, `setPaletteColors`, `removePalette`, `instanceStats`; `ModelSource`, `Instance`, `WORLD_SLOTS`
-- **Sparse volumes**: `SparseVoxels`, `makeSparse`, `sparseGet`, `sparseSet`, `sparseFromDense`, `sparseToDense`, `sparseCount`
-- **Storage**: `BrickGrid`, `BrickPool`, `BRICK_B`, `TOP_B`
-- **Frame loop**: `makeFrameLoop` (render on demand), `observeResize`
-- **Formats**: `parseVox`, `writeVox`, `parseVoxScene`, `decodeVoxRotation`, `voxSceneAnimator`,
-  `packMaterials`, `buildMinecraftRegion`
-- **Acceleration**: `OccupancyGrid`, `COARSE_B`, `GridStamper` (`stamp` for movers, `writeBase` for permanent edits such as carving or rubble)
-- **Cameras**: `makeCamera`, `firstPersonFrame`, `chaseFrame`. Input (orbit and first-person
-  controllers, gestures, keys, gamepad, touch controls) lives in
-  [`@voxolith/engine/input`](https://github.com/voxolith/engine#input); the renderer only draws.
-- **Lighting**: `renderer.setLights()` (point lights with range-limited shadows and a visible
-  glow, up to `MAX_LIGHTS`)
-- **Atmosphere**: optional `FrameParams` fields `fog`, `clouds`, `precipitation`, `surface`,
-  `waterWind`, `effectScale` (types `AtmosphereParams` and friends)
-- **Effects**: `makeExplosion`, `makeMuzzleFlash`
-- **Utilities**: `rayAABB`, `makeRay`, `voxelRaycast` (CPU DDA for hit tests), `seededRandom` / `hashSeed`, `makePerf` (adaptive render scale + overlay)
-
-`BRICK_B` and `TOP_B` are duplicated as WGSL constants (`COARSE_B`, `TOP_B`) in
-`src/shaders/grid.wesl`. Keep them in sync.
-
-## Storage
-
-The world is 8³ bricks, each a 4-bit index into its own 15-entry palette (8-bit when a brick
-holds more values), under a two-level index: blocks of 8³ brick entries (64³ voxels) that exist
-only where something is, below one top-level entry per block. A brick of a single value is kept
-in its index entry with no payload. An empty world of 12800 x 2048 x 12800 voxels costs its
-5 MB top level; what is resident costs its surface. A null block is a 64-voxel empty-space skip
-for rays, a null brick an 8-voxel one.
-
-Every index table sits in one storage buffer in regions (world and model top levels, blocks,
-instance lists, instances, models), so the pass stays within 8 storage buffers per stage; the
-world's top level is mirrored in a small 3D texture, since every ray step starts there. Ray walks
-look a brick up once as they enter it and reuse it for every step inside.
-
-## Instances
-
-`addModel({ size, data | sparse })` uploads a model once into the shared brick pool;
-`setInstances([{ model, x, y, z, anchor?, yaw?, mirror?, base }])` draws it anywhere, at any
-heading, at fractional positions, with its role values mapped to `base + r - 1` per instance.
-Each 64³ top cell lists the instances whose box touches it; a voxel the world leaves empty is
-looked up in them, turned into model space (pivoting on the anchor voxel's centre, so a quarter
-turn is exact). That is resampling at world voxel centres: a turned instance still reads as
-axis-aligned cubes, and shadows, AO, lights and water need nothing special. Empty model bricks
-next to content are flagged so rays still skip through turned models safely.
-
-Instances draw from palettes of their own: `addPalette(rgba, materials?)` returns a base slot
-after the world's 256 (`WORLD_SLOTS`; world voxels are 8-bit), `setPaletteColors` restyles one
-in place and `removePalette` frees it. The buffer grows as needed, so a scene is not limited to
-255 colours: every species, or every placement, can have its own.
-
-Instance sampling is a pipeline constant: a scene that never places an instance runs a shader
-with that code compiled away (it costs even untaken), and the instanced pipeline is built the
-first time one is placed.
-
-Scenery is `setInstances(list)` (lists built once); a crowd is
-`setInstances(list, { dynamic: true })` each frame, which costs only the moving instances and the
-cells they touch. The engine's `makeInstanceLayer` and `makeCrowd({ instances })` drive both.
-
-## Performance controls
-
-Everything below is a runtime knob; nothing needs a rebuild.
-
-- **Quality** (`renderer.setQuality`): `maxSteps` caps the primary-ray DDA walk, `shadowSteps`
-  caps the shadow ray (0 turns shadows off), `ao` toggles face ambient occlusion. Use a preset
-  (`renderer.setQuality("low")`) or pass a partial object. `QUALITY_PRESETS.high` is the
-  original look; `low` is roughly 2 to 3 times cheaper per pixel.
-- **Resolution** (`gpu.renderScale`, `gpu.pixelRatio`): rays per frame scale with the square of
-  these. `initGpu(canvas, { maxPixelRatio: 1 })` caps HiDPI; `makePerf({ minScale, targetMs })`
-  adapts the scale to hit a frame-time target, or pin it with `perf.setScale()` or `setRenderScale()`.
-- **Render on demand** (`makeFrameLoop`): a raymarcher redraws the whole screen every frame, so
-  only render when something changed. Call `loop.invalidate()` from your controls (the engine's
-  input takes the loop and does it for you), `observeResize(canvas, loop)` for viewport
-  changes, and `loop.setContinuous(true)` only while something animates.
-- **Adapter check**: `gpu.adapterInfo` is what the browser reported and `gpu.software` is true for
-  CPU implementations (SwiftShader, llvmpipe, lavapipe, fallback adapters). `initGpu` logs the
-  adapter to the console. If a capable GPU shows as software, the browser is not using it.
-- **Slow on Linux Chrome despite a hardware adapter**: when `chrome://gpu` reports
-  `Disabled Features: webgpu_on_vk_via_gl_interop`, the compositor runs on OpenGL and each WebGPU
-  frame is copied through the CPU. Enabling `chrome://flags/#enable-vulkan` fixes it.
-
-```ts
-const gpu = await initGpu(canvas, { maxPixelRatio: gpu.software ? 1 : 2 });
-const renderer = await createRenderer(gpu, scene);
-renderer.setQuality(gpu.software ? "low" : "high");
-
-const perf = makePerf({ enabled: false, scale: gpu.renderScale, minScale: 0.35 });
-const loop = makeFrameLoop({
-  render(now) {
-    perf.frame(now);
-    gpu.renderScale = perf.scale();
-    resizeToDisplay(gpu);
-    renderer.render({ ...camera(orbit.yaw(), orbit.distance(), undefined, orbit.pitch()), ...ENV });
-  },
 });
+const size = { x: 32, y: 32, z: 32 };
+const data = new Uint8Array(size.x * size.y * size.z).fill(1); // palette slot 1 everywhere
+const palette = new Float32Array(256 * 4);
+palette.set([0.9, 0.5, 0.2, 1], 4); // slot 1, linear RGBA
+const renderer = await createRenderer(gpu, { size, data, palette }); // stored as 8³ bricks
+const camera = makeCamera({ target: [16, 16, 16], distance: 80, pitchDeg: 30, fovDeg: 35 });
+const loop = makeFrameLoop({ render() { resizeToDisplay(gpu); renderer.render({ ...camera(35), ...LIGHTING }); } });
 observeResize(canvas, loop);
-// From @voxolith/engine/input: every input event invalidates the loop.
-const orbit = makeOrbitController(createInput(canvas, { loop }), { distance: 120, distanceLimits: [20, 600] });
 loop.invalidate();
 ```
 
-## Lights and time of day
+`LIGHTING` is the key light and sky fields of `FrameParams`; `timeOfDay(phase)` from
+`@voxolith/engine/atmosphere` produces them from one number. See
+[the examples](https://voxolith.github.io/examples/) for complete pages and
+[the viewer](https://voxolith.github.io/viewer/) for a full `.vox` / `.mca` app.
 
-The scene has one directional key light (`lightDir`, `lightColor` in `FrameParams`) plus up to
-`MAX_LIGHTS` (32) point lights:
+## Documentation
 
-```ts
-renderer.setLights([
-  { position: [120, 30, 80], color: [1, 0.7, 0.4], intensity: 2.5, range: 90, glow: 3 },
-  { position: [60, 20, 40], color: [0.4, 0.6, 1], range: 40, shadows: false },
-]);
-loop.invalidate();
-```
+The long-form material lives on the documentation site, in the
+[renderer section](https://voxolith.github.io/docs/renderer/):
 
-- `range` is hard: past it a light contributes exactly nothing, and the range test comes first,
-  so a pixel no light reaches costs a loop over the list and nothing else.
-- Inside the range the light fades smoothly to zero at the edge, with a soft inverse square.
-- `shadows` (default on) traces one shadow ray per pixel towards the light, stopping at the light
-  and capped by the quality preset's `shadowSteps`. So `low` keeps the lights but drops their
-  shadows, and the cost is one short ray per shadowed light in range per pixel.
-- `glow` draws a visible halo, so the lamp itself shows, including against the sky.
-- Metal and glass reflections pick up the lights, unshadowed.
-- `setLights` rewrites a 1.5 KB buffer, so moving a lamp every frame is cheap.
-
-**Water** is a material kind, not a separate system: voxels whose material is `water` (kind 4)
-ripple over time (pass `time` in seconds in `FrameParams`; a constant time freezes them), reflect
-the scene by Fresnel, refract down to the bed (found by a second walk that treats water as empty),
-fade into the water's colour with depth (`att`) and catch moving caustics. The water stays voxels,
-so it streams, clips and edits like everything else.
-
-The sun and moon discs only paint the sky; the key light, its colour and the ambient do the
-lighting. Turning a time of day into those values is not the renderer's job: see `timeOfDay` in
-[`@voxolith/engine/atmosphere`](https://github.com/voxolith/engine#atmosphere).
-
-## Atmosphere
-
-Raw effects, each off until its amount is above zero, so a scene that sets none renders as
-before. The renderer knows nothing about weather; `@voxolith/engine/atmosphere` turns "rain" or
-"a blizzard" into these.
-
-- `fog`: exponential extinction towards a colour, optionally thinning with height; applied to
-  hits by distance and to the sky, so the horizon dissolves.
-- `clouds`: a drifting noise layer over the sky gradient; `cover` 1 is overcast and hides the sun,
-  moon and stars.
-- `precipitation`: rain streaks or snowflakes as analytic particles along each primary ray,
-  stopped by whatever the ray hit (so roofs and trees occlude them), tilted by `fall`, never
-  uploaded and unlimited in extent. Particles are kept at least a pixel wide at distance.
-- `surface`: `wet` darkens the ground and adds a sheen to upward faces; `cover` blends upward
-  faces towards a snow colour. On medium and high quality a short upward ray keeps it off ground
-  under canopies and roofs; `low` skips that ray.
-- `waterWind`: drifts and raises the ripples on water.
-- `effectScale`: how many voxels the effects' own sizes are measured in (default 1). A world at
-  ten times the resolution passes 10 so waves, caustics, drops and snowflakes keep their size in
-  it (`atmosphereFrame(..., { voxelsPerMetre })` sets it).
-
-Cost: fog and clouds are a few arithmetic ops per pixel; precipitation is 8 hash samples; snow
-shelter is one short ray per upward pixel while `cover > 0`.
+- [Entry points](https://voxolith.github.io/docs/renderer/entry-points/): bundler setup, starting the GPU, a first frame, cameras, picking, effects
+- [Storage](https://voxolith.github.io/docs/renderer/storage/): bricks, per-brick palettes, the two-level index, editing a brick at a time
+- [Instances](https://voxolith.github.io/docs/renderer/instances/): `addModel` / `setInstances`, static and dynamic sets, instance palettes
+- [Lighting and materials](https://voxolith.github.io/docs/renderer/lighting/) and [Atmosphere](https://voxolith.github.io/docs/renderer/atmosphere/): point lights, water, fog, clouds, precipitation
+- [Quality and performance](https://voxolith.github.io/docs/renderer/quality-and-performance/): presets, render scale, the frame loop, software adapters
+- [Formats](https://voxolith.github.io/docs/renderer/formats/): `.vox` and `.mca`
+- [API reference](https://voxolith.github.io/docs/renderer/api/): every export, generated from the source
 
 ## Development
 
 ```sh
 bun install
 bun run typecheck
+bun run verify
 ```
 
 For local development against the viewer, editor, examples and games, clone the sibling repos
 next to this one and use a bun workspace root that lists them; consumers then resolve
 `@voxolith/renderer` through a symlink to this checkout.
+
+`BRICK_B` and `TOP_B` in `src/brick.ts` are duplicated as WGSL constants (`COARSE_B`, `TOP_B`) in
+`src/shaders/grid.wesl`. Keep them in sync.
 
 ## Releasing
 

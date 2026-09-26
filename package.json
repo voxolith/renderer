@@ -1,7 +1,7 @@
 {
   "name": "@voxolith/renderer",
   "version": "0.1.0",
-  "description": "A WebGPU voxel raymarching engine: DDA raymarch + coarse occupancy, soft shadows, AO, materials, .vox and Minecraft .mca I/O, cameras and effects",
+  "description": "A WebGPU voxel raymarcher: sparse 8³ bricks under a two-level index, instances, soft shadows, AO, point lights, materials, atmospheric effects, .vox and Minecraft .mca I/O, cameras and effects",
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
