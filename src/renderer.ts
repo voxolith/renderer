@@ -23,6 +23,7 @@ import raymarchWesl from "./shaders/raymarch.wesl?raw";
 import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
 import { INST_WORDS, MAX_PARTS, maxPoseWords, packInstance, packPose, partBoxes } from "./instance";
+import { GpuTimer } from "./timer";
 
 export type { DirtyBox };
 import { BrickGrid, BrickPool, BLOCK_ENTRIES, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS, TOP_B, emptyEdit, type BrickEdit } from "./brick";
@@ -169,6 +170,38 @@ interface GpuModel {
   joints?: ModelSource["joints"];
 }
 
+/** Options for {@link createRenderer}. */
+export interface RendererOptions {
+  /**
+   * Where shading runs: `"fragment"` (a fullscreen fragment pass), `"compute"` (8x8 compute
+   * tiles, straight into the canvas when its format allows storage writes, else through a present
+   * pass) or `"auto"` (the default): compute, except for frames with instances posed on the GPU
+   * (`Instance.parts`), whose kernel measured about 18% slower in compute than as a fragment
+   * shader. The shading and the image are the same either way. The default can be overridden for a
+   * whole page with `globalThis.__voxolithPipeline` (a development hook the workspace's tools use to
+   * compare them).
+   */
+  pipeline?: "fragment" | "compute" | "auto";
+}
+
+/** The pipeline a renderer uses when RendererOptions.pipeline is not given. */
+function defaultPipeline(): "fragment" | "compute" | "auto" {
+  const g = globalThis as { __voxolithPipeline?: string };
+  return g.__voxolithPipeline === "compute" || g.__voxolithPipeline === "fragment" ? g.__voxolithPipeline : "auto";
+}
+
+/** The compute path's present pass: the frame texture, texel for texel, into the canvas or target. */
+const PRESENT_WGSL = /* wgsl */ `
+@group(0) @binding(0) var frame : texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {
+  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  return vec4<f32>(p[vi], 0.0, 1.0);
+}
+@fragment fn fs(@builtin(position) pos : vec4<f32>) -> @location(0) vec4<f32> {
+  return textureLoad(frame, vec2<i32>(pos.xy), 0);
+}
+`;
+
 /** Minimal scene data the renderer needs to build/upload the voxel grid. */
 export interface RenderScene {
   /** World grid extent in voxels; fixed for the renderer's lifetime. */
@@ -297,6 +330,24 @@ export class Renderer {
   /** The same pass with instance sampling compiled in; made when a scene first places one. */
   private instancedPipeline: GPURenderPipeline | null = null;
   private partsPipeline: GPURenderPipeline | null = null;
+  /** Compute tile (workgroup) size in pixels. Tuning hook: globalThis.__voxolithTile = [x, y]. */
+  private readonly tile: [number, number] = ((globalThis as { __voxolithTile?: [number, number] }).__voxolithTile ?? [8, 8]);
+  /** Shading in a compute pass instead of the fragment stage (RendererOptions.pipeline). */
+  private readonly useCompute: boolean;
+  private readonly pipelineMode: "fragment" | "compute" | "auto";
+  private readonly makeComputePipeline: (instances: boolean, parts?: boolean, canvas?: boolean) => GPUComputePipeline;
+  /** Bind layout for writing the canvas directly (GpuContext.canvasStorage), else null. */
+  private readonly canvasLayout: GPUBindGroupLayout | null;
+  private readonly canvasBinding: number;
+  /** By variant: 0 plain, 1 instances, 2 instances with parts; +3 for the canvas-writing kernels. */
+  private readonly computePipelines: (GPUComputePipeline | undefined)[] = [];
+  private readonly frameLayout: GPUBindGroupLayout;
+  private presentLayout: GPUBindGroupLayout | null = null;
+  private presentPipeline: GPURenderPipeline | null = null;
+  /** The compute path's frame (rgba16float), with its bind groups; remade when the size changes. */
+  private frame: { tex: GPUTexture; w: number; h: number; out: GPUBindGroup; present: GPUBindGroup } | null = null;
+  /** GPU time per pass, when the device has `timestamp-query`. */
+  private readonly timer: GpuTimer | null;
   private readonly makePipeline: (instances: boolean, parts?: boolean) => GPURenderPipeline;
   private readonly uniformBuffer: GPUBuffer;
   private readonly uniformData = new Float32Array(UNIFORM_FLOATS);
@@ -377,7 +428,7 @@ export class Renderer {
    * the WGSL from `raymarchShaderCode()`. Building scans a dense `scene.data`
    * once for its occupied bounds and uploads it as bricks.
    */
-  constructor(gpu: GpuContext, scene: RenderScene, shaderCode: string) {
+  constructor(gpu: GpuContext, scene: RenderScene, shaderCode: string, opts: RendererOptions = {}) {
     this.gpu = gpu;
     const { device } = gpu;
     this.gridSize = [scene.size.x, scene.size.y, scene.size.z];
@@ -445,47 +496,47 @@ export class Renderer {
       entries: [
         {
           binding: 0,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
           buffer: { type: "uniform" },
         },
         {
           binding: 1,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
           buffer: { type: "read-only-storage" },
         },
         {
           binding: 2,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
           buffer: { type: "read-only-storage" },
         },
         {
           binding: 3,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
           buffer: { type: "read-only-storage" },
         },
         {
           binding: 4,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
           buffer: { type: "read-only-storage" },
         },
         {
           binding: 5,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
           buffer: { type: "read-only-storage" },
         },
         {
           binding: 6,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
           buffer: { type: "read-only-storage" },
         },
         {
           binding: 7,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
           buffer: { type: "read-only-storage" },
         },
         {
           binding: 8,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
           texture: { sampleType: "uint", viewDimension: "3d" },
         },
       ],
@@ -509,6 +560,42 @@ export class Renderer {
         primitive: { topology: "triangle-list" },
       });
     this.pipeline = this.makePipeline(false);
+    this.timer = gpu.features?.has("timestamp-query") ? new GpuTimer(device) : null;
+
+    // The compute path: the same shading (raymarch.wesl shadePixel) in 8x8 compute tiles, written
+    // to a storage texture that a present pass copies to the canvas (the canvas format cannot be a
+    // storage target without an optional feature).
+    this.frameLayout = device.createBindGroupLayout({
+      entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: "rgba16float" } }],
+    });
+    const computeLayout = device.createPipelineLayout({ bindGroupLayouts: [layout, this.frameLayout] });
+    // Writing the canvas directly needs its own layout (a bgra8unorm storage texture), when allowed.
+    const rgba = gpu.format === "rgba8unorm";
+    this.canvasBinding = rgba ? 2 : 1;
+    this.canvasLayout = gpu.canvasStorage
+      ? device.createBindGroupLayout({ entries: [{ binding: this.canvasBinding, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: rgba ? "rgba8unorm" : "bgra8unorm" } }] })
+      : null;
+    const canvasPipelineLayout = this.canvasLayout ? device.createPipelineLayout({ bindGroupLayouts: [layout, this.canvasLayout] }) : null;
+    this.makeComputePipeline = (instances, parts = false, canvas = false) =>
+      device.createComputePipeline({
+        layout: canvas ? canvasPipelineLayout! : computeLayout,
+        compute: { module, entryPoint: canvas ? (rgba ? "trace_canvas_rgba" : "trace_canvas_bgra") : "trace_main", constants: { 0: instances ? 1 : 0, 1: parts ? 1 : 0, 2: this.tile[0], 3: this.tile[1] } },
+      });
+    this.pipelineMode = opts.pipeline ?? defaultPipeline();
+    this.useCompute = this.pipelineMode !== "fragment";
+    if (this.useCompute) {
+      this.computePipelines[this.canvasLayout ? 3 : 0] = this.makeComputePipeline(false, false, !!this.canvasLayout);
+      const presentModule = device.createShaderModule({ code: PRESENT_WGSL });
+      this.presentLayout = device.createBindGroupLayout({
+        entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } }],
+      });
+      this.presentPipeline = device.createRenderPipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [this.presentLayout] }),
+        vertex: { module: presentModule, entryPoint: "vs" },
+        fragment: { module: presentModule, entryPoint: "fs", targets: [{ format: gpu.format }] },
+        primitive: { topology: "triangle-list" },
+      });
+    }
 
     this.bindGroup = this.makeBindGroup();
     this.uploadIndexAll();
@@ -1422,6 +1509,16 @@ export class Renderer {
 
     const view = target?.view ?? this.gpu.context.getCurrentTexture().createView();
     const encoder = device.createCommandEncoder();
+    this.timer?.begin();
+    // "auto" keeps frames with GPU-posed instances on the fragment path (faster for that kernel).
+    const posed = this.instCount > 0 && this.partLen > 0;
+    if (this.useCompute && !(this.pipelineMode === "auto" && posed)) {
+      this.renderCompute(encoder, view, width, height, !target);
+      const readC = this.timer?.resolve(encoder);
+      device.queue.submit([encoder.finish()]);
+      readC?.();
+      return;
+    }
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
@@ -1431,6 +1528,7 @@ export class Renderer {
           storeOp: "store",
         },
       ],
+      timestampWrites: this.timer?.passWrites("trace") as GPURenderPassTimestampWrites | undefined,
     });
     let pipeline = this.pipeline;
     if (this.instCount > 0 && this.partLen > 0) pipeline = this.partsPipeline ??= this.makePipeline(true, true);
@@ -1439,7 +1537,66 @@ export class Renderer {
     pass.setBindGroup(0, this.bindGroup);
     pass.draw(3);
     pass.end();
+    const read = this.timer?.resolve(encoder);
     device.queue.submit([encoder.finish()]);
+    read?.();
+  }
+
+  /** The compute path: shade into the frame texture, then present it into `view`. */
+  private renderCompute(encoder: GPUCommandEncoder, view: GPUTextureView, width: number, height: number, toCanvas: boolean): void {
+    const { device } = this.gpu;
+    const variant = this.instCount > 0 ? (this.partLen > 0 ? 2 : 1) : 0;
+    if (toCanvas && this.canvasLayout) {
+      // Shade straight into the canvas: one pass.
+      const pipe = (this.computePipelines[variant + 3] ??= this.makeComputePipeline(variant > 0, variant === 2, true));
+      const cp = encoder.beginComputePass({ timestampWrites: this.timer?.passWrites("trace") as GPUComputePassTimestampWrites | undefined });
+      cp.setPipeline(pipe);
+      cp.setBindGroup(0, this.bindGroup);
+      cp.setBindGroup(1, device.createBindGroup({ layout: this.canvasLayout, entries: [{ binding: this.canvasBinding, resource: view }] }));
+      cp.dispatchWorkgroups(Math.ceil(width / this.tile[0]), Math.ceil(height / this.tile[1]));
+      cp.end();
+      return;
+    }
+    if (!this.frame || this.frame.w !== width || this.frame.h !== height) {
+      this.frame?.tex.destroy();
+      const tex = device.createTexture({
+        size: { width, height },
+        format: "rgba16float",
+        usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+      });
+      const tv = tex.createView();
+      this.frame = {
+        tex, w: width, h: height,
+        out: device.createBindGroup({ layout: this.frameLayout, entries: [{ binding: 0, resource: tv }] }),
+        present: device.createBindGroup({ layout: this.presentLayout!, entries: [{ binding: 0, resource: tv }] }),
+      };
+    }
+    const pipe = (this.computePipelines[variant] ??= this.makeComputePipeline(variant > 0, variant === 2));
+    const cp = encoder.beginComputePass({ timestampWrites: this.timer?.passWrites("trace") as GPUComputePassTimestampWrites | undefined });
+    cp.setPipeline(pipe);
+    cp.setBindGroup(0, this.bindGroup);
+    cp.setBindGroup(1, this.frame.out);
+    cp.dispatchWorkgroups(Math.ceil(width / this.tile[0]), Math.ceil(height / this.tile[1]));
+    cp.end();
+    const pp = encoder.beginRenderPass({
+      colorAttachments: [{ view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" }],
+      timestampWrites: this.timer?.passWrites("present") as GPURenderPassTimestampWrites | undefined,
+    });
+    pp.setPipeline(this.presentPipeline!);
+    pp.setBindGroup(0, this.frame.present);
+    pp.draw(3);
+    pp.end();
+  }
+
+  /**
+   * Average GPU time per pass in milliseconds (e.g. `{ trace: 4.2 }`), from timestamp queries; null
+   * when the device has no `timestamp-query` feature (see `GpuContext.features`). Browsers quantise
+   * timestamps, so read it as an average over many frames.
+   *
+   * @returns Milliseconds by pass name, or null.
+   */
+  gpuTimings(): Record<string, number> | null {
+    return this.timer ? this.timer.timings() : null;
   }
 }
 
@@ -1468,8 +1625,14 @@ export class Renderer {
  * const renderer = await createRenderer(gpu, { size, data, palette });
  * ```
  */
-export async function createRenderer(gpu: GpuContext, scene: RenderScene): Promise<Renderer> {
-  return new Renderer(gpu, scene, await raymarchShaderCode());
+export async function createRenderer(gpu: GpuContext, scene: RenderScene, opts: RendererOptions = {}): Promise<Renderer> {
+  const renderer = new Renderer(gpu, scene, await raymarchShaderCode(), opts);
+  // A development hook: tools (the workspace's gpu-bench) read timings from the page's renderers
+  // through globalThis.__voxolithRenderers without every app wiring it up. Weak, so it keeps
+  // nothing alive.
+  const g = globalThis as { __voxolithRenderers?: WeakRef<Renderer>[] };
+  (g.__voxolithRenderers ??= []).push(new WeakRef(renderer));
+  return renderer;
 }
 
 /** Inclusive min/max voxel coords that contain any non-empty voxel (one-time scan). */

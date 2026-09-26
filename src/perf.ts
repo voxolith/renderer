@@ -58,6 +58,11 @@ export interface PerfOptions {
   maxSampleMs?: number;
   /** Extra text shown in the overlay (adapter name, quality preset, ...). */
   label?: string;
+  /**
+   * GPU milliseconds per pass to show in the overlay, e.g. `() => renderer.gpuTimings()` (null
+   * when the device has no timestamp queries).
+   */
+  gpuTimings?: () => Record<string, number> | null;
 }
 
 /**
@@ -157,7 +162,11 @@ export function makePerf(opts: PerfOptions): Perf {
     if (el && now - lastShow > 250) {
       lastShow = now;
       const fps = emaMs > 0 ? 1000 / emaMs : 0;
-      el.textContent = `${emaMs.toFixed(1)} ms · ${fps.toFixed(0)} fps · scale ${scale.toFixed(2)}${label ? "\n" + label : ""}`;
+      const gt = opts.gpuTimings?.();
+      const gpuLine = gt && Object.keys(gt).length
+        ? "\nGPU " + Object.entries(gt).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(" · ") + ` ms (${Object.values(gt).reduce((a, b) => a + b, 0).toFixed(2)})`
+        : "";
+      el.textContent = `${emaMs.toFixed(1)} ms · ${fps.toFixed(0)} fps · scale ${scale.toFixed(2)}${gpuLine}${label ? "\n" + label : ""}`;
     }
   }
 

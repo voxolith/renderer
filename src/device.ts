@@ -35,6 +35,17 @@ export interface GpuContext {
    * which are well below what most adapters offer.
    */
   limits: GrantedLimits;
+  /**
+   * Optional device features granted: `timestamp-query` when the adapter has it, for per-pass GPU
+   * timings (`Renderer.gpuTimings`). Never required.
+   */
+  features?: ReadonlySet<string>;
+  /**
+   * True when the canvas can be written by a compute pass directly (the canvas format is
+   * `rgba8unorm`, or `bgra8unorm` with the `bgra8unorm-storage` feature): the renderer's compute
+   * path then skips its present pass.
+   */
+  canvasStorage?: boolean;
 }
 
 /**
@@ -172,14 +183,16 @@ export async function initGpu(canvas: HTMLCanvasElement, opts: GpuOptions = {}):
     limits[key] = asked || supported;
   }
 
-  const device = await adapter.requestDevice({ requiredLimits }).catch(async (err) => {
+  // Optional features: asked for only when the adapter has them, so the request cannot fail on them.
+  const requiredFeatures = (["timestamp-query", "bgra8unorm-storage"] as GPUFeatureName[]).filter((f) => adapter.features.has(f));
+  const device = await adapter.requestDevice({ requiredLimits, requiredFeatures }).catch(async (err) => {
     // A driver that refuses the negotiated set is still better served than not
     // running at all; fall back to defaults and let callers size accordingly.
     console.warn("[voxolith] requestDevice with raised limits failed, using defaults:", err);
     limits.maxTextureDimension3D = 2048;
     limits.maxBufferSize = 268435456;
     limits.maxStorageBufferBindingSize = 134217728;
-    return adapter.requestDevice();
+    return adapter.requestDevice({ requiredFeatures });
   });
   for (const key of Object.keys(limits) as (keyof GrantedLimits)[]) {
     limits[key] = Number(device.limits[key] ?? limits[key]);
@@ -210,10 +223,13 @@ export async function initGpu(canvas: HTMLCanvasElement, opts: GpuOptions = {}):
     );
   }
 
+  // A compute pass can write the canvas directly when the format allows storage (see canvasStorage).
+  const canvasStorage = format === "rgba8unorm" || (format === "bgra8unorm" && device.features.has("bgra8unorm-storage"));
   context.configure({
     device,
     format,
     alphaMode: "premultiplied",
+    usage: GPUTextureUsage.RENDER_ATTACHMENT | (canvasStorage ? GPUTextureUsage.STORAGE_BINDING : 0),
   });
 
   const gpu: GpuContext = {
@@ -228,6 +244,8 @@ export async function initGpu(canvas: HTMLCanvasElement, opts: GpuOptions = {}):
     adapterInfo,
     software,
     limits,
+    features: new Set([...device.features]),
+    canvasStorage,
   };
 
   resizeToDisplay(gpu);

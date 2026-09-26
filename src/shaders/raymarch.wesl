@@ -1,6 +1,8 @@
-// Root module of the raymarch pass: the fullscreen vertex shader + the fragment
-// shader that ties together intersection, traversal, shadow, AO, highlight, and
-// background. Imports pull in only what's used (the linker drops the rest).
+// Root module of the raymarch pass: shadePixel ties together intersection,
+// traversal, shadow, AO, highlight and background for one pixel, and two entry
+// points run it: the fullscreen vertex + fragment pair, and a compute kernel
+// (trace_main) that writes the frame into a storage texture for the present
+// pass. Imports pull in only what's used (the linker drops the rest).
 
 import package::uniforms::U;
 import package::intersect::intersectBox;
@@ -68,6 +70,50 @@ fn vs(@builtin(vertex_index) vi : u32) -> VsOut {
 
 @fragment
 fn fs(@builtin(position) fragCoord : vec4<f32>) -> @location(0) vec4<f32> {
+  return shadePixel(fragCoord);
+}
+
+// The compute path's output: the frame at render resolution, presented (copied to
+// the canvas or a RenderTarget) by the renderer's present pass.
+@group(1) @binding(0) var frameOut : texture_storage_2d<rgba16float, write>;
+
+// One thread per pixel, in WG_X x WG_Y tiles (pipeline constants, 8x8 by default;
+// 8x8 measured best among 8x4 to 32x4 on a desktop Radeon).
+// The pixel centre matches what the fragment stage's @builtin(position) gives, so
+// both paths shade exactly the same rays.
+@id(2) override WG_X : u32 = 8u;
+@id(3) override WG_Y : u32 = 8u;
+@compute @workgroup_size(WG_X, WG_Y)
+fn trace_main(@builtin(global_invocation_id) id : vec3<u32>) {
+  if (id.x >= u32(U.resolution.x) || id.y >= u32(U.resolution.y)) {
+    return;
+  }
+  textureStore(frameOut, id.xy, shadePixel(vec4<f32>(vec2<f32>(id.xy) + vec2<f32>(0.5), 0.0, 1.0)));
+}
+
+// Straight into the canvas when it allows storage writes: no present pass. One
+// kernel per canvas format (bgra8unorm needs the bgra8unorm-storage feature).
+@group(1) @binding(1) var canvasBgra : texture_storage_2d<bgra8unorm, write>;
+@group(1) @binding(2) var canvasRgba : texture_storage_2d<rgba8unorm, write>;
+
+@compute @workgroup_size(WG_X, WG_Y)
+fn trace_canvas_bgra(@builtin(global_invocation_id) id : vec3<u32>) {
+  if (id.x >= u32(U.resolution.x) || id.y >= u32(U.resolution.y)) {
+    return;
+  }
+  textureStore(canvasBgra, id.xy, shadePixel(vec4<f32>(vec2<f32>(id.xy) + vec2<f32>(0.5), 0.0, 1.0)));
+}
+
+@compute @workgroup_size(WG_X, WG_Y)
+fn trace_canvas_rgba(@builtin(global_invocation_id) id : vec3<u32>) {
+  if (id.x >= u32(U.resolution.x) || id.y >= u32(U.resolution.y)) {
+    return;
+  }
+  textureStore(canvasRgba, id.xy, shadePixel(vec4<f32>(vec2<f32>(id.xy) + vec2<f32>(0.5), 0.0, 1.0)));
+}
+
+/** The colour of the pixel whose centre is `fragCoord.xy` (in pixels, as @builtin(position) gives it). */
+fn shadePixel(fragCoord : vec4<f32>) -> vec4<f32> {
   if (U.debug > 6.5 && U.debug < 7.5) {
     return vec4<f32>(selfTest(fragCoord.xy), 1.0);
   }

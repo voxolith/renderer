@@ -32,6 +32,7 @@ export type {
   QualityPreset,
   ModelSource,
   Instance,
+  RendererOptions,
 } from "./renderer";
 
 // Render-on-demand loop (browser only; not part of ./core).
