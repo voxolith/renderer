@@ -22,7 +22,7 @@ import selftestWesl from "./shaders/selftest.wesl?raw";
 import raymarchWesl from "./shaders/raymarch.wesl?raw";
 import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
-import { INST_WORDS, maxPartWords, packInstance, partBoxes } from "./instance";
+import { INST_WORDS, MAX_PARTS, maxPoseWords, packInstance, packPose, partBoxes } from "./instance";
 
 export type { DirtyBox };
 import { BrickGrid, BrickPool, BLOCK_ENTRIES, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS, TOP_B, emptyEdit, type BrickEdit } from "./brick";
@@ -108,6 +108,12 @@ export interface ModelSource {
    * around a posed joint may be filled from either side, so a turned child stays attached.
    */
   joints?: readonly { parent: number; at: readonly [number, number, number] }[];
+  /**
+   * Per-part voxel boxes to use instead of this model's own (min x, y, z, max x, y, z each). Poses
+   * are packed per set of boxes, so copies of a model that pass the same boxes object (a creature's
+   * wounded copies, with the undamaged model's boxes, which contain theirs) share every pose.
+   */
+  partBoxes?: Int32Array;
 }
 
 /** One placement of a model: its anchor at a world position, turned about y. */
@@ -322,9 +328,21 @@ export class Renderer {
   private instData = new Uint32Array(INST_WORDS * 64);
   private instCount = 0;
   /** Part records of instances drawn with parts: the static set's, then the moving set's. */
+  /**
+   * Pose store: the packed poses posed instances name (instance.ts packPose), each packed once and
+   * shared by every instance showing it, keyed by the part transforms' identity and the model's part
+   * boxes. The static set's poses come first; the moving set's after them, and that area is cleared
+   * and refilled when it holds far more than the moving set uses.
+   */
   private partData = new Uint32Array(4096);
   private partLen = 0;
   private staticPartLen = 0;
+  private staticPoses = new WeakMap<object, Map<Int32Array, { off: number; box: number[] }>>();
+  private movingPoses = new WeakMap<object, Map<Int32Array, { off: number; box: number[] }>>();
+  /** Words of the moving area the poses shown in the last moving set use. */
+  private movingPoseWords = 0;
+  /** Newly packed pose ranges [from, to) waiting to be uploaded. */
+  private poseDirty: [number, number][] = [];
   private cellData: Uint32Array;
   private cellTouched: number[] = [];
   private listData = new Uint32Array(1024);
@@ -855,8 +873,9 @@ export class Renderer {
       partTopOff = this.claimTops(partGrid.top.length);
       const parts = Math.max(count, src.joints?.length ?? 0);
       // Each brick of a posed instance keeps a 32-bit mask of the parts in it (see instance.ts).
-      if (parts > 32) throw new Error(`addModel: at most 32 parts can be posed on the GPU (this model has ${parts})`);
-      boxes = partBoxes(src.size, src.data, src.parts, parts);
+      if (parts > MAX_PARTS) throw new Error(`addModel: at most ${MAX_PARTS} parts can be posed on the GPU (this model has ${parts})`);
+      // Given boxes (a superset, e.g. the undamaged model's) let damaged copies share poses.
+      boxes = src.partBoxes ?? partBoxes(src.size, src.data, src.parts, parts);
     }
     let id = this.models.indexOf(null);
     if (id < 0) id = this.models.push(null) - 1;
@@ -919,7 +938,12 @@ export class Renderer {
     // Static: instances [0, n), lists [0, total), and the cell entries they give.
     const perCell = new Map<number, number[]>();
     this.staticCount = 0;
+    // A new static set repacks the store from the start, so both areas start over.
     this.partLen = 0;
+    this.staticPoses = new WeakMap();
+    this.movingPoses = new WeakMap();
+    this.movingPoseWords = 0;
+    this.poseDirty = [];
     for (const inst of list) {
       const k = this.writeInstance(inst, this.staticCount);
       if (k < 0) continue;
@@ -959,21 +983,33 @@ export class Renderer {
   private staticTouched: number[] = [];
   private staticDirty = false;
 
-  /**
-   * Write instance `k`'s words (and its part records at `partLen`, advancing it); returns k, or -1
-   * when its model is gone. The packing is instance.ts's, shared with the CPU sampler.
-   */
-  private writeInstance(inst: Instance, k: number): number {
+  /** The packed pose for these part transforms of model `m`, packing it into the store the first time. */
+  private poseOf(parts: ArrayLike<number>, m: GpuModel, moving: boolean): { off: number; box: number[] } {
+    const cache = moving ? this.movingPoses : this.staticPoses;
+    const key = parts as unknown as object;
+    let byBoxes = cache.get(key);
+    if (!byBoxes) cache.set(key, (byBoxes = new Map()));
+    let pose = byBoxes.get(m.partBoxes!);
+    if (!pose) {
+      const pm = { size: m.size, partBoxes: m.partBoxes, joints: m.joints };
+      const most = maxPoseWords(pm);
+      if (this.partData.length < this.partLen + most) this.partData = growU32(this.partData, this.partLen + most);
+      const { words, box } = packPose(parts, pm, this.partData, this.partLen);
+      pose = { off: this.partLen, box };
+      this.poseDirty.push([this.partLen, this.partLen + words]);
+      this.partLen += words;
+      byBoxes.set(m.partBoxes!, pose);
+    }
+    return pose;
+  }
+
+  /** Write instance `k`'s words; returns k, or -1 when its model is gone. The packing is instance.ts's, shared with the CPU sampler. */
+  private writeInstance(inst: Instance, k: number, moving = false): number {
     const m = this.models[inst.model];
     if (!m) return -1;
     if (this.instData.length < (k + 1) * INST_WORDS) this.instData = growU32(this.instData, (k + 1) * INST_WORDS);
-    const pm = { size: m.size, partBoxes: m.partBoxes, joints: m.joints };
-    if (inst.parts && m.partBoxes) {
-      const most = maxPartWords(pm);
-      if (this.partData.length < this.partLen + most) this.partData = growU32(this.partData, this.partLen + most);
-    }
-    const { box, partWords } = packInstance(inst, pm, inst.model, this.instData, k * INST_WORDS, this.partData, this.partLen);
-    this.partLen += partWords;
+    const pose = inst.parts && m.partBoxes ? this.poseOf(inst.parts, m, moving) : undefined;
+    const { box } = packInstance(inst, { size: m.size, partBoxes: m.partBoxes, joints: m.joints }, inst.model, this.instData, k * INST_WORDS, pose);
     if (this.instBox.length < (k + 1) * 6) { const nb = new Float64Array(Math.max(64, (k + 1) * 12)); nb.set(this.instBox); this.instBox = nb; }
     this.instBox.set(box, k * 6);
     return k;
@@ -999,11 +1035,23 @@ export class Renderer {
    */
   private rebuildDynamic(): void {
     let n = this.staticCount;
-    this.partLen = this.staticPartLen;
+    // Clear the moving area when it holds far more than the last moving set used (poses that are no
+    // longer shown); this frame's poses are then packed afresh.
+    if (this.partLen - this.staticPartLen > Math.max(1 << 16, 4 * this.movingPoseWords)) {
+      this.partLen = this.staticPartLen;
+      this.movingPoses = new WeakMap();
+    }
+    const seen = new Set<object>();
+    let used = 0;
     const perCell = new Map<number, number[]>();
     for (const inst of this.dynamicList) {
-      const k = this.writeInstance(inst, n);
+      const k = this.writeInstance(inst, n, true);
       if (k < 0) continue;
+      if (inst.parts && !seen.has(inst.parts as unknown as object)) {
+        seen.add(inst.parts as unknown as object);
+        const m = this.models[inst.model]!;
+        if (m.partBoxes) used += maxPoseWords({ size: m.size, partBoxes: m.partBoxes });
+      }
       this.cellsOf(k, (ci) => {
         let l = perCell.get(ci);
         if (!l) perCell.set(ci, (l = []));
@@ -1012,6 +1060,7 @@ export class Renderer {
       n++;
     }
     const dynCount = n - this.staticCount;
+    this.movingPoseWords = used;
     let at = this.staticListLen;
     const touched: number[] = [];
     for (const ci of this.cellTouched) this.cellData[ci] = this.staticCells[ci];
@@ -1038,13 +1087,16 @@ export class Renderer {
     if (this.staticDirty) {
       this.writeRegion("inst", 0, this.instData, 0, this.instCount * INST_WORDS);
       this.writeRegion("parts", 0, this.partData, 0, this.partLen);
+      this.poseDirty = [];
       this.writeRegion("list", 0, this.listData, 0, this.listLen);
       this.writeRegion("cells", 0, this.cellData, 0, this.cellData.length);
       this.staticDirty = false;
       return;
     }
     this.writeRegion("inst", this.staticCount * INST_WORDS, this.instData, this.staticCount * INST_WORDS, dynCount * INST_WORDS);
-    this.writeRegion("parts", this.staticPartLen, this.partData, this.staticPartLen, this.partLen - this.staticPartLen);
+    // Only poses packed since the last upload: a pose already on the GPU costs nothing more.
+    for (const [lo, hi] of this.poseDirty) this.writeRegion("parts", lo, this.partData, lo, hi - lo);
+    this.poseDirty = [];
     this.writeRegion("list", this.staticListLen, this.listData, this.staticListLen, this.listLen - this.staticListLen);
     for (const [lo, hi] of runs(dirty, 64)) this.writeRegion("cells", lo, this.cellData, lo, hi - lo + 1);
   }
@@ -1232,6 +1284,7 @@ export class Renderer {
     this.writeRegion("inst", 0, this.instData, 0, this.instCount * INST_WORDS);
     this.writeRegion("models", 0, this.modelData, 0, this.models.length * MODEL_WORDS);
     this.writeRegion("parts", 0, this.partData, 0, this.partLen);
+    this.poseDirty = [];
     this.uploadSlots(null, null);
   }
 

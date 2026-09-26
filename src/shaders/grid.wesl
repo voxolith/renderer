@@ -26,12 +26,12 @@ const UNIFORM_BIT : u32 = 0x40000000u;
 const SLOT_MASK : u32 = 0x1fffffffu;
 /** Words per instance record. Must match INST_WORDS in instance.ts. */
 const INST_WORDS : u32 = 24u;
-/** Words per part record. Must match PART_WORDS in instance.ts. */
+/** Words per part record, and of a pose's header. Must match PART_WORDS and POSE_HEADER in instance.ts. */
 const PART_WORDS : u32 = 24u;
+const POSE_HEADER : u32 = 8u;
 const INST_MIRROR : u32 = 1u;
 const INST_PARTS : u32 = 2u;
 const NO_PARENT : u32 = 0xffffffffu;
-const NO_MASKS : u32 = 0xffffffffu;
 /** Brick edge of an instance's part mask grid. Must match MASK_B in instance.ts. */
 const MASK_B : i32 = 8;
 
@@ -160,17 +160,27 @@ fn modelValue(mi : u32, q : vec3<i32>, part : bool) -> u32 {
  * Intersection Function" (EG 2026, doi:10.2312/egs.20261026); here the deformation is rigid per
  * part, over the brick index. sampleInstance() in instance.ts is the CPU twin.
  */
-fn partsVoxel(o : u32, mi : u32, p : vec3<i32>, wp : vec3<f32>) -> u32 {
+fn partsVoxel(o : u32, mi : u32, wp : vec3<f32>) -> u32 {
   let size = vec3<i32>(i32(idx[mi + 4u]), i32(idx[mi + 5u]), i32(idx[mi + 6u]));
+  // Into the posed model's space: the pose (part inverses, joints, masks) is packed there once and
+  // shared by every instance showing it.
+  let u = affineAt(o, wp);
+  let uc = vec3<i32>(floor(u));
   let off = U.partsOff + idx[o + 15u];
-  // Which parts can be here: the brick's pair of masks (one bit per part, at most 32 parts). The
-  // first says whose posed box touches the brick, the second whose joint weld does; a bit is set
-  // only for parts that have voxels (and, for welds, whose parent has too).
-  let lo = vec3<i32>(bitcast<i32>(idx[o + 17u]), bitcast<i32>(idx[o + 18u]), bitcast<i32>(idx[o + 19u]));
-  let hi = vec3<i32>(bitcast<i32>(idx[o + 20u]), bitcast<i32>(idx[o + 21u]), bitcast<i32>(idx[o + 22u]));
-  let dims = toU(max((hi - lo + vec3<i32>(MASK_B - 1)) / MASK_B, vec3<i32>(1)));
-  let bc = toU(p - lo) / u32(MASK_B);
-  let mb = U.partsOff + idx[o + 23u] + (bc.x + bc.y * dims.x + bc.z * dims.x * dims.y) * 2u;
+  let lo = vec3<i32>(bitcast<i32>(idx[off]), bitcast<i32>(idx[off + 1u]), bitcast<i32>(idx[off + 2u]));
+  let dims = vec3<i32>(i32(idx[off + 3u]), i32(idx[off + 4u]), i32(idx[off + 5u]));
+  let n = idx[o + 16u];
+  // Which parts can be here: the brick's pair of masks (one bit per part, at most 32). The first
+  // says whose posed box touches the brick, the second whose joint weld does; a bit is set only for
+  // parts that have voxels (and, for welds, whose parent has too).
+  let d = uc - lo;
+  if (any(d < vec3<i32>(0)) || any(d >= dims * MASK_B)) {
+    return 0u;
+  }
+  let bc = toU(d) / u32(MASK_B);
+  let pd = toU(dims);
+  let P = off + POSE_HEADER;
+  let mb = P + n * PART_WORDS + (bc.x + bc.y * pd.x + bc.z * pd.x * pd.y) * 2u;
   var hits = idx[mb];
   var welds = idx[mb + 1u];
   // One loop over the candidates, so the lookups are compiled once: first each part whose box is
@@ -197,9 +207,9 @@ fn partsVoxel(o : u32, mi : u32, p : vec3<i32>, wp : vec3<f32>) -> u32 {
       }
       b = firstTrailingBit(welds);
       welds = welds & (welds - 1u);
-      let q0 = off + b * PART_WORDS;
+      let q0 = P + b * PART_WORDS;
       let j = vec3<i32>(bitcast<i32>(idx[q0 + 18u]), bitcast<i32>(idx[q0 + 19u]), bitcast<i32>(idx[q0 + 20u]));
-      if (any(abs(p - j) > vec3<i32>(1))) {
+      if (any(abs(uc - j) > vec3<i32>(1))) {
         continue;
       }
       par = idx[q0 + 21u];
@@ -207,7 +217,7 @@ fn partsVoxel(o : u32, mi : u32, p : vec3<i32>, wp : vec3<f32>) -> u32 {
       pendB = b;
       pendPar = par;
     }
-    let q = vec3<i32>(floor(affineAt(off + via * PART_WORDS, wp)));
+    let q = vec3<i32>(floor(affineAt(P + via * PART_WORDS, u)));
     if (any(q < vec3<i32>(0)) || any(q >= size)) {
       continue;
     }
@@ -247,7 +257,7 @@ fn instanceVoxel(p : vec3<i32>) -> u32 {
     let mi = U.modelsOff + idx[o + 12u] * MODEL_WORDS;
     let flags = idx[o + 14u];
     if (PARTS && (flags & INST_PARTS) != 0u) {
-      let v = partsVoxel(o, mi, p, wp);
+      let v = partsVoxel(o, mi, wp);
       if (v != 0u) {
         return idx[o + 13u] + v - 1u;
       }
@@ -331,19 +341,32 @@ fn instanceNear(c : vec3<i32>) -> bool {
     let mi = U.modelsOff + idx[o + 12u] * MODEL_WORDS;
     let flags = idx[o + 14u];
     if (PARTS && (flags & INST_PARTS) != 0u) {
-      // Posed parts: the brick may hold voxels where a mask brick it overlaps has a part or a
-      // weld in it.
-      let m0 = idx[o + 23u];
-      let dims = max((ihi - ilo + vec3<i32>(MASK_B - 1)) / MASK_B, vec3<i32>(1));
-      let c0 = clamp((blo - ilo) / MASK_B, vec3<i32>(0), dims - vec3<i32>(1));
-      let c1 = clamp((bhi - vec3<i32>(1) - ilo) / MASK_B, vec3<i32>(0), dims - vec3<i32>(1));
-      if (any(bhi <= ilo) || any(blo >= ihi)) {
+      // Posed: the world brick, taken into the posed model's space, may hold voxels where a mask
+      // brick it reaches has a part or a weld in it.
+      let off = U.partsOff + idx[o + 15u];
+      let lo = vec3<i32>(bitcast<i32>(idx[off]), bitcast<i32>(idx[off + 1u]), bitcast<i32>(idx[off + 2u]));
+      let dims = vec3<i32>(i32(idx[off + 3u]), i32(idx[off + 4u]), i32(idx[off + 5u]));
+      let uc = toModel(k, wc);
+      // Half the brick's extent along each posed axis: 4 × the row's absolute sum (4 for an axis the
+      // turn leaves alone, up to 5.7 under a yaw), so the reach is exact for any rotation.
+      let io = U.instOff + k * INST_WORDS;
+      let ext = 4.0 * vec3<f32>(
+        abs(bitcast<f32>(idx[io])) + abs(bitcast<f32>(idx[io + 1u])) + abs(bitcast<f32>(idx[io + 2u])),
+        abs(bitcast<f32>(idx[io + 4u])) + abs(bitcast<f32>(idx[io + 5u])) + abs(bitcast<f32>(idx[io + 6u])),
+        abs(bitcast<f32>(idx[io + 8u])) + abs(bitcast<f32>(idx[io + 9u])) + abs(bitcast<f32>(idx[io + 10u])),
+      );
+      let r0 = vec3<i32>(floor(uc - ext)) - lo;
+      let r1 = vec3<i32>(floor(uc + ext)) - lo;
+      if (any(r1 < vec3<i32>(0)) || any(r0 >= dims * MASK_B)) {
         continue;
       }
+      let c0 = clamp(r0 / MASK_B, vec3<i32>(0), dims - vec3<i32>(1));
+      let c1 = clamp(r1 / MASK_B, vec3<i32>(0), dims - vec3<i32>(1));
+      let mbase = off + POSE_HEADER + idx[o + 16u] * PART_WORDS;
       for (var z = c0.z; z <= c1.z; z = z + 1) {
         for (var y = c0.y; y <= c1.y; y = y + 1) {
           for (var x = c0.x; x <= c1.x; x = x + 1) {
-            let bi = U.partsOff + m0 + u32(x + y * dims.x + z * dims.x * dims.y) * 2u;
+            let bi = mbase + u32(x + y * dims.x + z * dims.x * dims.y) * 2u;
             if ((idx[bi] | idx[bi + 1u]) != 0u) {
               return true;
             }

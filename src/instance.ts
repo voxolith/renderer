@@ -5,13 +5,18 @@
 // of the maths. The WGSL side is grid.wesl: toModel, instanceVoxel, partsVoxel, instanceNear.
 //
 // An instance maps a world point to its model through one world→model affine (3x4). A model
-// added with parts (one part index per voxel, e.g. a skeleton's bones) can instead be drawn with
-// one transform per part: a world point is taken back through each part's inverse in turn, and
-// the first part whose own voxel is there wins, parents first. That is posing on the GPU from a
-// single rest model shared by every instance, instead of re-baking the posed voxels each frame.
-// A small grid of part masks per instance (one pair of words per 8³ brick of its box) says which
-// parts can be in each brick, so a sample tests one or two parts, not all of them, and a ray
-// skips the bricks of the box no part reaches.
+// added with parts (one part index per voxel, e.g. a skeleton's bones) can instead be drawn in a
+// pose: one transform per part, applied in the model's own space before the instance's placement.
+// A world point is taken into the posed model's space through the placement's inverse, then back
+// through each part's inverse into the rest model in turn; the first part whose own voxel is there
+// wins, parents first. That is posing on the GPU from a single rest model shared by every instance,
+// instead of re-baking the posed voxels each frame.
+//
+// A pose (the part inverses, joints, and a small grid of part masks per 8³ brick of the posed
+// model, saying which parts can be in each brick) lives in the model's own space, so it is packed
+// and uploaded once and shared by every instance showing it, wherever they stand; each instance
+// then costs one record per frame. The masks let a sample test one or two parts, not all of them,
+// and a ray skip the bricks no part reaches.
 //
 // Posing by moving samples into a shared, static rest pose (rather than rebuilding geometry) is
 // the idea of Gruen, Benthin, Kern and McAllister, "Ray Tracing Massive Amounts of Animated
@@ -21,26 +26,30 @@
 // Here the deformation is rigid per part, over the renderer's brick index.
 
 /**
- * Words per instance record: world→model affine (0-11), model (12), palette base (13), flags (14),
- * part offset (15) and count (16), the world cells it can touch (17-22: lo x, y, z, hi x, y, z,
- * exclusive, as i32; the first test a sample meets), part mask grid offset (23, or NO_MASKS).
+ * Words per instance record: world→model affine (0-11; for a posed instance, world→posed model),
+ * model (12), palette base (13), flags (14), pose offset in the pose store (15), part count (16),
+ * the world cells it can touch (17-22: lo x, y, z, hi x, y, z, exclusive, as i32; the first test a
+ * sample meets), pad (23).
  */
 export const INST_WORDS = 24;
+/** Words of a pose record's header: mask grid origin (0-2, i32 cells of the posed model), its dims in bricks (3-5), part count (6), pad (7). */
+export const POSE_HEADER = 8;
 /**
- * Words per part record: world→model affine (0-11), posed world box (12-17, f32), joint cell
- * (18-20, i32), parent (21, or NO_PARENT), has voxels (22), pad (23).
+ * Words per part record in a pose: posed→rest affine (0-11), posed box in model space (12-17,
+ * f32), joint cell in posed model space (18-20, i32), parent (21, or NO_PARENT), has voxels (22),
+ * pad (23).
  */
 export const PART_WORDS = 24;
 /** Instance flag: the model is mirrored along x (applied after flooring, like a stamped orientation). */
 export const INST_MIRROR = 1;
-/** Instance flag: drawn with one transform per part. */
+/** Instance flag: drawn in a pose (per-part transforms). */
 export const INST_PARTS = 2;
 /** A part record's `parent` when it has none. */
 export const NO_PARENT = 0xffffffff;
-/** An instance with more parts than a mask word holds tests every part (no mask grid). */
-export const NO_MASKS = 0xffffffff;
-/** Bricks of a part mask grid, in voxels. */
+/** Bricks of a pose's part mask grid, in voxels. */
 export const MASK_B = 8;
+/** Parts a posed model can have: one bit each in a mask word. */
+export const MAX_PARTS = 32;
 
 type Vec3 = [number, number, number];
 
@@ -126,8 +135,8 @@ export function placement(inst: PackInstance, size: { x: number; y: number; z: n
   return { fwd, anchor: an };
 }
 
-/** World box of the model-space box [lo, hi) under the affine at m[mo], into out[oo..oo+6]. */
-function boxInto(m: Affine, mo: number, x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, out: Float64Array | Float32Array, oo: number): void {
+/** Box of the box [lo, hi) under the affine at m[mo], into out[oo..oo+6]. */
+function boxInto(m: Affine, mo: number, x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, out: Float64Array | Float32Array | number[], oo: number): void {
   let bx0 = Infinity, by0 = Infinity, bz0 = Infinity, bx1 = -Infinity, by1 = -Infinity, bz1 = -Infinity;
   for (let k = 0; k < 8; k++) {
     const x = k & 1 ? x1 : x0, y = k & 2 ? y1 : y0, z = k & 4 ? z1 : z0;
@@ -144,67 +153,46 @@ function boxInto(m: Affine, mo: number, x0: number, y0: number, z0: number, x1: 
   out[oo] = bx0; out[oo + 1] = by0; out[oo + 2] = bz0; out[oo + 3] = bx1; out[oo + 4] = by1; out[oo + 5] = bz1;
 }
 
-const scratchFwd = new Float64Array(12), scratchInv = new Float64Array(12), scratchW = new Float64Array(12), scratchBox = new Float64Array(6);
+const scratchFwd = new Float64Array(12), scratchInv = new Float64Array(12), scratchBox = new Float64Array(6);
 
-/** Bricks of an instance's mask grid along each axis, from its world cells [lo, hi). */
-function maskDims(lo: ArrayLike<number>, hi: ArrayLike<number>): [number, number, number] {
-  return [Math.max(1, Math.ceil((hi[0] - lo[0]) / MASK_B)), Math.max(1, Math.ceil((hi[1] - lo[1]) / MASK_B)), Math.max(1, Math.ceil((hi[2] - lo[2]) / MASK_B))];
+/**
+ * Pose words a model with parts can need at most (header, part records and the largest mask grid
+ * a pose of it can have), for sizing a pose store before packing.
+ */
+export function maxPoseWords(model: PackModel): number {
+  const n = model.partBoxes ? model.partBoxes.length / 6 : 0;
+  if (!n) return 0;
+  // Any pose stays within a cube of twice the model's diagonal about it, plus the weld margin.
+  const d = 2 * Math.ceil(Math.hypot(model.size.x, model.size.y, model.size.z)) + 4;
+  const b = Math.ceil(d / MASK_B) + 1;
+  return POSE_HEADER + n * PART_WORDS + b * b * b * 2;
 }
 
 /**
- * Pack one instance into `words` at `o` (INST_WORDS words), and, for an instance with parts, its
- * part records (PART_WORDS each) followed by its mask grid into `parts` at `partOff` (size it with
- * {@link maxPartWords}). Returns the instance's world box, which decides the top cells that list
- * it, and the part words used.
+ * Pack a pose of a model with parts into `out` at `off`: the header, one record per part (its
+ * posed→rest inverse, posed box, joint cell and parent) and the mask grid over the posed model.
+ * Everything is in the model's own space, so one packed pose serves every instance showing it.
+ * Returns the words used and the posed model's box (model space, grown by the weld margin), which
+ * the instances' world boxes are made from.
  */
-export function packInstance(
-  inst: PackInstance,
-  model: PackModel,
-  modelId: number,
-  words: Uint32Array,
-  o: number,
-  parts?: Uint32Array,
-  partOff = 0,
-): { box: number[]; partWords: number } {
-  const f = new Float32Array(words.buffer, words.byteOffset, words.length);
-  const wi = new Int32Array(words.buffer, words.byteOffset, words.length);
-  const n = inst.parts && model.partBoxes ? model.partBoxes.length / 6 : 0;
-  // Parts carry their own transforms; mirroring applies only to plain instances.
-  const { fwd } = placement(n ? { ...inst, mirror: false } : inst, model.size, scratchFwd);
-  invertAffine(fwd, scratchInv);
-  for (let k = 0; k < 12; k++) f[o + k] = scratchInv[k];
-  words[o + 12] = modelId;
-  words[o + 13] = inst.base;
-  words[o + 14] = (inst.mirror && !n ? INST_MIRROR : 0) | (n ? INST_PARTS : 0);
-  words[o + 15] = partOff;
-  words[o + 16] = n;
-  words[o + 23] = NO_MASKS;
-  const cells = (b: ArrayLike<number>) => {
-    wi[o + 17] = Math.floor(b[0]); wi[o + 18] = Math.floor(b[1]); wi[o + 19] = Math.floor(b[2]);
-    wi[o + 20] = Math.ceil(b[3]); wi[o + 21] = Math.ceil(b[4]); wi[o + 22] = Math.ceil(b[5]);
-  };
-  if (!n) {
-    boxInto(fwd, 0, 0, 0, 0, model.size.x, model.size.y, model.size.z, scratchBox, 0);
-    cells(scratchBox);
-    return { box: Array.from(scratchBox), partWords: 0 };
-  }
-
-  // Parts: world_b = placement · part_b, sampled through its inverse.
-  if (!parts) throw new Error("packInstance: an instance with parts needs a parts buffer");
-  const pf = new Float32Array(parts.buffer, parts.byteOffset, parts.length);
-  const pi = new Int32Array(parts.buffer, parts.byteOffset, parts.length);
+export function packPose(parts: ArrayLike<number>, model: PackModel, out: Uint32Array, off: number): { words: number; box: number[] } {
+  const pb = model.partBoxes;
+  if (!pb) throw new Error("packPose: the model has no parts");
+  const n = pb.length / 6;
+  if (n > MAX_PARTS) throw new Error(`packPose: at most ${MAX_PARTS} parts (this model has ${n})`);
+  const pf = new Float32Array(out.buffer, out.byteOffset, out.length);
+  const pi = new Int32Array(out.buffer, out.byteOffset, out.length);
   const box = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
-  const pb = model.partBoxes!, local = inst.parts!;
+  const P = off + POSE_HEADER;
   for (let b = 0; b < n; b++) {
-    const q = partOff + b * PART_WORDS;
-    mulAffine(fwd, local, scratchW, 0, b * 12, 0);
-    invertAffine(scratchW, pf, 0, q);
+    const q = P + b * PART_WORDS;
+    invertAffine(parts, pf, b * 12, q);
     const empty = pb[b * 6] > pb[b * 6 + 3];
     if (empty) {
       pf[q + 12] = pf[q + 13] = pf[q + 14] = 0;
       pf[q + 15] = pf[q + 16] = pf[q + 17] = -1;
     } else {
-      boxInto(scratchW, 0, pb[b * 6], pb[b * 6 + 1], pb[b * 6 + 2], pb[b * 6 + 3] + 1, pb[b * 6 + 4] + 1, pb[b * 6 + 5] + 1, scratchBox, 0);
+      boxInto(parts, b * 12, pb[b * 6], pb[b * 6 + 1], pb[b * 6 + 2], pb[b * 6 + 3] + 1, pb[b * 6 + 4] + 1, pb[b * 6 + 5] + 1, scratchBox, 0);
       for (let k = 0; k < 6; k++) pf[q + 12 + k] = scratchBox[k];
       for (let a = 0; a < 3; a++) {
         if (scratchBox[a] < box[a]) box[a] = scratchBox[a];
@@ -213,65 +201,87 @@ export function packInstance(
     }
     const j = model.joints?.[b];
     if (j && j.parent >= 0) {
-      const x = j.at[0], y = j.at[1], z = j.at[2];
-      pi[q + 18] = Math.floor(scratchW[0] * x + scratchW[1] * y + scratchW[2] * z + scratchW[3]);
-      pi[q + 19] = Math.floor(scratchW[4] * x + scratchW[5] * y + scratchW[6] * z + scratchW[7]);
-      pi[q + 20] = Math.floor(scratchW[8] * x + scratchW[9] * y + scratchW[10] * z + scratchW[11]);
-      parts[q + 21] = j.parent;
+      const m = b * 12, x = j.at[0], y = j.at[1], z = j.at[2];
+      pi[q + 18] = Math.floor(parts[m] * x + parts[m + 1] * y + parts[m + 2] * z + parts[m + 3]);
+      pi[q + 19] = Math.floor(parts[m + 4] * x + parts[m + 5] * y + parts[m + 6] * z + parts[m + 7]);
+      pi[q + 20] = Math.floor(parts[m + 8] * x + parts[m + 9] * y + parts[m + 10] * z + parts[m + 11]);
+      out[q + 21] = j.parent;
     } else {
       pi[q + 18] = pi[q + 19] = pi[q + 20] = 0;
-      parts[q + 21] = NO_PARENT;
+      out[q + 21] = NO_PARENT;
     }
-    parts[q + 22] = empty ? 0 : 1;
-    parts[q + 23] = 0;
+    out[q + 22] = empty ? 0 : 1;
+    out[q + 23] = 0;
   }
+  if (!isFinite(box[0])) box.splice(0, 6, 0, 0, 0, 0, 0, 0);
   // A weld cell can sit one voxel outside every part's box.
-  const out = isFinite(box[0]) ? [box[0] - 1, box[1] - 1, box[2] - 1, box[3] + 1, box[4] + 1, box[5] + 1] : [0, 0, 0, 0, 0, 0];
-  cells(out);
-  let used = n * PART_WORDS;
-  if (n > 32) return { box: out, partWords: used };
+  const grown = [box[0] - 1, box[1] - 1, box[2] - 1, box[3] + 1, box[4] + 1, box[5] + 1];
 
-  // Mask grid over the instance's cells, one brick per MASK_B³: bit b of the first word when part
-  // b's posed box touches the brick, of the second when a cell of the brick is in part b's weld
-  // block (the 3x3x3 cells around its joint).
-  const lo = [wi[o + 17], wi[o + 18], wi[o + 19]], hi = [wi[o + 20], wi[o + 21], wi[o + 22]];
-  const [dx, dy, dz] = maskDims(lo, hi);
-  const m0 = partOff + used;
-  if (parts.length < m0 + dx * dy * dz * 2) throw new Error("packInstance: parts buffer too small for the mask grid (see maxPartWords)");
-  parts.fill(0, m0, m0 + dx * dy * dz * 2);
+  // Mask grid over the posed model's cells, one brick per MASK_B³: bit b of the first word when
+  // part b's posed box touches the brick, of the second when a cell of the brick is in part b's
+  // weld block (the 3x3x3 cells around its joint, when it and its parent both have voxels).
+  const lo = [Math.floor(grown[0]), Math.floor(grown[1]), Math.floor(grown[2])];
+  const dx = Math.max(1, Math.ceil((Math.ceil(grown[3]) - lo[0]) / MASK_B));
+  const dy = Math.max(1, Math.ceil((Math.ceil(grown[4]) - lo[1]) / MASK_B));
+  const dz = Math.max(1, Math.ceil((Math.ceil(grown[5]) - lo[2]) / MASK_B));
+  pi[off] = lo[0]; pi[off + 1] = lo[1]; pi[off + 2] = lo[2];
+  out[off + 3] = dx; out[off + 4] = dy; out[off + 5] = dz;
+  out[off + 6] = n; out[off + 7] = 0;
+  const m0 = P + n * PART_WORDS;
+  if (out.length < m0 + dx * dy * dz * 2) throw new Error("packPose: pose store too small (see maxPoseWords)");
+  out.fill(0, m0, m0 + dx * dy * dz * 2);
   const mark = (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number, bit: number, word: number) => {
     // Cells [x0, x1) etc. → bricks, clamped to the grid.
     const bx0 = Math.max(0, Math.floor((x0 - lo[0]) / MASK_B)), bx1 = Math.min(dx - 1, Math.floor((x1 - 1 - lo[0]) / MASK_B));
     const by0 = Math.max(0, Math.floor((y0 - lo[1]) / MASK_B)), by1 = Math.min(dy - 1, Math.floor((y1 - 1 - lo[1]) / MASK_B));
     const bz0 = Math.max(0, Math.floor((z0 - lo[2]) / MASK_B)), bz1 = Math.min(dz - 1, Math.floor((z1 - 1 - lo[2]) / MASK_B));
-    for (let z = bz0; z <= bz1; z++) for (let y = by0; y <= by1; y++) for (let x = bx0; x <= bx1; x++) parts[m0 + (x + y * dx + z * dx * dy) * 2 + word] |= 1 << bit;
+    for (let z = bz0; z <= bz1; z++) for (let y = by0; y <= by1; y++) for (let x = bx0; x <= bx1; x++) out[m0 + (x + y * dx + z * dx * dy) * 2 + word] |= 1 << bit;
   };
   for (let b = 0; b < n; b++) {
-    const q = partOff + b * PART_WORDS;
-    if (!parts[q + 22]) continue;
+    const q = P + b * PART_WORDS;
+    if (!out[q + 22]) continue;
     mark(Math.floor(pf[q + 12]), Math.floor(pf[q + 13]), Math.floor(pf[q + 14]), Math.ceil(pf[q + 15]), Math.ceil(pf[q + 16]), Math.ceil(pf[q + 17]), b, 0);
-    const par = parts[q + 21];
-    if (par !== NO_PARENT && parts[partOff + par * PART_WORDS + 22]) {
+    const par = out[q + 21];
+    if (par !== NO_PARENT && out[P + par * PART_WORDS + 22]) {
       const jx = pi[q + 18], jy = pi[q + 19], jz = pi[q + 20];
       mark(jx - 1, jy - 1, jz - 1, jx + 2, jy + 2, jz + 2, b, 1);
     }
   }
-  words[o + 23] = m0;
-  used += dx * dy * dz * 2;
-  return { box: out, partWords: used };
+  return { words: m0 + dx * dy * dz * 2 - off, box: grown };
 }
 
 /**
- * Part words an instance of `model` with parts can need at most (its records plus the largest
- * mask grid its box can have), for sizing a parts buffer before packing.
+ * Pack one instance into `words` at `o` (INST_WORDS words). A posed instance names its pose, packed
+ * with {@link packPose}: its offset in the pose store and the posed box that call returned.
+ * Returns the instance's world box, which decides the top cells that list it.
  */
-export function maxPartWords(model: PackModel): number {
-  const n = model.partBoxes ? model.partBoxes.length / 6 : 0;
-  if (!n) return 0;
-  // Any pose stays within a cube of the model's diagonal about its joints, plus the weld margin.
-  const d = 2 * Math.ceil(Math.hypot(model.size.x, model.size.y, model.size.z)) + 4;
-  const b = Math.ceil(d / MASK_B) + 1;
-  return n * PART_WORDS + (n > 32 ? 0 : b * b * b * 2);
+export function packInstance(
+  inst: PackInstance,
+  model: PackModel,
+  modelId: number,
+  words: Uint32Array,
+  o: number,
+  pose?: { off: number; box: ArrayLike<number> },
+): { box: number[] } {
+  const f = new Float32Array(words.buffer, words.byteOffset, words.length);
+  const wi = new Int32Array(words.buffer, words.byteOffset, words.length);
+  const n = pose && model.partBoxes ? model.partBoxes.length / 6 : 0;
+  // A pose carries the part transforms; mirroring applies only to plain instances.
+  const { fwd } = placement(n ? { ...inst, mirror: false } : inst, model.size, scratchFwd);
+  invertAffine(fwd, scratchInv);
+  for (let k = 0; k < 12; k++) f[o + k] = scratchInv[k];
+  words[o + 12] = modelId;
+  words[o + 13] = inst.base;
+  words[o + 14] = (inst.mirror && !n ? INST_MIRROR : 0) | (n ? INST_PARTS : 0);
+  words[o + 15] = n ? pose!.off : 0;
+  words[o + 16] = n;
+  words[o + 23] = 0;
+  const b = [0, 0, 0, 0, 0, 0];
+  if (n) boxInto(fwd, 0, pose!.box[0], pose!.box[1], pose!.box[2], pose!.box[3], pose!.box[4], pose!.box[5], b, 0);
+  else boxInto(fwd, 0, 0, 0, 0, model.size.x, model.size.y, model.size.z, b, 0);
+  wi[o + 17] = Math.floor(b[0]); wi[o + 18] = Math.floor(b[1]); wi[o + 19] = Math.floor(b[2]);
+  wi[o + 20] = Math.ceil(b[3]); wi[o + 21] = Math.ceil(b[4]); wi[o + 22] = Math.ceil(b[5]);
+  return { box: b };
 }
 
 /** Per-part voxel boxes of a model with parts (the `partBoxes` packing needs). */
@@ -306,64 +316,61 @@ export interface SampleModel {
 
 /**
  * The value an instance draws at world cell (x, y, z), or 0: the CPU twin of grid.wesl's
- * instance sampling, reading the same packed words (as f32, like the GPU).
+ * instance sampling, reading the same packed words (as f32, like the GPU). `poses` is the pose
+ * store a posed instance's record points into.
  */
-export function sampleInstance(words: Uint32Array, o: number, parts: Uint32Array | undefined, model: SampleModel, x: number, y: number, z: number): number {
+export function sampleInstance(words: Uint32Array, o: number, poses: Uint32Array | undefined, model: SampleModel, x: number, y: number, z: number): number {
   const wi = new Int32Array(words.buffer, words.byteOffset, words.length);
   if (x < wi[o + 17] || y < wi[o + 18] || z < wi[o + 19] || x >= wi[o + 20] || y >= wi[o + 21] || z >= wi[o + 22]) return 0;
   const f = new Float32Array(words.buffer, words.byteOffset, words.length);
   const fr = Math.fround;
-  const wx = x + 0.5, wy = y + 0.5, wz = z + 0.5;
   const { size } = model;
   const inside = (q: Vec3) => q[0] >= 0 && q[1] >= 0 && q[2] >= 0 && q[0] < size.x && q[1] < size.y && q[2] < size.z;
-  const map = (m: Float32Array, at: number): Vec3 => [
-    Math.floor(fr(fr(fr(fr(m[at] * wx) + fr(m[at + 1] * wy)) + fr(m[at + 2] * wz)) + m[at + 3])),
-    Math.floor(fr(fr(fr(fr(m[at + 4] * wx) + fr(m[at + 5] * wy)) + fr(m[at + 6] * wz)) + m[at + 7])),
-    Math.floor(fr(fr(fr(fr(m[at + 8] * wx) + fr(m[at + 9] * wy)) + fr(m[at + 10] * wz)) + m[at + 11])),
+  // An affine applied in f32, component by component, as the shader's dot products round.
+  const apply32 = (m: Float32Array, at: number, px: number, py: number, pz: number): Vec3 => [
+    fr(fr(fr(fr(m[at] * px) + fr(m[at + 1] * py)) + fr(m[at + 2] * pz)) + m[at + 3]),
+    fr(fr(fr(fr(m[at + 4] * px) + fr(m[at + 5] * py)) + fr(m[at + 6] * pz)) + m[at + 7]),
+    fr(fr(fr(fr(m[at + 8] * px) + fr(m[at + 9] * py)) + fr(m[at + 10] * pz)) + m[at + 11]),
   ];
+  const cell = (v: Vec3): Vec3 => [Math.floor(v[0]), Math.floor(v[1]), Math.floor(v[2])];
+  const u = apply32(f, o, x + 0.5, y + 0.5, z + 0.5);
   const flags = words[o + 14];
   if (!(flags & INST_PARTS)) {
-    const q = map(f, o);
+    const q = cell(u);
     if (flags & INST_MIRROR) q[0] = size.x - 1 - q[0];
     if (!inside(q)) return 0;
     return model.voxel(q[0], q[1], q[2]);
   }
-  const pf = new Float32Array(parts!.buffer, parts!.byteOffset, parts!.length);
-  const pi = new Int32Array(parts!.buffer, parts!.byteOffset, parts!.length);
+  // Posed: u is in the posed model's space. The brick's masks say which parts to try.
+  const pf = new Float32Array(poses!.buffer, poses!.byteOffset, poses!.length);
+  const pi = new Int32Array(poses!.buffer, poses!.byteOffset, poses!.length);
   const off = words[o + 15], n = words[o + 16];
-  // Which parts to test: the brick's masks, or every part (by its box) when there is no mask grid.
-  const m0 = words[o + 23];
-  let hits = 0xffffffff, welds = 0xffffffff;
-  if (m0 !== NO_MASKS) {
-    const lo = [wi[o + 17], wi[o + 18], wi[o + 19]], hi = [wi[o + 20], wi[o + 21], wi[o + 22]];
-    const [dx, dy] = maskDims(lo, hi);
-    const bi = Math.floor((x - lo[0]) / MASK_B) + Math.floor((y - lo[1]) / MASK_B) * dx + Math.floor((z - lo[2]) / MASK_B) * dx * dy;
-    hits = parts![m0 + bi * 2];
-    welds = parts![m0 + bi * 2 + 1];
-  }
+  const uc = cell(u);
+  const mc = [Math.floor((uc[0] - pi[off]) / MASK_B), Math.floor((uc[1] - pi[off + 1]) / MASK_B), Math.floor((uc[2] - pi[off + 2]) / MASK_B)];
+  const dx = poses![off + 3], dy = poses![off + 4], dz = poses![off + 5];
+  if (mc[0] < 0 || mc[1] < 0 || mc[2] < 0 || mc[0] >= dx || mc[1] >= dy || mc[2] >= dz) return 0;
+  const P = off + POSE_HEADER;
+  const mb = P + n * PART_WORDS + (mc[0] + mc[1] * dx + mc[2] * dx * dy) * 2;
+  const hits = poses![mb], welds = poses![mb + 1];
+  const rest = (via: number) => cell(apply32(pf, P + via * PART_WORDS, u[0], u[1], u[2]));
+  // Each part whose posed box touches the brick, through its own inverse, its own voxels only
+  // (parents first, as baking does). No box test: a cell whose centre maps into a part's rest box
+  // lies inside that part's posed box.
   for (let b = 0; b < n; b++) {
-    if (b < 32 && !((hits >>> b) & 1)) continue;
-    const q0 = off + b * PART_WORDS;
-    if (!parts![q0 + 22]) continue;
-    // Without masks, the cells the part's posed box touches (floor(min) .. ceil(max) - 1). With
-    // them no box test is needed: a cell whose centre maps into the part's rest box lies in it.
-    if (m0 === NO_MASKS &&
-      (x < Math.floor(pf[q0 + 12]) || y < Math.floor(pf[q0 + 13]) || z < Math.floor(pf[q0 + 14]) ||
-        x >= Math.ceil(pf[q0 + 15]) || y >= Math.ceil(pf[q0 + 16]) || z >= Math.ceil(pf[q0 + 17]))) continue;
-    const q = map(pf, q0);
+    if (!((hits >>> b) & 1)) continue;
+    const q = rest(b);
     if (!inside(q)) continue;
     const v = model.voxel(q[0], q[1], q[2]);
     if (v && model.part(q[0], q[1], q[2]) === b + 1) return v;
   }
   // Weld: near a joint, either side's voxels may fill the cell, so a turned child stays on.
   for (let b = 0; b < n; b++) {
-    if (b < 32 && !((welds >>> b) & 1)) continue;
-    const q0 = off + b * PART_WORDS;
-    const par = parts![q0 + 21];
-    if (par === NO_PARENT || !parts![q0 + 22] || !parts![off + par * PART_WORDS + 22]) continue;
-    if (Math.abs(x - pi[q0 + 18]) > 1 || Math.abs(y - pi[q0 + 19]) > 1 || Math.abs(z - pi[q0 + 20]) > 1) continue;
+    if (!((welds >>> b) & 1)) continue;
+    const q0 = P + b * PART_WORDS;
+    if (Math.abs(uc[0] - pi[q0 + 18]) > 1 || Math.abs(uc[1] - pi[q0 + 19]) > 1 || Math.abs(uc[2] - pi[q0 + 20]) > 1) continue;
+    const par = poses![q0 + 21];
     for (const via of [b, par]) {
-      const q = map(pf, off + via * PART_WORDS);
+      const q = rest(via);
       if (!inside(q)) continue;
       const v = model.voxel(q[0], q[1], q[2]);
       const pid = model.part(q[0], q[1], q[2]) - 1;
