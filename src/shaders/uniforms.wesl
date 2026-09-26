@@ -59,7 +59,7 @@ struct Uniforms {
   cloudDrift   : vec2<f32>,                       // 126,127
   waterWind    : vec2<f32>,                       // 128,129
   effectScale  : f32,                             // 130  voxels per unit of the effects below (1 = native)
-  _w0          : f32,                             // 131
+  viewDistance : f32,                             // 131  fog.distance: rays stop there (0 = off)
   // --- index regions (u32 word offsets into idx; see renderer.ts) ---
   topDim       : vec3<u32>, instanceCount : u32,  // 132-135  world top-level dims
   blocksOff    : u32, cellOff : u32, listOff : u32, instOff : u32, // 136-139

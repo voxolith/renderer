@@ -16,6 +16,13 @@ export interface FogParams {
   color: Vec3;
   /** Fog thins with height at this rate per voxel above y = 0. 0 = uniform. */
   heightFalloff?: number;
+  /**
+   * A view distance, voxels (fog of war): primary rays stop there, and the fog closes to total
+   * over its last quarter, so nothing past it is traced and the cut never shows. Rays through
+   * dense instanced scenery cost by how far they go, so this is the cheapest way to bound a
+   * close-up scene at a fine scale. 0 or absent = unbounded.
+   */
+  distance?: number;
 }
 
 /** A cloud layer drawn in the sky. */

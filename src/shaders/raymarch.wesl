@@ -49,8 +49,9 @@ fn traceLit(ro : vec3<f32>, rd : vec3<f32>) -> vec3<f32> {
 // A ray that hits nothing: sky (or the optional floor), lamp glows, fog and
 // the rain or snow in front of it.
 fn missColor(ro : vec3<f32>, rd : vec3<f32>, uv : vec2<f32>) -> vec3<f32> {
-  var c = background(ro, rd, uv) + lightGlow(ro, rd, 1e6);
-  c = applySkyFog(c, ro, rd);
+  // With a view distance, lights past it are behind the fog wall.
+  let far = select(1e6, U.viewDistance, U.viewDistance > 0.0);
+  let c = applySkyFog(background(ro, rd, uv), ro, rd) + lightGlow(ro, rd, far);
   let pr = precipitation(ro, rd, 1e6);
   return mix(c, pr.rgb, pr.a);
 }
@@ -255,14 +256,13 @@ fn shadePixel(fragCoord : vec4<f32>) -> vec4<f32> {
     }
   }
 
-  // Lamps in front of the hit glow over it.
+  // Atmosphere in front of the hit: fog, the lamps in front of it glowing through their own
+  // share of it, then falling rain or snow.
   let tHit = length(hitCenter - ro);
+  color = applyFog(color, ro, dir, tHit);
   if (U.lightCount > 0.5) {
     color += lightGlow(ro, dir, tHit);
   }
-
-  // Atmosphere in front of the hit: fog, then falling rain or snow.
-  color = applyFog(color, ro, dir, tHit);
   let pr = precipitation(ro, dir, tHit);
   color = mix(color, pr.rgb, pr.a);
 

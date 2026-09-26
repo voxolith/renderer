@@ -1598,6 +1598,7 @@ export class Renderer {
     u[126] = cl?.drift[0] ?? 0; u[127] = cl?.drift[1] ?? 0;
     u[128] = p.waterWind?.[0] ?? 0; u[129] = p.waterWind?.[1] ?? 0;
     u[130] = p.effectScale ?? 1;
+    u[131] = fog?.distance && fog.distance > 0 ? fog.distance : 0;
     // Index regions (132..143), as u32.
     const w = new Uint32Array(u.buffer);
     const [tx, ty, tz] = this.bricks.topDim;

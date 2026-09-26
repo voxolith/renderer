@@ -52,8 +52,14 @@ fn walk(ro : vec3<f32>, rd : vec3<f32>, tStart : f32, skipWater : bool) -> Hit {
   // The current brick's lookup, reused while the ray stays in it.
   var qb = vec3<i32>(-2147483647);
   var q : BrickQuery;
+  // The view distance (fog.distance), from the ray's origin: past it the fog is total. (Measured
+  // from the cell, since a skip re-seeds sideDist from where it lands.)
+  let reach = select(1e30, U.viewDistance, U.viewDistance > 0.0);
   for (var i = 0; i < steps; i = i + 1) {
     if (any(cell < vec3<i32>(-1)) || any(cell > vec3<i32>(U.gridSize))) {
+      break;
+    }
+    if (dot(vec3<f32>(cell) + vec3<f32>(0.5) - ro, rd) > reach) {
       break;
     }
     let b = brickOf(cell);

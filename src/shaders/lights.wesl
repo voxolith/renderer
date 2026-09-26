@@ -8,6 +8,7 @@
 
 import package::uniforms::{U, lights};
 import package::shadow::occludedTo;
+import package::fog::fogAmount;
 
 // Inverse-square softness: at 1/sqrt(K) voxels the light is at half strength
 // (before the range window).
@@ -62,8 +63,9 @@ fn pointLighting(p : vec3<f32>, n : vec3<f32>, shadows : bool) -> vec3<f32> {
 }
 
 // Visible glow of the lights along a ray, up to `tMax` (the hit distance, or
-// far away on a miss): a gaussian of the ray's closest approach to each light.
-// A light behind the surface the ray hit shows nothing.
+// far away on a miss): a gaussian of the ray's closest approach to each light,
+// seen through the fog between the eye and that light (so add it after the
+// fog). A light behind the surface the ray hit shows nothing.
 fn lightGlow(ro : vec3<f32>, rd : vec3<f32>, tMax : f32) -> vec3<f32> {
   var sum = vec3<f32>(0.0);
   let count = u32(U.lightCount);
@@ -74,7 +76,7 @@ fn lightGlow(ro : vec3<f32>, rd : vec3<f32>, tMax : f32) -> vec3<f32> {
     if (t < 0.0 || t > tMax + l.glow) { continue; }
     let closest = ro + rd * min(t, tMax);
     let d = length(l.pos - closest) / l.glow;
-    sum += l.color * exp(-d * d);
+    sum += l.color * exp(-d * d) * (1.0 - fogAmount(ro, rd, t));
   }
   return sum;
 }
