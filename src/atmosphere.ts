@@ -8,23 +8,29 @@
 
 type Vec3 = [number, number, number];
 
+/** Distance fog, optionally thinning with height. */
 export interface FogParams {
   /** Extinction per voxel of distance; 0.002 is a light haze, 0.02 thick fog. */
   density: number;
+  /** Linear RGB the fog fades to. */
   color: Vec3;
   /** Fog thins with height at this rate per voxel above y = 0. 0 = uniform. */
   heightFalloff?: number;
 }
 
+/** A cloud layer drawn in the sky. */
 export interface CloudParams {
   /** 0 clear .. 1 fully overcast. */
   cover: number;
+  /** Linear RGB of the clouds, already lit for the time of day. */
   color: Vec3;
   /** Drift of the cloud layer, sky units per second on x and z. */
   drift: [number, number];
 }
 
+/** Falling rain or snow: analytic particles fixed in the world, hidden by geometry, never stored. */
 export interface PrecipitationParams {
+  /** Streaks or flakes. */
   kind: "rain" | "snow";
   /** 0 .. 1: how many particles. */
   density: number;
@@ -34,11 +40,13 @@ export interface PrecipitationParams {
   color?: Vec3;
 }
 
+/** Wet or snow-covered ground: a tint of upward-facing surfaces. */
 export interface SurfaceParams {
   /** 0 .. 1: darker ground and a sheen on upward faces. */
   wet: number;
   /** 0 .. 1: upward faces blend to `coverColor` (settled snow). */
   cover: number;
+  /** Linear RGB of the cover. */
   coverColor: Vec3;
 }
 

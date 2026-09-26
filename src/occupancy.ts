@@ -3,21 +3,52 @@
 // non-empty. The shader fast-forwards its DDA across empty coarse cells, so rays
 // through the big air volumes (room interior, yard, sky) skip in B-voxel jumps.
 //
-// COARSE_B is duplicated as a WGSL const in shaders/raymarch.wesl — keep them in sync.
+// The GPU no longer reads this grid: the renderer's brick index is its own
+// empty-space structure (a null brick or top-level block is the skip), and
+// Renderer.updateCoarse is a no-op kept for callers that still pass one. What
+// remains is the CPU grid. The shader's COARSE_B in grid.wesl is the brick
+// edge (8), not this.
 
 import type { DirtyBox } from "./box";
 
+/** Edge of an `OccupancyGrid` cell, in fine voxels. */
 export const COARSE_B = 4;
 
+/**
+ * A coarse occupancy grid over a dense voxel grid: one byte per 4^3 block
+ * (`COARSE_B`), 1 when any voxel in the block is non-empty. Headless.
+ *
+ * The renderer no longer needs one (its brick index skips empty space, and
+ * `Renderer.updateCoarse` ignores what it is given); it remains for CPU tests
+ * such as a quick "anything here?" before a finer scan, and for a scrolling
+ * world that keeps it up to date with `shiftZ`.
+ *
+ * @example
+ * ```ts
+ * import { COARSE_B, OccupancyGrid } from "@voxolith/renderer/core";
+ *
+ * const occ = new OccupancyGrid(size, data);
+ * // Anything in the block holding voxel (x, y, z)?
+ * const i = ((x / COARSE_B) | 0) + ((y / COARSE_B) | 0) * occ.cx + ((z / COARSE_B) | 0) * occ.cx * occ.cy;
+ * if (occ.data[i]) scanBlock(x, y, z);
+ * // After a paint stroke inside `box`:
+ * occ.updateBox(data, box);
+ * ```
+ */
 export class OccupancyGrid {
+  /** One byte per coarse cell (i, j, k) at `i + j*cx + k*cx*cy`: 1 occupied, 0 empty. */
   readonly data: Uint8Array;
+  /** Coarse cells along x (`ceil(size.x / COARSE_B)`). */
   readonly cx: number;
+  /** Coarse cells along y. */
   readonly cy: number;
+  /** Coarse cells along z. */
   readonly cz: number;
   private readonly sx: number;
   private readonly sy: number;
   private readonly sz: number;
 
+  /** Build from a dense grid (`x + y*sx + z*sx*sy`); a full scan. */
   constructor(size: { x: number; y: number; z: number }, fine: Uint8Array) {
     this.sx = size.x;
     this.sy = size.y;
@@ -49,7 +80,7 @@ export class OccupancyGrid {
 
   /**
    * Recompute the coarse cells overlapping a fine-voxel dirty box (the cat's
-   * footprint). Returns the coarse dirty box to upload.
+   * footprint). Returns the changed region in coarse-cell coordinates.
    */
   updateBox(fine: Uint8Array, box: DirtyBox): DirtyBox {
     const { cx, cy } = this;

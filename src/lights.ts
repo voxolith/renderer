@@ -8,6 +8,11 @@
 
 type Vec3 = [number, number, number];
 
+/**
+ * A point light for `Renderer.setLights`. Emissive voxels light only
+ * themselves, so a lamp that should light its surroundings needs one of these
+ * at it. Cost scales with the pixels inside `range`.
+ */
 export interface PointLight {
   /** Grid-space position (voxel units). */
   position: Vec3;

@@ -7,6 +7,7 @@ import { readRegion } from "./region";
 import { readChunkBlocks, type ChunkBlocks } from "./chunk";
 import { blockInfo, type BlockInfo } from "./blocks";
 
+/** Which part of a region `buildMinecraftRegion` crops, and at what resolution. */
 export interface MinecraftBuildOpts {
   /** Region-local block crop (0..511). Default: centred 256×256. */
   x0?: number; x1?: number; z0?: number; z1?: number;
@@ -18,21 +19,58 @@ export interface MinecraftBuildOpts {
   downsample?: number;
 }
 
+/**
+ * A cropped Minecraft region as a dense grid, shaped to pass straight to
+ * `createRenderer` (`size`, `data`, `palette`, `materials`).
+ */
 export interface MinecraftScene {
+  /** Grid extent in voxels (Y-up, one voxel per sampled block). */
   size: { x: number; y: number; z: number };
+  /** Dense palette slots, `x + y*sx + z*sx*sy`; 0 is air. */
   data: Uint8Array;
+  /** 256 RGBA floats 0..1; slots are allocated per distinct block colour. */
   palette: Float32Array;
+  /** Per-slot materials (256×8 f32) when any block is emissive, metal or glass. */
   materials?: Float32Array;
+  /** What was built, for a status line. */
   meta: {
+    /** Chunks decoded. */
     chunks: number;
+    /** Palette slots used (at most 255). */
     colours: number;
+    /** Solid voxels in the grid. */
     voxels: number;
+    /** The crop actually used, region-local block coordinates, inclusive. */
     crop: { x0: number; x1: number; z0: number; z1: number; yMin: number; yMax: number };
     downsample: number;
+    /** True when `maxDim` trimmed the requested crop. */
     clamped: boolean;
   };
 }
 
+/**
+ * Decode a Minecraft Anvil region file (`.mca`, 32×32 chunks, 512×512 blocks)
+ * and crop it into a renderable grid. Blocks map to a palette of at most 255
+ * colours built on the fly (a region with more distinct colours reuses the
+ * last slot); air-like blocks stay empty and unknown ones get a fallback
+ * colour. Minecraft is Y-up, so no axis swap is needed. Headless (it needs only
+ * `DecompressionStream`); chunks decompress in parallel, hence async.
+ *
+ * @param bytes - The whole `.mca` file.
+ * @param opts - Crop box, Y band, per-axis cap and downsampling.
+ * @returns The grid, its palette and materials, and what was built.
+ *
+ * @example
+ * ```ts
+ * import { buildMinecraftRegion, createRenderer } from "@voxolith/renderer";
+ *
+ * const bytes = new Uint8Array(await file.arrayBuffer());
+ * // A 256×256 block crop from the middle of the region, every 2nd block.
+ * const scene = await buildMinecraftRegion(bytes, { x0: 128, x1: 383, z0: 128, z1: 383, downsample: 2 });
+ * const renderer = await createRenderer(gpu, scene);
+ * info.textContent = `${scene.meta.chunks} chunks, ${scene.meta.voxels} voxels`;
+ * ```
+ */
 export async function buildMinecraftRegion(
   bytes: Uint8Array,
   opts: MinecraftBuildOpts = {},

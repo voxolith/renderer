@@ -1,16 +1,28 @@
-// Minimal MagicaVoxel ".vox" parser.
-//
-// The format is a RIFF-like tree of chunks:
-//   "VOX " <version:i32>
-//   chunk := <id:4 bytes> <contentSize:i32> <childrenSize:i32> <content> <children>
-// The root "MAIN" chunk holds everything else as children.
-//
-// We read the first model only (SIZE + XYZI) plus the optional RGBA palette.
-// Voxel colour indices are 1-based: XYZI index `c` -> palette entry `c`
-// (file RGBA entry `i` maps to palette index `i + 1`).
-//
-// Reference: https://github.com/ephtracy/voxel-model/blob/master/MagicaVoxel-file-format-vox.txt
+/**
+ * A minimal MagicaVoxel `.vox` reader and writer, with no GPU or DOM dependency.
+ *
+ * The format is a RIFF-like tree of chunks:
+ *
+ * ```text
+ * "VOX " <version:i32>
+ * chunk := <id:4 bytes> <contentSize:i32> <childrenSize:i32> <content> <children>
+ * ```
+ *
+ * The root `MAIN` chunk holds everything else as children.
+ *
+ * `parseVox` reads the first model only (SIZE + XYZI) plus the optional RGBA
+ * palette; `parseVoxScene` reads the extended format (every model, the scene
+ * graph, materials, layers and keyframes). Voxel colour indices are 1-based:
+ * XYZI index `c` is palette entry `c` (file RGBA entry `i` maps to palette index
+ * `i + 1`). Models are Z-up, as MagicaVoxel stores them; the renderer's grid is
+ * Y-up, so callers swap axes when they build one.
+ *
+ * Reference: https://github.com/ephtracy/voxel-model/blob/master/MagicaVoxel-file-format-vox.txt
+ *
+ * @packageDocumentation
+ */
 
+/** One voxel of a `.vox` model, in the file's Z-up coordinates (0..255 per axis). */
 export interface Voxel {
   x: number;
   y: number;
@@ -19,13 +31,37 @@ export interface Voxel {
   c: number;
 }
 
+/** One model from a `.vox` file: its extent, its voxels and the palette they index. */
 export interface VoxModel {
+  /** Extent in voxels, Z-up as stored in the file. */
   size: { x: number; y: number; z: number };
   voxels: Voxel[];
   /** 256 RGBA entries (1024 bytes). Index by Voxel.c; entry 0 is unused. */
   palette: Uint8Array;
 }
 
+/**
+ * Read the first model of a MagicaVoxel `.vox` file, with its RGBA palette (or
+ * MagicaVoxel's default palette when the file has none). Later models, the
+ * scene graph and materials are ignored; use `parseVoxScene` for those.
+ * Headless: import it from `@voxolith/renderer/vox` in tools.
+ *
+ * @param buffer - The whole file.
+ * @returns The model in the file's Z-up coordinates.
+ * @throws Error when the magic is not `VOX ` or no SIZE chunk is present.
+ *
+ * @example
+ * ```ts
+ * import { parseVox } from "@voxolith/renderer";
+ *
+ * const model = parseVox(await (await fetch("models/cat-sit.vox")).arrayBuffer());
+ * console.log(model.size, model.voxels.length);
+ * // Grid (Y-up) from file (Z-up): (x, y, z) -> (x, z, y).
+ * const size = { x: model.size.x, y: model.size.z, z: model.size.y };
+ * const data = new Uint8Array(size.x * size.y * size.z);
+ * for (const v of model.voxels) data[v.x + v.z * size.x + v.y * size.x * size.y] = v.c;
+ * ```
+ */
 export function parseVox(buffer: ArrayBuffer): VoxModel {
   const view = new DataView(buffer);
   const magic = readTag(view, 0);
@@ -111,16 +147,31 @@ export function parseVox(buffer: ArrayBuffer): VoxModel {
 export type Mat3 = [number, number, number, number, number, number, number, number, number];
 const IDENTITY3: Mat3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
 
+/**
+ * A MagicaVoxel MATL material for one palette index, as the file states it
+ * (the `_` prefix dropped). Fields a file omits take MagicaVoxel's defaults;
+ * `packMaterials` turns these into the renderer's material buffer.
+ */
 export interface VoxMaterial {
+  /** Unknown types read as "diffuse". */
   type: "diffuse" | "metal" | "glass" | "emit";
+  /** Strength of the type's effect, 0..1 (default 1). */
   weight: number;
+  /** Roughness, 0..1 (default 0.1). */
   rough: number;
+  /** Specular, 0..1 (default 0.5). */
   spec: number;
+  /** Index of refraction minus 1, as MagicaVoxel stores it (default 0.3). */
   ior: number;
+  /** Attenuation through glass (default 0). */
   att: number;
+  /** Emission power (default 0). */
   flux: number;
+  /** Emission strength (default 0). */
   emit: number;
+  /** Glass opacity: `_alpha`, else `_media` (default 0). */
   alpha: number;
+  /** Metalness (default 0; "metal" materials fall back to `weight`). */
   metal: number;
 }
 
@@ -132,11 +183,19 @@ export interface Placement {
   layerId: number;
 }
 
+/**
+ * A whole extended `.vox` file: every model, the scene graph, materials,
+ * layers and keyframes, with `sample` to evaluate the graph at a frame.
+ * `voxSceneAnimator` turns one into a playable Y-up grid.
+ */
 export interface VoxScene {
+  /** Every model in file order; the scene graph refers to them by index. */
   models: VoxModel[];
+  /** 256 RGBA entries (1024 bytes), shared by every model. */
   palette: Uint8Array;
   /** Indexed by palette index (0..255); null = plain diffuse. */
   materials: (VoxMaterial | null)[];
+  /** LAYR chunks; a placement's `layerId` names one. Hidden layers are still sampled. */
   layers: { id: number; name: string; hidden: boolean }[];
   /** Number of animation frames (max keyframe index + 1; ≥ 1). */
   frameCount: number;
@@ -181,6 +240,14 @@ interface GrpNode { kind: 1; children: number[] }
 interface ShpNode { kind: 2; models: { id: number; f: number }[] }
 type SceneNode = TrnNode | GrpNode | ShpNode;
 
+/**
+ * Read the full extended `.vox` format: every model, the nTRN/nGRP/nSHP scene
+ * graph, MATL materials, LAYR layers and keyframes. A file without a scene
+ * graph (the base format) samples as its first model at the origin.
+ * Headless: import it from `@voxolith/renderer/vox` in tools.
+ *
+ * @throws Error when the magic is not `VOX `.
+ */
 export function parseVoxScene(buffer: ArrayBuffer): VoxScene {
   const view = new DataView(buffer);
   if (readTag(view, 0) !== "VOX ") throw new Error("Not a .vox file");
@@ -404,6 +471,25 @@ export function parseVoxScene(buffer: ArrayBuffer): VoxScene {
  * `voxels` are `[x, y, z, colorIndex]` with a 1-based colour index; `colorFor`
  * maps a 1-based index (1..255) to an RGB triple or null (transparent/unused).
  * Pure (no fs) — callers write the returned bytes to disk themselves.
+ * Coordinates are written as bytes, so every axis must fit in 0..255.
+ *
+ * @param size - Model extent, Z-up as MagicaVoxel expects.
+ * @param voxels - Solid voxels only; there is no empty value to write.
+ * @param colorFor - RGB 0..255 for each palette index that is used.
+ * @returns The file's bytes.
+ *
+ * @example
+ * ```ts
+ * import { writeVox } from "@voxolith/renderer/vox";
+ *
+ * // A 2×2×1 slab in palette index 1 (red).
+ * const bytes = writeVox(
+ *   { x: 2, y: 2, z: 1 },
+ *   [[0, 0, 0, 1], [1, 0, 0, 1], [0, 1, 0, 1], [1, 1, 0, 1]],
+ *   (i) => (i === 1 ? [220, 40, 40] : null),
+ * );
+ * await Bun.write("slab.vox", bytes);
+ * ```
  */
 export function writeVox(
   size: { x: number; y: number; z: number },

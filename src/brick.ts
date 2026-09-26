@@ -58,8 +58,10 @@ export const UNIFORM_BIT = 0x4000_0000;
  * the neighbourhood is empty too.
  */
 export const NEAR_BIT = 0x2000_0000;
+/** Index entry bits holding the payload slot + 1. */
 export const SLOT_MASK = 0x1fff_ffff;
 
+/** Memory use of one `BrickGrid`, from `stats()`. */
 export interface BrickStats {
   /** Bricks holding something (uniform ones included). */
   used: number;
@@ -87,6 +89,7 @@ export interface BrickEdit {
   tops: number[];
 }
 
+/** A `BrickEdit` with nothing in it, to accumulate several edits into. */
 export const emptyEdit = (): BrickEdit => ({ slots4: [], slots8: [], blocks: [], tops: [] });
 
 /** Brick payloads and index blocks, shared by every grid built on it. */
@@ -109,6 +112,7 @@ export class BrickPool {
   private readonly lut = new Uint8Array(256);
   private readonly used = new Uint8Array(256);
 
+  /** Take a zeroed index block (reused or new); returns its id. */
   claimBlock(): number {
     const reused = this.freeBlocks.pop();
     const b = reused ?? this.blockCount++;
@@ -123,6 +127,7 @@ export class BrickPool {
     return b;
   }
 
+  /** Free an index block and every brick payload its entries hold. */
   releaseBlock(b: number): void {
     for (let i = b * BLOCK_ENTRIES, e = i + BLOCK_ENTRIES; i < e; i++) {
       this.release(this.blocks[i]);
@@ -254,6 +259,7 @@ export class BrickPool {
     return slot + 1;
   }
 
+  /** Return an entry's payload slot to the free list (uniform and empty entries hold none). */
   release(entry: number): void {
     if (!entry || entry & UNIFORM_BIT || !(entry & SLOT_MASK)) return;
     const slot = (entry & SLOT_MASK) - 1;
@@ -292,7 +298,25 @@ export class BrickPool {
  * Sparse view of one grid (the world, or one model) over a pool.
  *
  * `fill` callbacks and edits work a brick at a time, so a world can be built
- * and later edited without a dense array of it ever existing.
+ * and later edited without a dense array of it ever existing. Headless: the
+ * renderer keeps one internally, and tools use it to measure a scene or to
+ * check what a GPU upload would hold.
+ *
+ * @example
+ * ```ts
+ * import { BrickGrid } from "@voxolith/renderer/core";
+ *
+ * // An empty 256×64×256 world, filled a brick at a time: ground below y = 10.
+ * const grid = new BrickGrid({ x: 256, y: 64, z: 256 });
+ * grid.editBox({ x0: 0, y0: 0, z0: 0, x1: 255, y1: 9, z1: 255 }, (cells, ox, oy, oz) => {
+ *   for (let lz = 0; lz < 8; lz++)
+ *     for (let ly = 0; ly < 8; ly++)
+ *       for (let lx = 0; lx < 8; lx++) if (oy + ly < 10) cells[lx + ly * 8 + lz * 64] = 1;
+ *   return true;
+ * });
+ * grid.get(3, 9, 3); // 1
+ * grid.stats(); // { used, uniform, payloadBytes, denseBytes, ... }
+ * ```
  */
 export class BrickGrid {
   /** Brick-space dimensions. */
@@ -301,6 +325,7 @@ export class BrickGrid {
   readonly topDim: [number, number, number];
   /** One entry per top cell: 0 = nothing there, else pool block id + 1. */
   readonly top: Uint32Array;
+  /** Where the payloads and index blocks live; shared when one was passed in. */
   readonly pool: BrickPool;
   private readonly size: { x: number; y: number; z: number };
   /** Reused 512-voxel staging buffer; a brick is never big enough to justify allocating one per call. */
@@ -320,9 +345,11 @@ export class BrickGrid {
     if (data) this.rebuildAll(data);
   }
 
+  /** 4-bit payload slots claimed in the pool (by every grid sharing it). */
   get slotCount4(): number {
     return this.pool.slots4;
   }
+  /** 8-bit payload slots claimed in the pool (by every grid sharing it). */
   get slotCount8(): number {
     return this.pool.slots8;
   }
@@ -359,6 +386,7 @@ export class BrickGrid {
     edit.blocks.push(t - 1);
   }
 
+  /** Count this grid's bricks and blocks; `payloadBytes` is the whole pool's. Walks every block. */
   stats(): BrickStats {
     let used = 0, wide = 0, uniform = 0, blocks = 0;
     for (const t of this.top) {

@@ -1,4 +1,6 @@
 // Owns the WebGPU pipeline and resources for the fullscreen voxel raymarch pass.
+// Browser only: the shaders are imported with Vite's `?raw`, so only a bundler
+// can load this module.
 
 import { link } from "wesl";
 import uniformsWesl from "./shaders/uniforms.wesl?raw";
@@ -89,6 +91,7 @@ const MAX_CELL_INSTANCES = 255;
 
 /** A model drawn by instances; see Renderer.addModel. */
 export interface ModelSource {
+  /** Extent in voxels. */
   size: { x: number; y: number; z: number };
   /** Dense role values, `x + y*sx + z*sx*sy`; or `sparse`. */
   data?: Uint8Array;
@@ -97,10 +100,13 @@ export interface ModelSource {
 
 /** One placement of a model: its anchor at a world position, turned about y. */
 export interface Instance {
+  /** Model id from `Renderer.addModel`. */
   model: number;
   /** World position of the model's anchor (voxels, fractional allowed). */
   x: number;
+  /** See `x`. */
   y: number;
+  /** See `x`. */
   z: number;
   /** Model anchor, in model voxels (default the base centre: size.x/2, 0, size.z/2). */
   anchor?: Vec3;
@@ -124,6 +130,7 @@ interface GpuModel {
 
 /** Minimal scene data the renderer needs to build/upload the voxel grid. */
 export interface RenderScene {
+  /** World grid extent in voxels; fixed for the renderer's lifetime. */
   size: { x: number; y: number; z: number };
   /**
    * Dense voxels, `x + y*sx + z*sx*sy`. Optional: omit it for an empty world
@@ -131,6 +138,7 @@ export interface RenderScene {
    * holding a dense copy of itself in memory.
    */
   data?: Uint8Array;
+  /** The world's 256 colours, RGBA floats 0..1 per slot (1024 floats); slot 0 is empty. */
   palette: Float32Array;
   /** Optional per-slot materials (256×8 f32); enables material shading. */
   materials?: Float32Array;
@@ -138,40 +146,68 @@ export interface RenderScene {
 
 /** Optional offscreen render destination (defaults to the canvas swapchain). */
 export interface RenderTarget {
+  /** A view of a texture in `gpu.format` with RENDER_ATTACHMENT usage. */
   view: GPUTextureView;
+  /** Pixels; sets the aspect ratio and ray basis. */
   width: number;
+  /** Pixels. */
   height: number;
 }
 
 type Vec3 = [number, number, number];
 
+/**
+ * Everything one `Renderer.render` call draws with: a camera (spread a
+ * `CameraFrame` from `makeCamera`, `firstPersonFrame` or `chaseFrame`), the
+ * key light and sky, and the optional atmosphere. Colours are linear RGB;
+ * directions are unit vectors in grid space. The renderer knows nothing about
+ * time of day: `@voxolith/engine/atmosphere` computes these from a clock, or
+ * pass constants.
+ */
 export interface FrameParams extends AtmosphereParams {
   // Camera (from camera.ts).
+  /** Eye position, grid space (voxels). */
   camPos: Vec3;
+  /** Unit screen-right. */
   camRight: Vec3;
+  /** Unit screen-up. */
   camUp: Vec3;
+  /** Unit view direction. */
   camFwd: Vec3;
+  /** tan of half the vertical field of view. */
   tanHalfFov: number;
   // Environment lighting + sky. Generic: the caller supplies the values (a game
   // may drive them from a day/night clock, or pass static constants).
+  /** Towards the key light (sun or moon); it lights and casts the shadows. */
   lightDir: Vec3;
+  /** Key light colour and strength. */
   lightColor: Vec3;
+  /** Ambient light from above (hemisphere, sky side). */
   ambientSky: Vec3;
+  /** Ambient light from below (hemisphere, ground side). */
   ambientGround: Vec3;
+  /** Where the sun disc is drawn in the sky. */
   sunDir: Vec3;
+  /** Where the moon disc is drawn. The moon lights nothing; `lightDir` does. */
   moonDir: Vec3;
+  /** Colour of the sun disc and its glow. */
   sunColor: Vec3;
+  /** Colour of the moon disc. */
   moonColor: Vec3;
+  /** Sky colour at the zenith. */
   skyTop: Vec3;
+  /** Sky colour at the horizon. */
   skyHorizon: Vec3;
+  /** 0 day .. 1 night: blends in the night sky (stars). */
   nightFactor: number;
+  /** Sun disc brightness; 0 hides it. */
   sunIntensity: number;
+  /** Moon disc brightness; 0 hides it. */
   moonIntensity: number;
   /** Seconds, for animated materials (water ripples). Leave it constant and nothing moves. */
   time?: number;
 }
 
-/** Optional infinite ground-plane drawn on ray-miss below `y` (off by default). */
 /** Per-frame cost knobs. All are runtime uniforms; changing them is free. */
 export interface RenderQuality {
   /** Primary-ray DDA step cap (16..4096). Lower is cheaper; too low clips far geometry. */
@@ -182,6 +218,7 @@ export interface RenderQuality {
   ao: boolean;
 }
 
+/** Names of the `QUALITY_PRESETS`; "low" has no shadows or AO. */
 export type QualityPreset = "low" | "medium" | "high";
 
 /** Presets consumers can offer in a UI; `high` matches the engine's original look. */
@@ -191,13 +228,28 @@ export const QUALITY_PRESETS: Record<QualityPreset, RenderQuality> = {
   high: { maxSteps: 768, shadowSteps: 90, ao: true },
 };
 
+/** Optional infinite ground-plane drawn on ray-miss below `y` (off by default). */
 export interface FloorParams {
   enabled: boolean;
+  /** Height of the plane, grid space (voxels). */
   y: number;
+  /** One colour of the 3-voxel checker, linear RGB. */
   colorA: Vec3;
+  /** The other colour of the checker, linear RGB. */
   colorB: Vec3;
 }
 
+/**
+ * The fullscreen voxel raymarcher: one world grid (8-bit palette slots, held
+ * as sparse bricks on the GPU), models drawn by instance, point lights and
+ * atmosphere. Build it with `createRenderer`, edit the world with `edit`,
+ * `editMany` or `updateVoxels`, and call `render` for each frame; nothing
+ * draws between calls. Browser only.
+ *
+ * World coordinates are voxels, y up, with the grid from (0, 0, 0) to `size`;
+ * a voxel value is a palette slot and 0 is empty. GPU buffers grow as needed.
+ * Call `destroy` before dropping a renderer.
+ */
 export class Renderer {
   private readonly gpu: GpuContext;
   private readonly pipeline: GPURenderPipeline;
@@ -262,6 +314,11 @@ export class Renderer {
   private debugMode = 0;
   private quality: RenderQuality = { ...QUALITY_PRESETS.high };
 
+  /**
+   * Prefer `createRenderer`, which links the shader for you. `shaderCode` is
+   * the WGSL from `raymarchShaderCode()`. Building scans a dense `scene.data`
+   * once for its occupied bounds and uploads it as bricks.
+   */
   constructor(gpu: GpuContext, scene: RenderScene, shaderCode: string) {
     this.gpu = gpu;
     const { device } = gpu;
@@ -445,6 +502,18 @@ export class Renderer {
    * Replace the point lights (up to MAX_LIGHTS; extras are ignored). Cheap: it
    * rewrites a 1.5 KB buffer, so moving a lamp every frame is fine. Invalidate
    * the frame loop afterwards.
+   *
+   * @param lights - The whole set; pass `[]` for none.
+   *
+   * @example
+   * ```ts
+   * renderer.setLights([
+   *   { position: lamp, color: [1.0, 0.7, 0.38], intensity: 2.6, range: 90, glow: 3.5 },
+   *   // A soft unshadowed spill, so light still reaches just round a trunk.
+   *   { position: lamp, color: [1.0, 0.75, 0.45], intensity: 0.25, range: 50, shadows: false },
+   * ]);
+   * loop.invalidate();
+   * ```
    */
   setLights(lights: readonly PointLight[]): void {
     const { count } = packLights(lights, this.lightData);
@@ -541,8 +610,19 @@ export class Renderer {
     this.floor = state;
   }
 
-  /** 1 = force single-step DDA (ignore coarse skip) — for the ?diff exactness check. */
-  /** Set per-frame cost knobs (partial updates allowed). Takes effect next frame. */
+  /**
+   * Set per-frame cost knobs (partial updates allowed). Takes effect next frame.
+   * Values are clamped to the ranges `RenderQuality` states.
+   *
+   * @param q - A preset name, or the fields to change.
+   *
+   * @example
+   * ```ts
+   * renderer.setQuality(gpu.software ? "low" : "medium");
+   * renderer.setQuality({ shadowSteps: 0 }); // keep the rest
+   * loop.invalidate();
+   * ```
+   */
   setQuality(q: Partial<RenderQuality> | QualityPreset): void {
     const src = typeof q === "string" ? QUALITY_PRESETS[q] : q;
     this.quality = {
@@ -552,10 +632,17 @@ export class Renderer {
     };
   }
 
+  /** The knobs in effect (a copy). */
   getQuality(): RenderQuality {
     return { ...this.quality };
   }
 
+  /**
+   * Diagnostic modes. 0 is normal; 1 forces single-step DDA (no empty-space
+   * skip), for exactness checks and for grids that change every frame; 7, 8
+   * and 9 replace the picture with self-test bands of the voxel lookup, green
+   * where a stage works (see shaders/selftest.wesl).
+   */
   setDebug(v: number): void {
     this.debugMode = v;
   }
@@ -615,6 +702,27 @@ export class Renderer {
    * `fill` gets each overlapping brick's current 512 voxels and its world
    * origin; see BrickGrid.editBox. Touched bricks are uploaded before this
    * returns.
+   *
+   * @param box - Inclusive voxel box; every brick it overlaps is visited whole.
+   * @param fill - Gets the brick's 512 voxels (`lx + ly*8 + lz*64`) and its
+   *   world origin; mutate the cells and return true if anything changed.
+   *   Cells outside `box` are the caller's to leave alone.
+   *
+   * @example
+   * ```ts
+   * // Carve a 9×9×9 hole centred on (cx, cy, cz).
+   * const box = { x0: cx - 4, y0: cy - 4, z0: cz - 4, x1: cx + 4, y1: cy + 4, z1: cz + 4 };
+   * renderer.edit(box, (cells, ox, oy, oz) => {
+   *   let changed = false;
+   *   for (let i = 0; i < 512; i++) {
+   *     const x = ox + (i & 7), y = oy + ((i >> 3) & 7), z = oz + (i >> 6);
+   *     if (x < box.x0 || x > box.x1 || y < box.y0 || y > box.y1 || z < box.z0 || z > box.z1) continue;
+   *     if (cells[i]) { cells[i] = 0; changed = true; }
+   *   }
+   *   return changed;
+   * });
+   * loop.invalidate();
+   * ```
    */
   edit(box: DirtyBox, fill: (cells: Uint8Array, ox: number, oy: number, oz: number) => boolean): void {
     this.commit(this.bricks.editBox(box, fill));
@@ -625,6 +733,20 @@ export class Renderer {
    * end, instead of one per box. What moving things need: a crowd touches a
    * few thousand scattered bricks a frame, and a box around all of them would
    * visit most of the world.
+   *
+   * @param boxes - Inclusive voxel boxes. Boxes sharing a brick visit it once
+   *   per box, so keep them disjoint.
+   * @param fill - As for `edit`, called once per brick per box.
+   *
+   * @example
+   * ```ts
+   * // Stream in the ground for the brick columns that became visible.
+   * const boxes = columns.map(([bx, bz]) => ({
+   *   x0: bx * 8, y0: 0, z0: bz * 8,
+   *   x1: bx * 8 + 7, y1: size.y - 1, z1: bz * 8 + 7,
+   * }));
+   * renderer.editMany(boxes, (cells, ox, oy, oz) => ground.fillBrick(cells, ox, oy, oz));
+   * ```
    */
   editMany(boxes: readonly DirtyBox[], fill: (cells: Uint8Array, ox: number, oy: number, oz: number) => boolean): void {
     if (!boxes.length) return;
@@ -644,6 +766,24 @@ export class Renderer {
    * Upload a model once, to be drawn any number of times by `setInstances`.
    * Its voxels are role values (1..), mapped to palette slots per instance.
    * Returns the model id.
+   *
+   * The model's bricks share the world's GPU pool, so a model costs its
+   * occupied bricks once however many instances draw it. Ids of removed
+   * models are reused.
+   *
+   * @param src - Size plus dense `data` or `sparse` bricks.
+   * @returns The id an `Instance` names in `model`.
+   *
+   * @example
+   * ```ts
+   * const tree = renderer.addModel({ size: model.size, data: model.data });
+   * // Role r of this tree draws colour r - 1 of its own palette.
+   * const bark = renderer.addPalette(new Float32Array([0.4, 0.28, 0.18, 1, 0.25, 0.5, 0.2, 1]));
+   * renderer.setInstances([
+   *   { model: tree, base: bark, x: 40, y: 12, z: 60 },
+   *   { model: tree, base: bark, x: 90.5, y: 14, z: 31, yaw: Math.PI / 3, mirror: true },
+   * ]);
+   * ```
    */
   addModel(src: ModelSource): number {
     const grid = new BrickGrid(src.size, undefined, this.pool);
@@ -693,6 +833,20 @@ export class Renderer {
    * set and build its per-cell lists once. `{ dynamic: true }` replaces only
    * the moving set, which is what a crowd calls every frame: its cost is the
    * moving instances and the cells they touch, however much scenery there is.
+   *
+   * Each 64^3 top cell draws at most 255 instances; more are dropped with a
+   * console warning. Instances naming a removed model are skipped.
+   *
+   * @param list - The whole static set, or the whole moving set.
+   * @param opts - `dynamic: true` for the moving set.
+   *
+   * @example
+   * ```ts
+   * renderer.setInstances(trees); // once: scenery
+   * // Every frame, for what moves:
+   * const moving = rats.map((r) => ({ model: ratModel, base: ratPalette, x: r.x, y: r.y, z: r.z, yaw: r.yaw }));
+   * renderer.setInstances(moving, { dynamic: true });
+   * ```
    */
   setInstances(list: readonly Instance[], opts: { dynamic?: boolean } = {}): void {
     if (opts.dynamic) {
@@ -1064,6 +1218,29 @@ export class Renderer {
   /**
    * Draw the scene. Renders to the canvas swapchain by default, or to a
    * provided offscreen target (used for headless capture / future post passes).
+   *
+   * One fullscreen pass, submitted before this returns. The swapchain size is
+   * `gpu.width` × `gpu.height`, so call `resizeToDisplay(gpu)` first when the
+   * canvas may have changed size.
+   *
+   * @param p - Camera, lighting, sky and atmosphere for this frame.
+   * @param target - Draw here instead of the canvas.
+   *
+   * @example
+   * ```ts
+   * const camera = makeCamera({ target: [48, 8, 48], distance: 200, pitchDeg: 32, fovDeg: 35 });
+   * const sun: [number, number, number] = [0.48, 0.81, 0.33];
+   * resizeToDisplay(gpu);
+   * renderer.render({
+   *   ...camera(35),
+   *   lightDir: sun, lightColor: [1, 0.98, 0.94],
+   *   ambientSky: [0.5, 0.53, 0.6], ambientGround: [0.3, 0.29, 0.27],
+   *   sunDir: sun, moonDir: [0, -1, 0], sunColor: [1, 0.96, 0.85], moonColor: [0, 0, 0],
+   *   skyTop: [0.35, 0.55, 0.9], skyHorizon: [0.75, 0.82, 0.92],
+   *   nightFactor: 0, sunIntensity: 1, moonIntensity: 0,
+   *   time: performance.now() / 1000,
+   * });
+   * ```
    */
   render(p: FrameParams, target?: RenderTarget): void {
     const width = target?.width ?? this.gpu.width;
@@ -1153,6 +1330,26 @@ export class Renderer {
  * Build a Renderer, linking the WESL shader first (cached after the first call).
  * Async because linking is async; the per-call cost after warm-up is just the
  * pipeline/texture setup. Prefer this over `new Renderer(...)`.
+ *
+ * @param gpu - From `initGpu`.
+ * @param scene - Grid size, optional dense voxels, the world palette and
+ *   optional materials. The renderer keeps its own copy as bricks; `data` can
+ *   be dropped afterwards.
+ * @returns A renderer at the high quality preset, floor off, no lights.
+ *
+ * @example
+ * ```ts
+ * import { createRenderer, initGpu } from "@voxolith/renderer";
+ *
+ * const gpu = await initGpu(canvas);
+ * const size = { x: 96, y: 32, z: 96 };
+ * const data = new Uint8Array(size.x * size.y * size.z);
+ * for (let z = 0; z < size.z; z++)
+ *   for (let x = 0; x < size.x; x++) data[x + z * size.x * size.y] = 1; // grass at y = 0
+ * const palette = new Float32Array(256 * 4);
+ * palette.set([0.36, 0.62, 0.28, 1], 1 * 4);
+ * const renderer = await createRenderer(gpu, { size, data, palette });
+ * ```
  */
 export async function createRenderer(gpu: GpuContext, scene: RenderScene): Promise<Renderer> {
   return new Renderer(gpu, scene, await raymarchShaderCode());

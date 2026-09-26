@@ -8,8 +8,14 @@
 
 import { seededRandom } from "./random";
 
+/** A point or direction in grid space, in voxels. */
 export type Vec3 = [number, number, number];
 
+/**
+ * A looping voxel effect on a small stage grid of its own. Build a renderer
+ * from `size`, `data` and `palette`, then each frame call `tick(dt)` and
+ * upload `data` with `renderer.updateVoxels`.
+ */
 export interface VoxEffect {
   /** Stage grid the effect wants a Renderer built for. */
   readonly size: { x: number; y: number; z: number };
@@ -86,9 +92,15 @@ const tempSlot = (h: number, n: number): number => {
   return n > 0.5 ? SMOKE_L : SMOKE_D;
 };
 
+/**
+ * Explosion presets: stage grids of 64×56×64, 96×88×96 and 128×112×128
+ * voxels, lasting 1.0, 1.7 and 2.6 s.
+ */
 export type ExplosionSize = "small" | "medium" | "large";
 
+/** Options for `makeExplosion`. */
 export interface ExplosionOpts {
+  /** Preset (default "medium"). */
   size?: ExplosionSize;
 }
 
@@ -114,6 +126,33 @@ interface Ejecta {
   parity: number;
 }
 
+/**
+ * A ground-anchored blast: a billowing fire dome sitting on the stage floor
+ * (y = 0) at the stage centre, with debris streaks thrown up and out, cooling
+ * to smoke. Loops once its lifetime is over. Deterministic (fixed seed) and
+ * headless; the palette uses slots 1..7 only.
+ *
+ * @param opts - The size preset.
+ * @returns The effect, already at its first frame.
+ *
+ * @example
+ * ```ts
+ * import { createRenderer, makeExplosion } from "@voxolith/renderer";
+ *
+ * const fx = makeExplosion({ size: "large" });
+ * const renderer = await createRenderer(gpu, { size: fx.size, data: fx.data, palette: fx.palette });
+ * // The stage starts almost empty, so clip to all of it.
+ * renderer.setClipBounds([0, 0, 0], [fx.size.x - 1, fx.size.y - 1, fx.size.z - 1]);
+ * const loop = makeFrameLoop({
+ *   continuous: true,
+ *   render: (_now, dt) => {
+ *     fx.tick(dt);
+ *     renderer.updateVoxels(fx.data);
+ *     renderer.render({ ...camera(30), ...sky });
+ *   },
+ * });
+ * ```
+ */
 export function makeExplosion(opts: ExplosionOpts = {}): VoxEffect {
   const P = EXPLOSION_PARAMS[opts.size ?? "medium"];
   const size = { x: P.sx, y: P.sy, z: P.sz };
@@ -265,13 +304,40 @@ export function makeExplosion(opts: ExplosionOpts = {}): VoxEffect {
 
 // ---- muzzle flashes --------------------------------------------------------
 
+/**
+ * Muzzle flash shapes: "star" a flat spiky star across the barrel, "cone" a
+ * forward flame jet, "bloom" a quick round pop.
+ */
 export type MuzzleType = "star" | "cone" | "bloom";
 
+/** Options for `makeMuzzleFlash`. */
 export interface MuzzleFlashOpts {
+  /** Shape (default "star"). */
   type?: MuzzleType;
+  /** Edge of the cubic stage grid, in voxels (default 48). */
   size?: number;
 }
 
+/**
+ * A gun's muzzle flash that repeats like sustained fire: a 0.13 s flash, then
+ * a dark gap, every 0.42 s. The muzzle sits left of centre and fires towards
+ * +x, so the flash reads in profile. Headless; the palette uses slots 1..7.
+ *
+ * @param opts - Shape and stage size.
+ * @returns The effect, already at its first frame.
+ *
+ * @example
+ * ```ts
+ * import { makeMuzzleFlash } from "@voxolith/renderer";
+ *
+ * const flash = makeMuzzleFlash({ type: "cone", size: 64 });
+ * const renderer = await createRenderer(gpu, { size: flash.size, data: flash.data, palette: flash.palette });
+ * renderer.setClipBounds([0, 0, 0], [63, 63, 63]);
+ * // Per frame:
+ * flash.tick(dt);
+ * renderer.updateVoxels(flash.data);
+ * ```
+ */
 export function makeMuzzleFlash(opts: MuzzleFlashOpts = {}): VoxEffect {
   const S = opts.size ?? 48;
   const type = opts.type ?? "star";

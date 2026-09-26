@@ -1,8 +1,14 @@
-// Ray helpers for picking: build a world-space ray from a screen tap, and a
-// ray vs axis-aligned box test. Shared by any game doing click selection.
+/**
+ * Ray helpers for picking. Build a world-space ray from a screen tap, test a
+ * ray against an axis-aligned box, and walk a dense voxel grid on the CPU.
+ * Shared by any game doing click selection or collision.
+ *
+ * @packageDocumentation
+ */
 
 import type { CameraFrame } from "./camera";
 
+/** A point or direction in grid space: x, y (up), z, in voxels. */
 export type Vec3 = [number, number, number];
 
 /** Ray vs axis-aligned box; returns entry distance along `d` (or null on miss). */
@@ -27,6 +33,8 @@ export function rayAABB(o: Vec3, d: Vec3, min: Vec3, max: Vec3): number | null {
 /**
  * Reconstruct the world-space ray through a client (pixel) coordinate, matching
  * the shader's per-pixel ray basis. Returns the camera origin + a (non-unit) dir.
+ * `clientX`/`clientY` are pointer-event coordinates; the canvas's CSS box and
+ * backing-store aspect are read, so this needs a browser.
  */
 export function makeRay(
   canvas: HTMLCanvasElement,
@@ -49,6 +57,7 @@ export function makeRay(
   return { origin: [...frame.camPos] as Vec3, dir };
 }
 
+/** Where a `voxelRaycast` stopped. */
 export interface VoxelHit {
   /** Distance along `dir` (in units of |dir|) to the hit face. */
   t: number;
@@ -64,6 +73,31 @@ export interface VoxelHit {
  * in units of `dir` (so `origin + dir * t` is the hit point). Cells count as
  * solid when `data[i] !== 0` unless a `solid` predicate is given. Returns null
  * when nothing is hit within `maxT`.
+ *
+ * Headless and cheap (at most one step per cell crossed), so it suits
+ * per-frame collision tests as well as picking. It walks one dense grid; a
+ * scene held only as bricks has no such array to pass.
+ *
+ * @param size - Grid extent in voxels.
+ * @param data - Dense grid, `x + y*sx + z*sx*sy`.
+ * @param origin - Ray start in grid space; it may lie outside the grid.
+ * @param dir - Ray direction; its length sets the unit of `t` and `maxT`.
+ * @param maxT - Give up beyond `origin + dir * maxT`.
+ * @param solid - Narrows which non-zero cells stop the ray (water, glass, the
+ *   shooter's own voxels).
+ * @returns The first solid cell and its entry face, or null.
+ *
+ * @example
+ * ```ts
+ * import { voxelRaycast, type Vec3 } from "@voxolith/renderer/core";
+ *
+ * // Will a ball at `p` moving by `move` this step hit anything?
+ * const hit = voxelRaycast(size, data, p, move, 1);
+ * if (hit) {
+ *   const at: Vec3 = [p[0] + move[0] * hit.t, p[1] + move[1] * hit.t, p[2] + move[2] * hit.t];
+ *   bounce(at, hit.normal);
+ * }
+ * ```
  */
 export function voxelRaycast(
   size: { x: number; y: number; z: number },

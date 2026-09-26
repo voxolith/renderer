@@ -4,11 +4,13 @@
 // while something animates. requestAnimationFrame is only scheduled while
 // there is work, so an idle viewer costs nothing.
 
+/** A render-on-demand loop from `makeFrameLoop`. */
 export interface FrameLoop {
   /** Request one frame (coalesced). */
   invalidate(): void;
   /** Keep rendering every frame while on (animation, particles, held keys). */
   setContinuous(on: boolean): void;
+  /** Whether continuous mode is on. */
   continuous(): boolean;
   /** Stop scheduling frames (invalidate() restarts). */
   stop(): void;
@@ -16,6 +18,7 @@ export interface FrameLoop {
   dispose(): void;
 }
 
+/** Options for `makeFrameLoop`. */
 export interface FrameLoopOptions {
   /** Called for each rendered frame with performance.now() and dt in seconds (capped). */
   render: (now: number, dt: number) => void;
@@ -25,6 +28,32 @@ export interface FrameLoopOptions {
   continuous?: boolean;
 }
 
+/**
+ * Start a render-on-demand loop over `requestAnimationFrame`. Nothing is drawn
+ * until something asks: `invalidate()` requests one frame (calls within a frame
+ * coalesce), `setContinuous(true)` renders every frame up to `maxFps` while
+ * something animates. A loop that starts on demand draws nothing until the
+ * first `invalidate()`. `dt` is capped at 50 ms, so a long pause does not
+ * arrive as one huge step. Browser only.
+ *
+ * @param opts - The render callback, fps cap and starting mode.
+ * @returns The loop; pass it to `observeResize` and to input that should redraw.
+ *
+ * @example
+ * ```ts
+ * import { makeFrameLoop, observeResize, resizeToDisplay } from "@voxolith/renderer";
+ *
+ * const loop = makeFrameLoop({
+ *   render: () => {
+ *     resizeToDisplay(gpu);
+ *     renderer.render({ ...camera(yaw), ...sky });
+ *   },
+ * });
+ * observeResize(canvas, loop);
+ * loop.invalidate(); // first frame
+ * slider.oninput = () => { yaw = slider.valueAsNumber; loop.invalidate(); };
+ * ```
+ */
 export function makeFrameLoop(opts: FrameLoopOptions): FrameLoop {
   const minDt = 1000 / (opts.maxFps ?? 60) - 1;
   let cont = opts.continuous ?? false;

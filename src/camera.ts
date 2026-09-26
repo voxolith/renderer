@@ -6,10 +6,15 @@ type Vec3 = [number, number, number];
 
 /** Camera basis the renderer needs; environment fields are merged in by the app. */
 export interface CameraFrame {
+  /** Eye position, grid space (voxels). */
   camPos: Vec3;
+  /** Unit screen-right, `cross(camFwd, +y)`. */
   camRight: Vec3;
+  /** Unit screen-up. */
   camUp: Vec3;
+  /** Unit view direction. */
   camFwd: Vec3;
+  /** tan of half the vertical field of view. */
   tanHalfFov: number;
 }
 
@@ -24,15 +29,37 @@ const norm = (a: Vec3): Vec3 => {
   return [a[0] / l, a[1] / l, a[2] / l];
 };
 
+/** Fixed settings of an orbit camera from `makeCamera`. */
 export interface CameraConfig {
   /** Default look-at target (a `frame()` call may override it). */
   target: Vec3;
   /** Default orbit distance (a `frame()` call may override it for zoom). */
   distance: number;
+  /** Default elevation above the target, degrees; positive looks down on it. */
   pitchDeg: number;
+  /** Vertical field of view, degrees. */
   fovDeg: number;
 }
 
+/**
+ * Make an orbit camera: a function from yaw (and optionally distance, target
+ * and pitch, which default to `cfg`) to the `CameraFrame` the renderer needs.
+ * The eye sits on a sphere around the target; yaw 0 puts it on the target's +z
+ * side looking towards -z, and increasing yaw moves it towards +x. Headless.
+ *
+ * @param cfg - Default target, distance, pitch and field of view.
+ * @returns `frame(yawDeg, distance?, target?, pitchDeg?)`.
+ *
+ * @example
+ * ```ts
+ * import { makeCamera } from "@voxolith/renderer";
+ *
+ * const camera = makeCamera({ target: [48, 8, 48], distance: 200, pitchDeg: 32, fovDeg: 35 });
+ * renderer.render({ ...camera(35), ...sky });
+ * // Driven by an orbit controller instead:
+ * renderer.render({ ...camera(orbit.yaw(), orbit.distance(), orbit.target(), orbit.pitch()), ...sky });
+ * ```
+ */
 export function makeCamera(cfg: CameraConfig) {
   const defaultPitch = (cfg.pitchDeg * Math.PI) / 180;
   const tanHalfFov = Math.tan((cfg.fovDeg * Math.PI) / 360);
@@ -64,6 +91,21 @@ export function makeCamera(cfg: CameraConfig) {
  * First-person camera frame: look from `eye` along a yaw/pitch direction (for a
  * walkthrough where the camera sits inside the grid). yaw 0 faces +Z; pitch +
  * looks up. Clamp pitch to ~±89° upstream to avoid the up-vector degenerating.
+ * Screen-right is `cross(forward, up)`, so increasing yaw turns right.
+ *
+ * @param eye - Camera position, grid space (voxels).
+ * @param yawDeg - Heading in degrees; 0 faces +z, 90 faces +x.
+ * @param pitchDeg - Elevation in degrees; positive looks up.
+ * @param fovDeg - Vertical field of view in degrees.
+ * @returns The frame to spread into `FrameParams`.
+ *
+ * @example
+ * ```ts
+ * import { firstPersonFrame } from "@voxolith/renderer";
+ *
+ * const eye: [number, number, number] = [128, 40, -10];
+ * renderer.render({ ...firstPersonFrame(eye, look.yaw(), look.pitch(), 75), ...sky });
+ * ```
  */
 export function firstPersonFrame(eye: Vec3, yawDeg: number, pitchDeg: number, fovDeg: number): CameraFrame {
   const yaw = (yawDeg * Math.PI) / 180;
@@ -75,6 +117,7 @@ export function firstPersonFrame(eye: Vec3, yawDeg: number, pitchDeg: number, fo
   return { camPos: eye, camFwd: fwd, camRight: right, camUp: up, tanHalfFov: Math.tan((fovDeg * Math.PI) / 360) };
 }
 
+/** Framing of a `chaseFrame` camera. Distances are in voxels. */
 export interface ChaseOptions {
   /** Heading the target is facing, degrees; yaw 0 faces +Z (same convention as firstPersonFrame). */
   yawDeg: number;
@@ -84,6 +127,7 @@ export interface ChaseOptions {
   height: number;
   /** Look at a point this far ahead of the target along the heading (framing leads the car). Default 0. */
   lookAhead?: number;
+  /** Vertical field of view, degrees. */
   fovDeg: number;
 }
 

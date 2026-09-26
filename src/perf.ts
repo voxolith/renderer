@@ -4,6 +4,7 @@
 // we comfortably hit the target and backs off quickly when frames stretch.
 // Overlay enabled via ?perf=1 (consumer decides).
 
+/** A frame-time readout and render-scale controller from `makePerf`. */
 export interface Perf {
   /** Call once per rendered frame with performance.now(). */
   frame(now: number): void;
@@ -23,7 +24,9 @@ export interface Perf {
   setLabel(label: string): void;
 }
 
+/** Options for `makePerf`. */
 export interface PerfOptions {
+  /** Show the overlay. The controller adapts either way. */
   enabled: boolean;
   /** Starting scale (usually gpu.renderScale). */
   scale: number;
@@ -57,6 +60,40 @@ export interface PerfOptions {
   label?: string;
 }
 
+/**
+ * Measure frame times and adapt the render scale to hit a frame-time target.
+ * Feed it every rendered frame; it lowers the scale quickly when frames run
+ * over budget and raises it in 0.05 steps when they fit, remembering a scale
+ * that proved too slow for `retryAfterMs`. With `enabled` it also adds a small
+ * overlay to `document.body`, so it needs a browser.
+ *
+ * Frame times come from `performance.now()` deltas between rendered frames,
+ * so they include vsync waits: under a 60 Hz display nothing reads below
+ * 16.7 ms.
+ *
+ * @param opts - Starting scale, limits, target and overlay settings.
+ * @returns The controller; apply `scale()` to `gpu.renderScale` each frame.
+ *
+ * @example
+ * ```ts
+ * import { makeFrameLoop, makePerf, resizeToDisplay } from "@voxolith/renderer";
+ *
+ * const perf = makePerf({
+ *   enabled: new URLSearchParams(location.search).has("perf"),
+ *   scale: gpu.renderScale,
+ *   minScale: gpu.software ? 0.25 : 0.4,
+ * });
+ * const loop = makeFrameLoop({
+ *   continuous: true,
+ *   render: (now) => {
+ *     perf.frame(now);
+ *     gpu.renderScale = perf.scale();
+ *     resizeToDisplay(gpu);
+ *     renderer.render({ ...camera(now / 50), ...sky });
+ *   },
+ * });
+ * ```
+ */
 export function makePerf(opts: PerfOptions): Perf {
   const minScale = opts.minScale ?? 0.35;
   const maxScale = opts.maxScale ?? 1;

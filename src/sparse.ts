@@ -5,10 +5,18 @@
 // renderer accepts it directly (`addModel`), and the engine's EntityModel can
 // carry one in place of its dense `data`.
 
+/** Brick edge of `SparseVoxels`, in voxels. */
 export const SPARSE_B = 8;
 const SV = SPARSE_B * SPARSE_B * SPARSE_B;
 
+/**
+ * A voxel volume stored as a map of 8^3 bricks, for models too large to hold
+ * densely. Only bricks with something in them exist. Pass it to
+ * `Renderer.addModel` as `sparse`, or build it with `sparseSet` or
+ * `sparseFromDense`; read it with `sparseGet`.
+ */
 export interface SparseVoxels {
+  /** Extent in voxels. */
   size: { x: number; y: number; z: number };
   /**
    * Bricks by `bx + by * bdx + bz * bdx * bdy` (bdx = ceil(size.x / 8), ...),
@@ -17,14 +25,17 @@ export interface SparseVoxels {
   bricks: Map<number, Uint8Array>;
 }
 
+/** Bricks along each axis for a volume of `size`: `ceil(size / 8)`. */
 export function sparseDims(size: { x: number; y: number; z: number }): [number, number, number] {
   return [Math.ceil(size.x / SPARSE_B), Math.ceil(size.y / SPARSE_B), Math.ceil(size.z / SPARSE_B)];
 }
 
+/** An empty sparse volume of `size` (the size is copied). */
 export function makeSparse(size: { x: number; y: number; z: number }): SparseVoxels {
   return { size: { ...size }, bricks: new Map() };
 }
 
+/** Read a voxel; 0 outside the volume or in a missing brick. */
 export function sparseGet(s: SparseVoxels, x: number, y: number, z: number): number {
   if (x < 0 || y < 0 || z < 0 || x >= s.size.x || y >= s.size.y || z >= s.size.z) return 0;
   const [dx, dy] = sparseDims(s.size);
@@ -46,6 +57,10 @@ export function sparseSet(s: SparseVoxels, x: number, y: number, z: number, v: n
   b[(x & 7) + (y & 7) * 8 + (z & 7) * 64] = v;
 }
 
+/**
+ * Convert a dense grid (`x + y*sx + z*sx*sy`) to bricks, keeping only bricks
+ * with a non-zero voxel. Costs one pass over the dense array.
+ */
 export function sparseFromDense(size: { x: number; y: number; z: number }, data: Uint8Array): SparseVoxels {
   const s = makeSparse(size);
   const { x: sx, y: sy, z: sz } = size;

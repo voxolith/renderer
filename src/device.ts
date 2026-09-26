@@ -1,13 +1,21 @@
 // WebGPU device + canvas context setup, with a graceful fallback when the
 // platform doesn't support WebGPU.
 
+/**
+ * The WebGPU device and canvas an app renders with, from `initGpu`. One per
+ * canvas; pass it to `createRenderer`. `width`, `height` and `renderScale` are
+ * live: `resizeToDisplay` and `setRenderScale` update them in place.
+ */
 export interface GpuContext {
   device: GPUDevice;
+  /** Configured for `device` and `format`, premultiplied alpha. */
   context: GPUCanvasContext;
   canvas: HTMLCanvasElement;
+  /** The browser's preferred canvas format. */
   format: GPUTextureFormat;
-  /** Current backing-store size in physical pixels. */
+  /** Current backing-store width in physical pixels. */
   width: number;
+  /** Current backing-store height in physical pixels. */
   height: number;
   /** Capped device pixel ratio. */
   pixelRatio: number;
@@ -29,8 +37,14 @@ export interface GpuContext {
   limits: GrantedLimits;
 }
 
+/**
+ * The device limits `initGpu` negotiates, as granted. The WebGPU defaults are
+ * 2048, 256 MiB and 128 MiB; most adapters grant far more when asked.
+ */
 export interface GrantedLimits {
+  /** Largest 3D texture edge, in texels. */
   maxTextureDimension3D: number;
+  /** Largest single buffer, in bytes. */
   maxBufferSize: number;
   /**
    * Caps a single storage-buffer binding. The default is only 128 MiB, well
@@ -41,14 +55,17 @@ export interface GrantedLimits {
   maxStorageBufferBindingSize: number;
 }
 
+/** What the browser reports about the GPU adapter; any string may be empty. */
 export interface AdapterInfo {
   vendor: string;
   architecture: string;
   device: string;
   description: string;
+  /** True for a browser "fallback" (usually CPU) adapter. */
   isFallbackAdapter: boolean;
 }
 
+/** Options for `initGpu`. */
 export interface GpuOptions {
   /** Cap on window.devicePixelRatio (default 2). Use 1 on weak GPUs. */
   maxPixelRatio?: number;
@@ -73,6 +90,11 @@ const WANT_LIMITS: GrantedLimits = {
   maxStorageBufferBindingSize: 1 << 30, // 1 GiB
 };
 
+/**
+ * Thrown by `initGpu` when the page cannot use WebGPU at all: no
+ * `navigator.gpu` (or not a secure context), no adapter, or no canvas context.
+ * Its message is written for the user; show it with `showUnsupportedScreen`.
+ */
 export class WebGPUUnsupportedError extends Error {
   constructor(message: string) {
     super(message);
@@ -83,6 +105,36 @@ export class WebGPUUnsupportedError extends Error {
 /** Cap the internal resolution so phones don't render at 3x retina for free. */
 const MAX_PIXEL_RATIO = 2;
 
+/**
+ * Request a WebGPU adapter and device and configure `canvas` for it. Browser
+ * only; WebGPU needs a secure context (HTTPS or localhost).
+ *
+ * Device limits are raised towards `opts.limits` (by default 4096 3D texture
+ * edge, 1 GiB buffers and storage bindings), each clamped to what the adapter
+ * offers; read what was granted from `limits`. If the driver refuses the raised
+ * set, the device falls back to the WebGPU defaults with a console warning.
+ * The canvas is sized once before this returns.
+ *
+ * @param canvas - The canvas to draw into.
+ * @param opts - Pixel ratio cap, initial render scale, power preference, limits.
+ * @returns The context to hand to `createRenderer`.
+ * @throws WebGPUUnsupportedError when WebGPU is missing or unusable.
+ *
+ * @example
+ * ```ts
+ * import { initGpu, showUnsupportedScreen, WebGPUUnsupportedError } from "@voxolith/renderer";
+ *
+ * const canvas = document.querySelector("canvas")!;
+ * try {
+ *   const gpu = await initGpu(canvas, { maxPixelRatio: 2 });
+ *   if (gpu.software) console.warn("CPU WebGPU adapter: start on the low preset");
+ *   // ...createRenderer(gpu, scene)
+ * } catch (err) {
+ *   if (err instanceof WebGPUUnsupportedError) showUnsupportedScreen(err.message, { appName: "Viewer" });
+ *   else throw err;
+ * }
+ * ```
+ */
 export async function initGpu(canvas: HTMLCanvasElement, opts: GpuOptions = {}): Promise<GpuContext> {
   if (!("gpu" in navigator) || !navigator.gpu) {
     // WebGPU is only exposed in a secure context. Over plain http on a LAN IP
@@ -223,6 +275,7 @@ export function resizeToDisplay(gpu: GpuContext): boolean {
   return true;
 }
 
+/** Options for `showUnsupportedScreen`. */
 export interface UnsupportedOpts {
   /** App name shown in the card (default "This app"). */
   appName?: string;

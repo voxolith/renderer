@@ -6,6 +6,7 @@
 
 import type { DirtyBox } from "./box";
 
+/** One voxel to write, grid coordinates. Out-of-range voxels are skipped. */
 export interface StampVoxel {
   x: number;
   y: number;
@@ -14,13 +15,34 @@ export interface StampVoxel {
   c: number;
 }
 
+/**
+ * Composites moving things over a static dense grid. `stamp` restores the
+ * cells the previous stamp covered from the base, writes the new voxels, and
+ * returns the union box to re-upload; batch every moving object into one
+ * `stamp` per frame. Headless. It holds a full copy of the grid (`liveData`),
+ * so it suits small dense worlds; for large or sparse worlds use the engine's
+ * `makeBrickStamper`.
+ *
+ * @example
+ * ```ts
+ * import { GridStamper } from "@voxolith/renderer/core";
+ *
+ * const stamper = new GridStamper(scene.data, scene.size);
+ * const renderer = await createRenderer(gpu, { ...scene, data: stamper.liveData });
+ * // Each frame:
+ * const box = stamper.stamp(units.flatMap((u) => u.voxels()));
+ * if (box) renderer.updateVoxels(stamper.liveData, box);
+ * ```
+ */
 export class GridStamper {
+  /** The composited grid (base plus the current stamp); upload this. */
   readonly liveData: Uint8Array;
   private prev: DirtyBox | null = null;
   private readonly sx: number;
   private readonly sy: number;
   private readonly sz: number;
 
+  /** `baseData` is kept (not copied) and becomes the clean plate; `liveData` starts as a copy. */
   constructor(
     private baseData: Uint8Array,
     private readonly size: { x: number; y: number; z: number },

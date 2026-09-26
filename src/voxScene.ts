@@ -32,11 +32,13 @@ export function packMaterials(scene: VoxScene): Float32Array | undefined {
   return out;
 }
 
+/** A `VoxScene` as one Y-up grid that can be filled for any animation frame. */
 export interface VoxSceneAnimator {
   /** Engine grid (Y-up), stable across all frames. */
   size: { x: number; y: number; z: number };
   /** 256 × vec4 palette (0..1). */
   palette: Float32Array;
+  /** Frames in the animation; `frame` takes 0..frameCount-1. */
   frameCount: number;
   /** Fill + return the grid for animation frame `i` (a cached buffer). */
   frame(i: number): Uint8Array;
@@ -50,6 +52,13 @@ function mat3vec(m: Mat3, x: number, y: number, z: number): [number, number, num
   ];
 }
 
+/**
+ * Prepare a parsed scene for playback in one renderer: a grid sized to the
+ * scene's bounds over every frame (so it never resizes mid-playback), with
+ * MagicaVoxel's Z-up turned into the renderer's Y-up. Each `frame(i)` call
+ * clears the grid and places that frame's models into it; upload the result
+ * with `renderer.updateVoxels`. Voxel values are the scene's palette indices.
+ */
 export function voxSceneAnimator(scene: VoxScene): VoxSceneAnimator {
   const b = scene.bounds(); // MagicaVoxel Z-up world AABB over all frames
   // Z-up (world) → Y-up (engine grid): X=x, Y=z, Z=y (matches toViewModel).
