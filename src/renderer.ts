@@ -22,11 +22,11 @@ import selftestWesl from "./shaders/selftest.wesl?raw";
 import raymarchWesl from "./shaders/raymarch.wesl?raw";
 import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
-import { INST_WORDS, MAX_PARTS, maxPoseWords, packInstance, packPose, partBoxes } from "./instance";
+import { blockCells, INST_WORDS, MAX_PARTS, maxPoseWords, packInstance, packPose, partBoxes } from "./instance";
 import { GpuTimer } from "./timer";
 
 export type { DirtyBox };
-import { BrickGrid, BrickPool, BLOCK_ENTRIES, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS, TOP_B, emptyEdit, type BrickEdit } from "./brick";
+import { BrickGrid, BrickPool, BLOCK_ENTRIES, BRICK_B, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS, TOP_B, emptyEdit, type BrickEdit } from "./brick";
 import { sparseDims, type SparseVoxels } from "./sparse";
 import { LIGHT_FLOATS, MAX_LIGHTS, packLights, type PointLight } from "./lights";
 import type { AtmosphereParams } from "./atmosphere";
@@ -83,13 +83,17 @@ const UNIFORM_FLOATS = 144;
 // per-top-cell instance lists, instances, models and the part transforms of
 // instances drawn with parts. One buffer keeps the pass within the default
 // limit of 8 storage buffers per stage. Instance and part records are laid out
-// in instance.ts (INST_WORDS, PART_WORDS), shared with the CPU sampler.
-type RegionName = "tops" | "blocks" | "cells" | "list" | "inst" | "models" | "parts";
-const REGIONS: RegionName[] = ["tops", "blocks", "cells", "list", "inst", "models", "parts"];
+// in instance.ts (INST_WORDS, PART_WORDS), shared with the CPU sampler. The
+// last region, "subs", holds the per-sub-cell instance lists of crowded static
+// cells (see buildSubLists).
+type RegionName = "tops" | "blocks" | "cells" | "list" | "inst" | "models" | "parts" | "subs";
+const REGIONS: RegionName[] = ["tops", "blocks", "cells", "list", "inst", "models", "parts", "subs"];
 /** u32 words per model: top offset, top dims, size, part grid top offset + 1 (0 = no parts). */
 const MODEL_WORDS = 8;
 /** Instances per top cell list; more are dropped (with a console warning). */
 const MAX_CELL_INSTANCES = 255;
+/** Static cells with at least this many instances get per-sub-cell lists. */
+const SUB_MIN = 8;
 
 /** A model drawn by instances; see Renderer.addModel. */
 export interface ModelSource {
@@ -168,6 +172,8 @@ interface GpuModel {
   partTopOff?: number;
   partBoxes?: Int32Array;
   joints?: ModelSource["joints"];
+  /** The model's occupied bricks, as x, y, z triples (for the sub-cell lists). */
+  occupied: Int32Array;
 }
 
 /** Options for {@link createRenderer}. */
@@ -396,6 +402,11 @@ export class Renderer {
   private poseDirty: [number, number][] = [];
   private cellData: Uint32Array;
   private cellTouched: number[] = [];
+  /** The "subs" region: a pointer per top cell (table offset + 1, 0 = use the cell list), then tables and lists. */
+  private subData: Uint32Array;
+  private subLen: number;
+  /** The static sub-table pointers, restored when moving instances leave a cell. */
+  private staticSubs: Uint32Array;
   private listData = new Uint32Array(1024);
   private listLen = 0;
   /** Brick-space dims, also the bounds test for the empty-space skip. */
@@ -448,6 +459,9 @@ export class Renderer {
     this.topEnd = this.bricks.top.length;
     this.cellData = new Uint32Array(this.bricks.top.length);
     this.staticCells = new Uint32Array(this.bricks.top.length);
+    this.subData = new Uint32Array(this.bricks.top.length);
+    this.subLen = this.bricks.top.length;
+    this.staticSubs = new Uint32Array(this.bricks.top.length);
     this.layout = this.planLayout();
     this.idxBuffer = this.makeIdxBuffer();
     this.topTexture = device.createTexture({
@@ -966,7 +980,7 @@ export class Renderer {
     }
     let id = this.models.indexOf(null);
     if (id < 0) id = this.models.push(null) - 1;
-    this.models[id] = { grid, topOff, size: { ...src.size }, partGrid, partTopOff, partBoxes: boxes, joints: src.joints };
+    this.models[id] = { grid, topOff, size: { ...src.size }, partGrid, partTopOff, partBoxes: boxes, joints: src.joints, occupied: occupiedBlocks(src) };
     if (this.modelData.length < (id + 1) * MODEL_WORDS) this.modelData = growU32(this.modelData, (id + 1) * MODEL_WORDS);
     const m = id * MODEL_WORDS;
     this.modelData.set([topOff, grid.topDim[0], grid.topDim[1], grid.topDim[2], src.size.x, src.size.y, src.size.z, partGrid ? partTopOff! + 1 : 0], m);
@@ -1031,9 +1045,11 @@ export class Renderer {
     this.movingPoses = new WeakMap();
     this.movingPoseWords = 0;
     this.poseDirty = [];
+    const placed: Instance[] = [];
     for (const inst of list) {
       const k = this.writeInstance(inst, this.staticCount);
       if (k < 0) continue;
+      placed.push(inst);
       this.cellsOf(k, (ci) => {
         let l = perCell.get(ci);
         if (!l) perCell.set(ci, (l = []));
@@ -1056,11 +1072,85 @@ export class Renderer {
       this.staticTouched.push(ci);
     }
     if (dropped) console.warn(`setInstances: ${dropped} cell entries over the ${MAX_CELL_INSTANCES}-per-cell limit were dropped`);
+    this.buildSubLists(perCell, placed);
     this.staticListLen = total;
     this.cellData.set(this.staticCells);
     this.cellTouched = [];
     this.staticDirty = true;
     this.rebuildDynamic();
+  }
+
+  /**
+   * Split each crowded static cell's list by 16^3 sub-cell (4^3 per cell): a sub-cell lists only
+   * the instances whose occupied model bricks can show a voxel in it, in the cell list's order (so
+   * the first hit is the same instance), and masks which of its 8 world bricks they reach. A sample
+   * then tests a handful of instances instead of every one whose box reaches the cell, which is
+   * what dense canopies cost; a ray skips bricks and sub-cells nothing reaches without asking the
+   * models; and "may be here" is about 3 voxels loose instead of the model grids' one-brick NEAR
+   * shell. Lists over the cell cap, and cells moving instances touch, keep their whole list.
+   */
+  private buildSubLists(perCell: Map<number, number[]>, placed: readonly Instance[]): void {
+    const cells = this.cellData.length;
+    const [tx, ty] = this.bricks.topDim;
+    const table = new Int32Array(cells).fill(-1);
+    let tables = 0;
+    for (const [ci, l] of perCell) if (l.length >= SUB_MIN && l.length <= MAX_CELL_INSTANCES) table[ci] = tables++;
+    const slots = tables * 64;
+    // (slot, instance) pairs in instance order, each pair once, then a counting sort by slot.
+    let pairSlot = new Uint32Array(1 << 16), pairK = new Uint32Array(1 << 16), n = 0;
+    const counts = new Uint32Array(slots), last = new Int32Array(slots).fill(-1), masks = new Uint8Array(slots);
+    const [bx, by, bz] = this.bricks.dim;
+    const mark = (k: number, x0: number, y0: number, z0: number, x1: number, y1: number, z1: number) => {
+      const gx0 = Math.max(0, Math.floor(x0 / BRICK_B)), gx1 = Math.min(bx - 1, Math.floor(x1 / BRICK_B));
+      const gy0 = Math.max(0, Math.floor(y0 / BRICK_B)), gy1 = Math.min(by - 1, Math.floor(y1 / BRICK_B));
+      const gz0 = Math.max(0, Math.floor(z0 / BRICK_B)), gz1 = Math.min(bz - 1, Math.floor(z1 / BRICK_B));
+      for (let gz = gz0; gz <= gz1; gz++)
+        for (let gy = gy0; gy <= gy1; gy++)
+          for (let gx = gx0; gx <= gx1; gx++) {
+            const t = table[(gx >> 3) + (gy >> 3) * tx + (gz >> 3) * tx * ty];
+            if (t < 0) continue;
+            const slot = t * 64 + ((gx >> 1) & 3) + ((gy >> 1) & 3) * 4 + ((gz >> 1) & 3) * 16;
+            masks[slot] |= 1 << ((gx & 1) + (gy & 1) * 2 + (gz & 1) * 4);
+            if (last[slot] === k) continue;
+            last[slot] = k;
+            counts[slot]++;
+            if (n === pairSlot.length) { pairSlot = growU32(pairSlot, n * 2); pairK = growU32(pairK, n * 2); }
+            pairSlot[n] = slot;
+            pairK[n++] = k;
+          }
+    };
+    if (tables) {
+      for (let k = 0; k < placed.length; k++) {
+        const inst = placed[k], m = this.models[inst.model]!;
+        if (inst.parts && m.partBoxes) {
+          // Posed: anywhere in its box.
+          const b = this.instBox, o = k * 6;
+          mark(k, b[o] - 1, b[o + 1] - 1, b[o + 2] - 1, b[o + 3] + 1, b[o + 4] + 1, b[o + 5] + 1);
+        } else {
+          blockCells(inst, m.size, m.occupied, BRICK_B, (x0, y0, z0, x1, y1, z1) => mark(k, x0, y0, z0, x1, y1, z1));
+        }
+      }
+    }
+    // Each table is followed by its lists; a table entry is (list offset from the table << 16) |
+    // (brick mask << 8) | count.
+    this.staticSubs = new Uint32Array(cells);
+    this.subLen = cells + slots + n;
+    if (this.subData.length < this.subLen) this.subData = new Uint32Array(this.subLen);
+    const base = new Uint32Array(tables);
+    let at = cells;
+    for (let t = 0; t < tables; t++) {
+      base[t] = at;
+      at += 64;
+      for (let s = 0; s < 64; s++) {
+        const slot = t * 64 + s, c = counts[slot];
+        this.subData[base[t] + s] = (((at - base[t]) << 16) | (masks[slot] << 8) | c) >>> 0;
+        counts[slot] = at;
+        at += c;
+      }
+    }
+    for (let i = 0; i < n; i++) this.subData[counts[pairSlot[i]]++] = pairK[i];
+    for (let ci = 0; ci < cells; ci++) if (table[ci] >= 0) this.staticSubs[ci] = base[table[ci]] + 1;
+    this.subData.set(this.staticSubs);
   }
 
   private dynamicList: readonly Instance[] = [];
@@ -1150,13 +1240,18 @@ export class Renderer {
     this.movingPoseWords = used;
     let at = this.staticListLen;
     const touched: number[] = [];
-    for (const ci of this.cellTouched) this.cellData[ci] = this.staticCells[ci];
+    for (const ci of this.cellTouched) {
+      this.cellData[ci] = this.staticCells[ci];
+      this.subData[ci] = this.staticSubs[ci];
+    }
     for (const [ci, l] of perCell) {
       const st = this.staticCells[ci];
       const sn = st & 0xff, ss = st >>> 8;
       const count = Math.min(MAX_CELL_INSTANCES, sn + l.length);
       if (this.listData.length < at + count) this.listData = growU32(this.listData, at + count);
       this.cellData[ci] = (at << 8) | count;
+      // Its sub-lists do not know the moving instances: the whole list, while they are there.
+      this.subData[ci] = 0;
       for (let i = 0; i < sn && i < count; i++) this.listData[at + i] = this.listData[ss + i];
       for (let i = sn; i < count; i++) this.listData[at + i] = l[i - sn];
       at += count;
@@ -1177,6 +1272,7 @@ export class Renderer {
       this.poseDirty = [];
       this.writeRegion("list", 0, this.listData, 0, this.listLen);
       this.writeRegion("cells", 0, this.cellData, 0, this.cellData.length);
+      this.writeRegion("subs", 0, this.subData, 0, this.subLen);
       this.staticDirty = false;
       return;
     }
@@ -1185,7 +1281,10 @@ export class Renderer {
     for (const [lo, hi] of this.poseDirty) this.writeRegion("parts", lo, this.partData, lo, hi - lo);
     this.poseDirty = [];
     this.writeRegion("list", this.staticListLen, this.listData, this.staticListLen, this.listLen - this.staticListLen);
-    for (const [lo, hi] of runs(dirty, 64)) this.writeRegion("cells", lo, this.cellData, lo, hi - lo + 1);
+    for (const [lo, hi] of runs(dirty, 64)) {
+      this.writeRegion("cells", lo, this.cellData, lo, hi - lo + 1);
+      this.writeRegion("subs", lo, this.subData, lo, hi - lo + 1);
+    }
   }
 
   /** Models uploaded and instances placed, for overlays and budgets. */
@@ -1306,13 +1405,14 @@ export class Renderer {
       inst: this.instCount * INST_WORDS,
       models: this.models.length * MODEL_WORDS,
       parts: this.partLen,
+      subs: this.subLen,
     };
   }
 
   /** Offsets with headroom; regions are laid out in REGIONS order. */
   private planLayout(): Record<RegionName, { off: number; cap: number }> {
     const need = this.needs();
-    const floor: Record<RegionName, number> = { tops: 0, blocks: BLOCK_ENTRIES * 16, cells: 0, list: 256, inst: INST_WORDS * 16, models: MODEL_WORDS * 8, parts: 1024 };
+    const floor: Record<RegionName, number> = { tops: 0, blocks: BLOCK_ENTRIES * 16, cells: 0, list: 256, inst: INST_WORDS * 16, models: MODEL_WORDS * 8, parts: 1024, subs: 0 };
     const out = {} as Record<RegionName, { off: number; cap: number }>;
     let off = 0;
     for (const r of REGIONS) {
@@ -1371,6 +1471,7 @@ export class Renderer {
     this.writeRegion("inst", 0, this.instData, 0, this.instCount * INST_WORDS);
     this.writeRegion("models", 0, this.modelData, 0, this.models.length * MODEL_WORDS);
     this.writeRegion("parts", 0, this.partData, 0, this.partLen);
+    this.writeRegion("subs", 0, this.subData, 0, this.subLen);
     this.poseDirty = [];
     this.uploadSlots(null, null);
   }
@@ -1502,7 +1603,7 @@ export class Renderer {
     const [tx, ty, tz] = this.bricks.topDim;
     w[132] = tx; w[133] = ty; w[134] = tz; w[135] = this.instCount;
     w[136] = this.layout.blocks.off; w[137] = this.layout.cells.off; w[138] = this.layout.list.off; w[139] = this.layout.inst.off;
-    w[140] = this.layout.models.off; w[141] = this.layout.tops.off; w[142] = this.layout.parts.off; w[143] = 0;
+    w[140] = this.layout.models.off; w[141] = this.layout.tops.off; w[142] = this.layout.parts.off; w[143] = this.layout.subs.off;
 
     const { device } = this.gpu;
     device.queue.writeBuffer(this.uniformBuffer, 0, u);
@@ -1676,6 +1777,28 @@ function runs(slots: number[], gap = 1): [number, number][] {
   }
   out.push([lo, prev]);
   return out;
+}
+
+/** A model's occupied bricks as x, y, z triples (from its sparse bricks, or a scan when dense). */
+function occupiedBlocks(src: ModelSource): Int32Array {
+  const seen = new Set<number>(), out: number[] = [];
+  const add = (x: number, y: number, z: number) => {
+    const key = x + y * 4096 + z * 16777216;
+    if (!seen.has(key)) { seen.add(key); out.push(x, y, z); }
+  };
+  if (src.sparse) {
+    const [dx, dy] = sparseDims(src.size);
+    for (const [key, cells] of src.sparse.bricks) {
+      if (cells.some((v) => v !== 0)) add(key % dx, Math.floor(key / dx) % dy, Math.floor(key / (dx * dy)));
+    }
+  } else if (src.data) {
+    const { x: sx, y: sy, z: sz } = src.size;
+    let i = 0;
+    for (let z = 0; z < sz; z++)
+      for (let y = 0; y < sy; y++)
+        for (let x = 0; x < sx; x++, i++) if (src.data[i]) add(x >> 3, y >> 3, z >> 3);
+  }
+  return Int32Array.from(out);
 }
 
 function growU32(a: Uint32Array, need: number): Uint32Array<ArrayBuffer> {

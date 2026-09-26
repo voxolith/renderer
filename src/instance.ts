@@ -156,6 +156,32 @@ function boxInto(m: Affine, mo: number, x0: number, y0: number, z0: number, x1: 
 const scratchFwd = new Float64Array(12), scratchInv = new Float64Array(12), scratchBox = new Float64Array(6);
 
 /**
+ * The world cells a plain (unposed) instance can show each of its occupied model blocks in: for
+ * every block of edge `B` listed in `blocks` (block coordinates as x, y, z triples), the inclusive
+ * range of world cells whose sample point maps into it, a cell wider on every side for rounding.
+ * The renderer builds its per-sub-cell instance lists from these.
+ */
+export function blockCells(
+  inst: PackInstance,
+  size: { x: number; y: number; z: number },
+  blocks: ArrayLike<number>,
+  B: number,
+  visit: (x0: number, y0: number, z0: number, x1: number, y1: number, z1: number) => void,
+): void {
+  const { fwd } = placement(inst, size, scratchFwd);
+  for (let i = 0; i < blocks.length; i += 3) {
+    let x0 = blocks[i] * B, x1 = Math.min(size.x, x0 + B);
+    const y0 = blocks[i + 1] * B, y1 = Math.min(size.y, y0 + B);
+    const z0 = blocks[i + 2] * B, z1 = Math.min(size.z, z0 + B);
+    // Mirroring flips the voxel index along x after the turn (see sampleInstance).
+    if (inst.mirror) [x0, x1] = [size.x - x1, size.x - x0];
+    boxInto(fwd, 0, x0, y0, z0, x1, y1, z1, scratchBox, 0);
+    const b = scratchBox;
+    visit(Math.floor(b[0]) - 1, Math.floor(b[1]) - 1, Math.floor(b[2]) - 1, Math.floor(b[3]) + 1, Math.floor(b[4]) + 1, Math.floor(b[5]) + 1);
+  }
+}
+
+/**
  * Pose words a model with parts can need at most (header, part records and the largest mask grid
  * a pose of it can have), for sizing a pose store before packing.
  */

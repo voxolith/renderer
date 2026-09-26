@@ -120,6 +120,33 @@ fn cellList(p : vec3<i32>) -> u32 {
   return idx[U.cellOff + t.x + t.y * U.topDim.x + t.z * U.topDim.x * U.topDim.y];
 }
 
+/**
+ * The instances that may have voxels in the brick containing `p` (in range): (first word in idx,
+ * count, flags). A crowded static cell keeps a table with, per 16^3 sub-cell, a short list of just
+ * the instances whose occupied model bricks reach it (in the cell list's order) and a mask of which
+ * of its 8 bricks they reach; other cells give their whole list. Flags: bit 0 = the answer is exact
+ * per brick (a count of 0 means nothing there), bit 1 = the whole sub-cell is empty. See
+ * buildSubLists in renderer.ts (each table is followed by its lists).
+ */
+fn instRange(p : vec3<i32>) -> vec3<u32> {
+  let cl = cellList(p);
+  if ((cl & 0xffu) == 0u) {
+    return vec3<u32>(0u, 0u, 3u);
+  }
+  let u = toU(p);
+  let t = u / u32(TOP_B);
+  let ptr = idx[U.subOff + t.x + t.y * U.topDim.x + t.z * U.topDim.x * U.topDim.y];
+  if (ptr == 0u) {
+    return vec3<u32>(U.listOff + (cl >> 8u), cl & 0xffu, 0u);
+  }
+  let s = (u / 16u) % 4u;
+  let tbl = U.subOff + ptr - 1u;
+  let e = idx[tbl + s.x + s.y * 4u + s.z * 16u];
+  let b = (u / 8u) % 2u;
+  let bit = (e >> (8u + b.x + b.y * 2u + b.z * 4u)) & 1u;
+  return vec3<u32>(tbl + (e >> 16u), select(0u, e & 0xffu, bit != 0u), select(1u, 3u, (e & 0xff00u) == 0u));
+}
+
 /** Apply the 3x4 affine stored at idx[o] (row-major, as f32 bits) to a point. */
 fn affineAt(o : u32, p : vec3<f32>) -> vec3<f32> {
   let r0 = vec4<f32>(bitcast<f32>(idx[o]), bitcast<f32>(idx[o + 1u]), bitcast<f32>(idx[o + 2u]), bitcast<f32>(idx[o + 3u]));
@@ -238,15 +265,17 @@ fn instanceVoxel(p : vec3<i32>) -> u32 {
   if (!INSTANCES) {
     return 0u;
   }
-  let cl = cellList(p);
-  let n = cl & 0xffu;
-  if (n == 0u) {
+  return instanceVoxelIn(instRange(p).xy, p);
+}
+
+/** instanceVoxel with the instances that may be at `p` already looked up (instRange). */
+fn instanceVoxelIn(r : vec2<u32>, p : vec3<i32>) -> u32 {
+  if (!INSTANCES) {
     return 0u;
   }
-  let start = cl >> 8u;
   let wp = vec3<f32>(p) + vec3<f32>(0.5);
-  for (var i = 0u; i < n; i = i + 1u) {
-    let k = idx[U.listOff + start + i];
+  for (var i = 0u; i < r.y; i = i + 1u) {
+    let k = idx[r.x + i];
     let o = U.instOff + k * INST_WORDS;
     // The world cells the instance can touch: most samples in a listed cell miss it here.
     let lo = vec3<i32>(bitcast<i32>(idx[o + 17u]), bitcast<i32>(idx[o + 18u]), bitcast<i32>(idx[o + 19u]));
@@ -314,22 +343,16 @@ fn isSolid(p : vec3<i32>) -> bool {
   return sampleVoxel(p) != 0u;
 }
 
-/** May an instance have voxels in the world brick `c` (brick coords, in range)? */
-fn instanceNear(c : vec3<i32>) -> bool {
+/** May an instance of `r` (the brick's instRange) have voxels in the world brick `c` (brick coords, in range)? */
+fn instanceNear(c : vec3<i32>, r : vec2<u32>) -> bool {
   if (!INSTANCES) {
     return false;
   }
-  let cl = cellList(c * COARSE_B);
-  let n = cl & 0xffu;
-  if (n == 0u) {
-    return false;
-  }
-  let start = cl >> 8u;
   let wc = vec3<f32>(c * COARSE_B) + vec3<f32>(4.0);
   let blo = c * COARSE_B;
   let bhi = blo + vec3<i32>(COARSE_B);
-  for (var i = 0u; i < n; i = i + 1u) {
-    let k = idx[U.listOff + start + i];
+  for (var i = 0u; i < r.y; i = i + 1u) {
+    let k = idx[r.x + i];
     let o = U.instOff + k * INST_WORDS;
     let ilo = vec3<i32>(bitcast<i32>(idx[o + 17u]), bitcast<i32>(idx[o + 18u]), bitcast<i32>(idx[o + 19u]));
     let ihi = vec3<i32>(bitcast<i32>(idx[o + 20u]), bitcast<i32>(idx[o + 21u]), bitcast<i32>(idx[o + 22u]));
@@ -407,18 +430,23 @@ fn coarseSolid(p : vec3<i32>) -> bool {
   if (worldEntry(p) != 0u) {
     return true;
   }
-  return (INSTANCES && U.instanceCount != 0u) && instanceNear(c);
+  if (!(INSTANCES && U.instanceCount != 0u)) {
+    return false;
+  }
+  let r = instRange(p);
+  return r.y != 0u && ((r.z & 1u) != 0u || instanceNear(c, r.xy));
 }
 
 // How far an empty brick at `p` lets a ray skip: its whole 64^3 top cell when
-// that holds nothing at all (no world block, no instances), else the brick.
+// that holds nothing at all (no world block, no instances), its 16^3 sub-cell
+// when only instances are there and none reaches that sub-cell, else the brick.
 // Call only where coarseSolid(p) is false, so `p` is in range.
 fn skipSize(p : vec3<i32>) -> i32 {
   if (textureLoad(topTex, toU(p) / u32(TOP_B), 0).r != 0u) {
     return COARSE_B;
   }
   if ((INSTANCES && U.instanceCount != 0u) && (cellList(p) & 0xffu) != 0u) {
-    return COARSE_B;
+    return select(COARSE_B, 16, (instRange(p).z & 2u) != 0u);
   }
   return TOP_B;
 }
@@ -439,6 +467,8 @@ struct BrickQuery {
   near  : bool,
   /** The brick lies inside the grid. */
   inGrid : bool,
+  /** The instances that may be in the brick (instRange), looked up once for all its steps. */
+  range : vec2<u32>,
 };
 
 /** Brick coordinates of a fine cell, flooring (cells may be one outside the grid). */
@@ -461,10 +491,19 @@ fn queryBrick(p : vec3<i32>) -> BrickQuery {
     q.entry = 0u;
     q.near = false;
     q.solid = true;
+    q.range = vec2<u32>(0u);
     return q;
   }
   q.entry = worldEntry(p);
-  q.near = q.entry == 0u && (INSTANCES && U.instanceCount != 0u) && instanceNear(c);
+  q.range = vec2<u32>(0u);
+  var exact = true;
+  if (INSTANCES && U.instanceCount != 0u) {
+    let r = instRange(p);
+    q.range = r.xy;
+    exact = (r.z & 1u) != 0u;
+  }
+  // A sub-table's brick mask answers "may an instance be here" outright; a whole list asks each.
+  q.near = q.entry == 0u && q.range.y != 0u && (exact || instanceNear(c, q.range));
   q.solid = q.entry != 0u || q.near;
   return q;
 }
@@ -485,7 +524,7 @@ fn voxelIn(q : BrickQuery, p : vec3<i32>) -> u32 {
     inst = true;
   }
   if (inst) {
-    return instanceVoxel(p);
+    return instanceVoxelIn(q.range, p);
   }
   return 0u;
 }
