@@ -20,15 +20,24 @@ fn faceAO(cell : vec3<i32>, n : vec3<f32>) -> f32 {
     t2 = vec3<i32>(0, 1, 0);
   }
 
-  let s1 = select(0.0, 1.0, isSolid(front + t1));
-  let s2 = select(0.0, 1.0, isSolid(front - t1));
-  let s3 = select(0.0, 1.0, isSolid(front + t2));
-  let s4 = select(0.0, 1.0, isSolid(front - t2));
-  let c1 = select(0.0, 1.0, isSolid(front + t1 + t2));
-  let c2 = select(0.0, 1.0, isSolid(front + t1 - t2));
-  let c3 = select(0.0, 1.0, isSolid(front - t1 + t2));
-  let c4 = select(0.0, 1.0, isSolid(front - t1 - t2));
-
-  let occ = (s1 + s2 + s3 + s4) * 0.10 + (c1 + c2 + c3 + c4) * 0.05;
+  // Edges weigh 0.10, corners 0.05. One loop (not eight calls) so the voxel lookup, which with
+  // instances is large, is compiled once.
+  var occ = 0.0;
+  for (var k = 0u; k < 8u; k = k + 1u) {
+    var o = t1;
+    switch k {
+      case 0u: { o = t1; }
+      case 1u: { o = -t1; }
+      case 2u: { o = t2; }
+      case 3u: { o = -t2; }
+      case 4u: { o = t1 + t2; }
+      case 5u: { o = t1 - t2; }
+      case 6u: { o = -t1 + t2; }
+      default: { o = -t1 - t2; }
+    }
+    if (isSolid(front + o)) {
+      occ = occ + select(0.05, 0.10, k < 4u);
+    }
+  }
   return clamp(1.0 - occ, 0.45, 1.0);
 }

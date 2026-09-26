@@ -4,12 +4,12 @@
 //   1 uniforms: u32 fields read     2 index regions laid out
 //   3 top-level texture has a block 4 index blocks have entries
 //   5 brick payloads present        6 palette present
-//   7 a column of the world has a voxel (sampleVoxel)
+//   7 a column of the world has a voxel (worldVoxel)
 //   8 a ray straight down that column hits it (traverse)
 
 import package::uniforms::{U, idx, topTex, brickVox4, palette};
 import package::grid::{worldEntry, toU, brickOf, queryBrick};
-import package::grid::sampleVoxel;
+import package::grid::worldVoxel;
 import package::trace::traverse;
 
 fn selfTest(frag : vec2<f32>) -> vec3<f32> {
@@ -29,7 +29,7 @@ fn selfTest(frag : vec2<f32>) -> vec3<f32> {
     case 3: { for (var i = 0u; i < 512u && !ok; i++) { ok = idx[U.blocksOff + i] != 0u; } }
     case 4: { for (var i = 0u; i < 4096u && !ok; i++) { ok = brickVox4[i] != 0u; } }
     case 5: { for (var i = 1u; i < 256u && !ok; i++) { ok = dot(palette[i].rgb, vec3<f32>(1.0)) > 0.0; } }
-    case 6: { for (var y = 0; y < i32(U.gridSize.y) && !ok; y++) { ok = sampleVoxel(vec3<i32>(c.x, y, c.z)) != 0u; } }
+    case 6: { for (var y = 0; y < i32(U.gridSize.y) && !ok; y++) { ok = worldVoxel(vec3<i32>(c.x, y, c.z)) != 0u; } }
     default: {
       let ro = vec3<f32>(f32(c.x) + 0.5, U.gridSize.y + 1.0, f32(c.z) + 0.5);
       ok = traverse(ro, vec3<f32>(0.0001, -1.0, 0.0002), 0.0).hit;
@@ -45,7 +45,7 @@ fn selfTest(frag : vec2<f32>) -> vec3<f32> {
 // tell a shader-compiler fault apart from missing data.
 //   1 top texel via signed shift (b >> 3)   2 via signed division (b / 8)
 //   3 via unsigned division                4 signed mask (b & 7) == unsigned (b % 8)
-//   5 worldEntry finds an entry (voxel input)            6 sampleVoxel finds a voxel
+//   5 worldEntry finds an entry (voxel input)            6 worldVoxel finds a voxel
 //   7 a ray down the column hits           8 (always green: reference)
 fn selfTest2(frag : vec2<f32>) -> vec3<f32> {
   let band = i32(floor(frag.x / U.resolution.x * 8.0));
@@ -61,7 +61,7 @@ fn selfTest2(frag : vec2<f32>) -> vec3<f32> {
       for (var y = 0; y < ny; y++) { let b = vec3<i32>(c.x + y, y, c.z + 2 * y); ok = ok && all(vec3<u32>(b & vec3<i32>(7)) == vec3<u32>(b) % 8u); }
     }
     case 4: { for (var y = 0; y < ny && !ok; y += 8) { ok = worldEntry(vec3<i32>(c.x, y, c.z)) != 0u; } }
-    case 5: { for (var y = 0; y < ny && !ok; y++) { ok = sampleVoxel(vec3<i32>(c.x, y, c.z)) != 0u; } }
+    case 5: { for (var y = 0; y < ny && !ok; y++) { ok = worldVoxel(vec3<i32>(c.x, y, c.z)) != 0u; } }
     case 6: {
       let ro = vec3<f32>(f32(c.x) + 0.5, U.gridSize.y + 1.0, f32(c.z) + 0.5);
       ok = traverse(ro, vec3<f32>(0.0001, -1.0, 0.0002), 0.0).hit;

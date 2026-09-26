@@ -63,7 +63,7 @@ struct Uniforms {
   // --- index regions (u32 word offsets into idx; see renderer.ts) ---
   topDim       : vec3<u32>, instanceCount : u32,  // 132-135  world top-level dims
   blocksOff    : u32, cellOff : u32, listOff : u32, instOff : u32, // 136-139
-  modelsOff    : u32, topsOff : u32, _i0 : u32, _i1 : u32,         // 140-143
+  modelsOff    : u32, topsOff : u32, partsOff : u32, _i1 : u32,    // 140-143
 };
 
 @group(0) @binding(0) var<uniform> U : Uniforms;

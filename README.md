@@ -113,6 +113,20 @@ git push origin main --tags
 `bun publish --access public` and creates a GitHub release. It needs an `NPM_TOKEN` repository
 secret holding an npm automation token with publish rights on the `@voxolith` scope.
 
+## References
+
+Instances with parts (renderer) and rigged crowds (engine) pose animated voxel models on the GPU
+from one shared rest model, following the rest-space animation of:
+
+- Holger Gruen, Carsten Benthin, Michael Kern, David McAllister. *Ray Tracing Massive Amounts of
+  Animated Geometry.* Proc. ACM Comput. Graph. Interact. Tech. 9(4), Article 49 (HPG 2026).
+  [doi:10.1145/3820014](https://doi.org/10.1145/3820014)
+- Chih-Chen Kao, Grzegorz Makowski, Shin Fujieda, Takahiro Harada. *Voxel Deformation-Aware Neural
+  Intersection Function.* Eurographics 2026 Short Papers.
+  [doi:10.2312/egs.20261026](https://doi.org/10.2312/egs.20261026)
+
+What was taken and what is Voxolith's own: [Research and credits](https://voxolith.github.io/docs/credits/).
+
 ## License
 
 MIT

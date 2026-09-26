@@ -22,6 +22,7 @@ import selftestWesl from "./shaders/selftest.wesl?raw";
 import raymarchWesl from "./shaders/raymarch.wesl?raw";
 import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
+import { INST_WORDS, maxPartWords, packInstance, partBoxes } from "./instance";
 
 export type { DirtyBox };
 import { BrickGrid, BrickPool, BLOCK_ENTRIES, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS, TOP_B, emptyEdit, type BrickEdit } from "./brick";
@@ -78,13 +79,13 @@ const UNIFORM_FLOATS = 144;
 
 // The index buffer (binding 1) holds every u32 table the traversal reads, in
 // regions: top levels of the world and of each model, index blocks, the
-// per-top-cell instance lists, instances and models. One buffer keeps the pass
-// within the default limit of 8 storage buffers per stage.
-type RegionName = "tops" | "blocks" | "cells" | "list" | "inst" | "models";
-const REGIONS: RegionName[] = ["tops", "blocks", "cells", "list", "inst", "models"];
-/** u32 words per instance: position, cos, anchor, sin, model, palette base, flags (1 = mirror), pad. */
-const INST_WORDS = 12;
-/** u32 words per model: top offset, top dims, size, pad. */
+// per-top-cell instance lists, instances, models and the part transforms of
+// instances drawn with parts. One buffer keeps the pass within the default
+// limit of 8 storage buffers per stage. Instance and part records are laid out
+// in instance.ts (INST_WORDS, PART_WORDS), shared with the CPU sampler.
+type RegionName = "tops" | "blocks" | "cells" | "list" | "inst" | "models" | "parts";
+const REGIONS: RegionName[] = ["tops", "blocks", "cells", "list", "inst", "models", "parts"];
+/** u32 words per model: top offset, top dims, size, part grid top offset + 1 (0 = no parts). */
 const MODEL_WORDS = 8;
 /** Instances per top cell list; more are dropped (with a console warning). */
 const MAX_CELL_INSTANCES = 255;
@@ -96,6 +97,17 @@ export interface ModelSource {
   /** Dense role values, `x + y*sx + z*sx*sy`; or `sparse`. */
   data?: Uint8Array;
   sparse?: SparseVoxels;
+  /**
+   * Part index per voxel (dense models only), laid out like `data`: e.g. a skeleton's bone per
+   * voxel. A model with parts can be drawn with one transform per part (`Instance.parts`), posed
+   * on the GPU from this single rest model. Parts must be ordered parents first; at most 32.
+   */
+  parts?: Uint8Array;
+  /**
+   * Per part, its parent (-1 for none) and the joint where it meets it, in model voxels. Cells
+   * around a posed joint may be filled from either side, so a turned child stays attached.
+   */
+  joints?: readonly { parent: number; at: readonly [number, number, number] }[];
 }
 
 /** One placement of a model: its anchor at a world position, turned about y. */
@@ -113,6 +125,12 @@ export interface Instance {
   /** Radians about +y; 0 leaves the model as authored. Turns pivot on the anchor voxel's centre. */
   yaw?: number;
   /**
+   * A full rotation instead of `yaw`: a 3x3 row-major matrix, world = R · model, pivoting on the
+   * anchor voxel's centre (tumbling debris, a tilted placement). Sampling at world voxel centres,
+   * so any rotation still draws as axis-aligned cubes.
+   */
+  rotation?: ArrayLike<number>;
+  /**
    * Mirror the model along its x before turning (the engine's orientation
    * bit 2): with yaw = -(o & 3) * PI / 2 this draws exactly what stamping
    * with orientation o would. `anchor` stays the unmirrored model's.
@@ -120,12 +138,29 @@ export interface Instance {
   mirror?: boolean;
   /** Palette slot of role 1 (from addPalette, or the world's): a voxel of role r draws slot base + r - 1. */
   base: number;
+  /**
+   * One model-space transform per part of a model added with `parts` (a 3x4 row-major affine, 12
+   * floats each, e.g. `poseMatrices` output), applied before this placement: the model is posed
+   * on the GPU, no baking. Each world cell is taken back through every part's inverse and drawn
+   * from the first part whose own voxel is there. `mirror` does not apply.
+   *
+   * Based on the rest-space animation of Gruen, Benthin, Kern and McAllister, "Ray Tracing Massive
+   * Amounts of Animated Geometry" (HPG 2026, doi:10.1145/3820014), and Kao, Makowski, Fujieda and
+   * Harada, "Voxel Deformation-Aware Neural Intersection Function" (EG 2026,
+   * doi:10.2312/egs.20261026).
+   */
+  parts?: ArrayLike<number>;
 }
 
 interface GpuModel {
   grid: BrickGrid;
   topOff: number;
   size: { x: number; y: number; z: number };
+  /** Part index + 1 per voxel, for models added with parts. */
+  partGrid?: BrickGrid;
+  partTopOff?: number;
+  partBoxes?: Int32Array;
+  joints?: ModelSource["joints"];
 }
 
 /** Minimal scene data the renderer needs to build/upload the voxel grid. */
@@ -255,7 +290,8 @@ export class Renderer {
   private readonly pipeline: GPURenderPipeline;
   /** The same pass with instance sampling compiled in; made when a scene first places one. */
   private instancedPipeline: GPURenderPipeline | null = null;
-  private readonly makePipeline: (instances: boolean) => GPURenderPipeline;
+  private partsPipeline: GPURenderPipeline | null = null;
+  private readonly makePipeline: (instances: boolean, parts?: boolean) => GPURenderPipeline;
   private readonly uniformBuffer: GPUBuffer;
   private readonly uniformData = new Float32Array(UNIFORM_FLOATS);
   private bindGroup: GPUBindGroup;
@@ -285,6 +321,10 @@ export class Renderer {
   private topEnd = 0;
   private instData = new Uint32Array(INST_WORDS * 64);
   private instCount = 0;
+  /** Part records of instances drawn with parts: the static set's, then the moving set's. */
+  private partData = new Uint32Array(4096);
+  private partLen = 0;
+  private staticPartLen = 0;
   private cellData: Uint32Array;
   private cellTouched: number[] = [];
   private listData = new Uint32Array(1024);
@@ -435,9 +475,10 @@ export class Renderer {
     this.bindLayout = layout;
 
     const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] });
-    // Instance sampling is a pipeline constant (grid.wesl INSTANCES), so a
-    // scene without instances never pays for the code.
-    this.makePipeline = (instances) =>
+    // Instance sampling is a pipeline constant (grid.wesl INSTANCES), and so is
+    // sampling instances drawn with parts (PARTS), so a scene never pays for
+    // code it does not use: compiled-in code costs even when never taken.
+    this.makePipeline = (instances, parts = false) =>
       device.createRenderPipeline({
         layout: pipelineLayout,
         vertex: { module, entryPoint: "vs" },
@@ -445,7 +486,7 @@ export class Renderer {
           module,
           entryPoint: "fs",
           targets: [{ format: gpu.format }],
-          constants: { 0: instances ? 1 : 0 },
+          constants: { 0: instances ? 1 : 0, 1: parts ? 1 : 0 },
         },
         primitive: { topology: "triangle-list" },
       });
@@ -786,6 +827,7 @@ export class Renderer {
    * ```
    */
   addModel(src: ModelSource): number {
+    if (src.parts && !src.data) throw new Error("addModel: parts need a dense model (data)");
     const grid = new BrickGrid(src.size, undefined, this.pool);
     const edit = emptyEdit();
     if (src.sparse) {
@@ -801,12 +843,27 @@ export class Renderer {
     }
     grid.markNear(edit);
     const topOff = this.claimTops(grid.top.length);
+    // Parts: a second grid of part index + 1 in the same pool, beside the roles (both are 8-bit).
+    let partGrid: BrickGrid | undefined, partTopOff: number | undefined, boxes: Int32Array | undefined;
+    if (src.parts && src.data) {
+      const ids = new Uint8Array(src.data.length);
+      let count = 0;
+      for (let i = 0; i < ids.length; i++) if (src.data[i]) { ids[i] = src.parts[i] + 1; count = Math.max(count, src.parts[i] + 1); }
+      partGrid = new BrickGrid(src.size, undefined, this.pool);
+      const g = partGrid.rebuildAll(ids);
+      for (const k of ["slots4", "slots8", "blocks", "tops"] as const) for (const v of g[k]) edit[k].push(v);
+      partTopOff = this.claimTops(partGrid.top.length);
+      const parts = Math.max(count, src.joints?.length ?? 0);
+      // Each brick of a posed instance keeps a 32-bit mask of the parts in it (see instance.ts).
+      if (parts > 32) throw new Error(`addModel: at most 32 parts can be posed on the GPU (this model has ${parts})`);
+      boxes = partBoxes(src.size, src.data, src.parts, parts);
+    }
     let id = this.models.indexOf(null);
     if (id < 0) id = this.models.push(null) - 1;
-    this.models[id] = { grid, topOff, size: { ...src.size } };
+    this.models[id] = { grid, topOff, size: { ...src.size }, partGrid, partTopOff, partBoxes: boxes, joints: src.joints };
     if (this.modelData.length < (id + 1) * MODEL_WORDS) this.modelData = growU32(this.modelData, (id + 1) * MODEL_WORDS);
     const m = id * MODEL_WORDS;
-    this.modelData.set([topOff, grid.topDim[0], grid.topDim[1], grid.topDim[2], src.size.x, src.size.y, src.size.z, 0], m);
+    this.modelData.set([topOff, grid.topDim[0], grid.topDim[1], grid.topDim[2], src.size.x, src.size.y, src.size.z, partGrid ? partTopOff! + 1 : 0], m);
     const grewPools = this.growPools();
     if (this.ensureLayout() || grewPools) {
       this.uploadIndexAll();
@@ -815,6 +872,7 @@ export class Renderer {
     this.uploadSlots(edit.slots4, edit.slots8);
     this.uploadBlocks(edit.blocks);
     this.writeRegion("tops", topOff, grid.top, 0, grid.top.length);
+    if (partGrid) this.writeRegion("tops", partTopOff!, partGrid.top, 0, partGrid.top.length);
     this.writeRegion("models", m, this.modelData, m, MODEL_WORDS);
     return id;
   }
@@ -825,6 +883,10 @@ export class Renderer {
     if (!m) return;
     m.grid.free();
     this.topFree.push([m.topOff, m.grid.top.length]);
+    if (m.partGrid) {
+      m.partGrid.free();
+      this.topFree.push([m.partTopOff!, m.partGrid.top.length]);
+    }
     this.models[id] = null;
   }
 
@@ -857,6 +919,7 @@ export class Renderer {
     // Static: instances [0, n), lists [0, total), and the cell entries they give.
     const perCell = new Map<number, number[]>();
     this.staticCount = 0;
+    this.partLen = 0;
     for (const inst of list) {
       const k = this.writeInstance(inst, this.staticCount);
       if (k < 0) continue;
@@ -867,6 +930,7 @@ export class Renderer {
       });
       this.staticCount++;
     }
+    this.staticPartLen = this.partLen;
     for (const ci of this.staticTouched) this.staticCells[ci] = 0;
     this.staticTouched = [];
     let total = 0;
@@ -895,34 +959,23 @@ export class Renderer {
   private staticTouched: number[] = [];
   private staticDirty = false;
 
-  /** Write instance `k`'s words; returns k, or -1 when its model is gone. */
+  /**
+   * Write instance `k`'s words (and its part records at `partLen`, advancing it); returns k, or -1
+   * when its model is gone. The packing is instance.ts's, shared with the CPU sampler.
+   */
   private writeInstance(inst: Instance, k: number): number {
     const m = this.models[inst.model];
     if (!m) return -1;
     if (this.instData.length < (k + 1) * INST_WORDS) this.instData = growU32(this.instData, (k + 1) * INST_WORDS);
-    const f = new Float32Array(this.instData.buffer);
-    const o = k * INST_WORDS;
-    const yaw = inst.yaw ?? 0, c = Math.cos(yaw), sn = Math.sin(yaw);
-    const a0 = inst.anchor ?? [m.size.x / 2, 0, m.size.z / 2];
-    // In the mirrored model the anchor voxel is the reflected one.
-    const an: Vec3 = inst.mirror ? [m.size.x - 1 - a0[0], a0[1], a0[2]] : [a0[0], a0[1], a0[2]];
-    f[o] = inst.x; f[o + 1] = inst.y; f[o + 2] = inst.z; f[o + 3] = c;
-    f[o + 4] = an[0]; f[o + 5] = an[1]; f[o + 6] = an[2]; f[o + 7] = sn;
-    this.instData[o + 8] = inst.model;
-    this.instData[o + 9] = inst.base;
-    this.instData[o + 10] = inst.mirror ? 1 : 0; this.instData[o + 11] = 0;
-    // World box of the turned model: world = R (m - anchor) + pos, with
-    // R = [c 0 s; 0 1 0; -s 0 c] (the same turn as bakePose), pivoting on
-    // the anchor voxel's centre.
-    let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
-    for (const mx of [0, m.size.x]) for (const mz of [0, m.size.z]) {
-      const dx = mx - an[0] - 0.5, dz = mz - an[2] - 0.5;
-      const wx = c * dx + sn * dz + inst.x + 0.5, wz = -sn * dx + c * dz + inst.z + 0.5;
-      x0 = Math.min(x0, wx); x1 = Math.max(x1, wx); z0 = Math.min(z0, wz); z1 = Math.max(z1, wz);
+    const pm = { size: m.size, partBoxes: m.partBoxes, joints: m.joints };
+    if (inst.parts && m.partBoxes) {
+      const most = maxPartWords(pm);
+      if (this.partData.length < this.partLen + most) this.partData = growU32(this.partData, this.partLen + most);
     }
-    const y0 = inst.y - an[1], y1 = y0 + m.size.y;
+    const { box, partWords } = packInstance(inst, pm, inst.model, this.instData, k * INST_WORDS, this.partData, this.partLen);
+    this.partLen += partWords;
     if (this.instBox.length < (k + 1) * 6) { const nb = new Float64Array(Math.max(64, (k + 1) * 12)); nb.set(this.instBox); this.instBox = nb; }
-    this.instBox.set([x0, y0, z0, x1, y1, z1], k * 6);
+    this.instBox.set(box, k * 6);
     return k;
   }
   private instBox = new Float64Array(64 * 6);
@@ -946,6 +999,7 @@ export class Renderer {
    */
   private rebuildDynamic(): void {
     let n = this.staticCount;
+    this.partLen = this.staticPartLen;
     const perCell = new Map<number, number[]>();
     for (const inst of this.dynamicList) {
       const k = this.writeInstance(inst, n);
@@ -983,12 +1037,14 @@ export class Renderer {
     }
     if (this.staticDirty) {
       this.writeRegion("inst", 0, this.instData, 0, this.instCount * INST_WORDS);
+      this.writeRegion("parts", 0, this.partData, 0, this.partLen);
       this.writeRegion("list", 0, this.listData, 0, this.listLen);
       this.writeRegion("cells", 0, this.cellData, 0, this.cellData.length);
       this.staticDirty = false;
       return;
     }
     this.writeRegion("inst", this.staticCount * INST_WORDS, this.instData, this.staticCount * INST_WORDS, dynCount * INST_WORDS);
+    this.writeRegion("parts", this.staticPartLen, this.partData, this.staticPartLen, this.partLen - this.staticPartLen);
     this.writeRegion("list", this.staticListLen, this.listData, this.staticListLen, this.listLen - this.staticListLen);
     for (const [lo, hi] of runs(dirty, 64)) this.writeRegion("cells", lo, this.cellData, lo, hi - lo + 1);
   }
@@ -1110,13 +1166,14 @@ export class Renderer {
       list: this.listLen,
       inst: this.instCount * INST_WORDS,
       models: this.models.length * MODEL_WORDS,
+      parts: this.partLen,
     };
   }
 
   /** Offsets with headroom; regions are laid out in REGIONS order. */
   private planLayout(): Record<RegionName, { off: number; cap: number }> {
     const need = this.needs();
-    const floor: Record<RegionName, number> = { tops: 0, blocks: BLOCK_ENTRIES * 16, cells: 0, list: 256, inst: INST_WORDS * 16, models: MODEL_WORDS * 8 };
+    const floor: Record<RegionName, number> = { tops: 0, blocks: BLOCK_ENTRIES * 16, cells: 0, list: 256, inst: INST_WORDS * 16, models: MODEL_WORDS * 8, parts: 1024 };
     const out = {} as Record<RegionName, { off: number; cap: number }>;
     let off = 0;
     for (const r of REGIONS) {
@@ -1164,12 +1221,17 @@ export class Renderer {
   private uploadIndexAll(): void {
     this.writeRegion("tops", 0, this.bricks.top, 0, this.bricks.top.length);
     this.uploadTopTexture();
-    for (const m of this.models) if (m) this.writeRegion("tops", m.topOff, m.grid.top, 0, m.grid.top.length);
+    for (const m of this.models) {
+      if (!m) continue;
+      this.writeRegion("tops", m.topOff, m.grid.top, 0, m.grid.top.length);
+      if (m.partGrid) this.writeRegion("tops", m.partTopOff!, m.partGrid.top, 0, m.partGrid.top.length);
+    }
     this.writeRegion("blocks", 0, this.pool.blocks, 0, this.pool.blockCount * BLOCK_ENTRIES);
     this.writeRegion("cells", 0, this.cellData, 0, this.cellData.length);
     this.writeRegion("list", 0, this.listData, 0, this.listLen);
     this.writeRegion("inst", 0, this.instData, 0, this.instCount * INST_WORDS);
     this.writeRegion("models", 0, this.modelData, 0, this.models.length * MODEL_WORDS);
+    this.writeRegion("parts", 0, this.partData, 0, this.partLen);
     this.uploadSlots(null, null);
   }
 
@@ -1300,7 +1362,7 @@ export class Renderer {
     const [tx, ty, tz] = this.bricks.topDim;
     w[132] = tx; w[133] = ty; w[134] = tz; w[135] = this.instCount;
     w[136] = this.layout.blocks.off; w[137] = this.layout.cells.off; w[138] = this.layout.list.off; w[139] = this.layout.inst.off;
-    w[140] = this.layout.models.off; w[141] = this.layout.tops.off; w[142] = 0; w[143] = 0;
+    w[140] = this.layout.models.off; w[141] = this.layout.tops.off; w[142] = this.layout.parts.off; w[143] = 0;
 
     const { device } = this.gpu;
     device.queue.writeBuffer(this.uniformBuffer, 0, u);
@@ -1317,8 +1379,10 @@ export class Renderer {
         },
       ],
     });
-    if (this.instCount > 0 && !this.instancedPipeline) this.instancedPipeline = this.makePipeline(true);
-    pass.setPipeline(this.instCount > 0 ? this.instancedPipeline! : this.pipeline);
+    let pipeline = this.pipeline;
+    if (this.instCount > 0 && this.partLen > 0) pipeline = this.partsPipeline ??= this.makePipeline(true, true);
+    else if (this.instCount > 0) pipeline = this.instancedPipeline ??= this.makePipeline(true);
+    pass.setPipeline(pipeline);
     pass.setBindGroup(0, this.bindGroup);
     pass.draw(3);
     pass.end();

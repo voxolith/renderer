@@ -46,6 +46,9 @@ export type { Vec3, VoxelHit } from "./ray";
 
 export { seededRandom, hashSeed } from "./random";
 
+export { INST_WORDS, PART_WORDS, INST_MIRROR, INST_PARTS, NO_PARENT, NO_MASKS, MASK_B, placement, packInstance, maxPartWords, partBoxes, sampleInstance, mulAffine, invertAffine } from "./instance";
+export type { Affine, PackModel, PackInstance, SampleModel } from "./instance";
+
 export { GridStamper } from "./stamper";
 export type { StampVoxel } from "./stamper";
 

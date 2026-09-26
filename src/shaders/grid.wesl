@@ -24,13 +24,25 @@ const TOP_B : i32 = 64;
 const TIER_BIT : u32 = 0x80000000u;
 const UNIFORM_BIT : u32 = 0x40000000u;
 const SLOT_MASK : u32 = 0x1fffffffu;
-const INST_WORDS : u32 = 12u;
+/** Words per instance record. Must match INST_WORDS in instance.ts. */
+const INST_WORDS : u32 = 24u;
+/** Words per part record. Must match PART_WORDS in instance.ts. */
+const PART_WORDS : u32 = 24u;
+const INST_MIRROR : u32 = 1u;
+const INST_PARTS : u32 = 2u;
+const NO_PARENT : u32 = 0xffffffffu;
+const NO_MASKS : u32 = 0xffffffffu;
+/** Brick edge of an instance's part mask grid. Must match MASK_B in instance.ts. */
+const MASK_B : i32 = 8;
 
 // Pipeline constant: whether this pipeline samples instances at all. The
 // renderer builds the instanced variant only once a scene places one, so a
 // scene without instances runs a shader with that code compiled away (it
 // costs even when never taken: several times the frame on SwiftShader).
 @id(0) override INSTANCES : bool = false;
+// Pipeline constant: whether any instance is drawn with parts (posed on the GPU). Its own variant,
+// for the same reason: a scene of plain instances runs without the part sampling compiled in.
+@id(1) override PARTS : bool = false;
 const MODEL_WORDS : u32 = 8u;
 
 // Index arithmetic is all unsigned: coordinates are converted once, after
@@ -108,18 +120,107 @@ fn cellList(p : vec3<i32>) -> u32 {
   return idx[U.cellOff + t.x + t.y * U.topDim.x + t.z * U.topDim.x * U.topDim.y];
 }
 
-/** A world point in instance `k`'s model space (voxels). */
+/** Apply the 3x4 affine stored at idx[o] (row-major, as f32 bits) to a point. */
+fn affineAt(o : u32, p : vec3<f32>) -> vec3<f32> {
+  let r0 = vec4<f32>(bitcast<f32>(idx[o]), bitcast<f32>(idx[o + 1u]), bitcast<f32>(idx[o + 2u]), bitcast<f32>(idx[o + 3u]));
+  let r1 = vec4<f32>(bitcast<f32>(idx[o + 4u]), bitcast<f32>(idx[o + 5u]), bitcast<f32>(idx[o + 6u]), bitcast<f32>(idx[o + 7u]));
+  let r2 = vec4<f32>(bitcast<f32>(idx[o + 8u]), bitcast<f32>(idx[o + 9u]), bitcast<f32>(idx[o + 10u]), bitcast<f32>(idx[o + 11u]));
+  let h = vec4<f32>(p, 1.0);
+  return vec3<f32>(dot(r0, h), dot(r1, h), dot(r2, h));
+}
+
+/**
+ * A world point in instance `k`'s model space (voxels): its world→model affine, which turns about
+ * the anchor voxel's centre, so a quarter turn maps voxel centres onto voxel centres exactly (as a
+ * stamped orientation does). See placement() in instance.ts.
+ */
 fn toModel(k : u32, wp : vec3<f32>) -> vec3<f32> {
-  let o = U.instOff + k * INST_WORDS;
-  let pos = vec3<f32>(bitcast<f32>(idx[o]), bitcast<f32>(idx[o + 1u]), bitcast<f32>(idx[o + 2u]));
-  let c = bitcast<f32>(idx[o + 3u]);
-  let anchor = vec3<f32>(bitcast<f32>(idx[o + 4u]), bitcast<f32>(idx[o + 5u]), bitcast<f32>(idx[o + 6u]));
-  let s = bitcast<f32>(idx[o + 7u]);
-  // The turn pivots on the anchor voxel's centre, so a quarter turn maps
-  // voxel centres onto voxel centres exactly (as a stamped orientation does).
-  let d = wp - pos - vec3<f32>(0.5, 0.0, 0.5);
-  // Inverse of world = R (m - anchor) + pos, R = [c 0 s; 0 1 0; -s 0 c].
-  return vec3<f32>(c * d.x - s * d.z, d.y, s * d.x + c * d.z) + anchor + vec3<f32>(0.5, 0.0, 0.5);
+  return affineAt(U.instOff + k * INST_WORDS, wp);
+}
+
+/** Value at model cell `q` (in range) of the grid whose record starts at `mi`, `part` selecting its part grid. */
+fn modelValue(mi : u32, q : vec3<i32>, part : bool) -> u32 {
+  var top = idx[mi];
+  if (part) {
+    top = idx[mi + 7u] - 1u;
+  }
+  let e = gridEntry(top, vec3<u32>(idx[mi + 1u], idx[mi + 2u], idx[mi + 3u]), q);
+  return brickVoxel(e, toI(toU(q) % 8u));
+}
+
+/**
+ * Role value an instance drawn with parts has at world cell `p`, or 0. Each part maps the cell
+ * centre back to the shared rest model through its own inverse; the first part whose own voxel is
+ * there wins (parts are ordered parents first). Near a joint, either side's voxels may fill the
+ * cell, so a turned child stays on its parent.
+ *
+ * Posing by moving samples into a shared, static rest pose follows Gruen, Benthin, Kern and
+ * McAllister, "Ray Tracing Massive Amounts of Animated Geometry" (HPG 2026,
+ * doi:10.1145/3820014), and Kao, Makowski, Fujieda and Harada, "Voxel Deformation-Aware Neural
+ * Intersection Function" (EG 2026, doi:10.2312/egs.20261026); here the deformation is rigid per
+ * part, over the brick index. sampleInstance() in instance.ts is the CPU twin.
+ */
+fn partsVoxel(o : u32, mi : u32, p : vec3<i32>, wp : vec3<f32>) -> u32 {
+  let size = vec3<i32>(i32(idx[mi + 4u]), i32(idx[mi + 5u]), i32(idx[mi + 6u]));
+  let off = U.partsOff + idx[o + 15u];
+  // Which parts can be here: the brick's pair of masks (one bit per part, at most 32 parts). The
+  // first says whose posed box touches the brick, the second whose joint weld does; a bit is set
+  // only for parts that have voxels (and, for welds, whose parent has too).
+  let lo = vec3<i32>(bitcast<i32>(idx[o + 17u]), bitcast<i32>(idx[o + 18u]), bitcast<i32>(idx[o + 19u]));
+  let hi = vec3<i32>(bitcast<i32>(idx[o + 20u]), bitcast<i32>(idx[o + 21u]), bitcast<i32>(idx[o + 22u]));
+  let dims = toU(max((hi - lo + vec3<i32>(MASK_B - 1)) / MASK_B, vec3<i32>(1)));
+  let bc = toU(p - lo) / u32(MASK_B);
+  let mb = U.partsOff + idx[o + 23u] + (bc.x + bc.y * dims.x + bc.z * dims.x * dims.y) * 2u;
+  var hits = idx[mb];
+  var welds = idx[mb + 1u];
+  // One loop over the candidates, so the lookups are compiled once: first each part whose box is
+  // here, through its own inverse, taking only its own voxels (parents first, as baking does);
+  // then each joint weld here, through the child's inverse and then the parent's, taking either's.
+  var pendB = 0u;
+  var pendPar = NO_PARENT;
+  loop {
+    var b = 0u;
+    var via = 0u;
+    var par = NO_PARENT;
+    if (hits != 0u) {
+      b = firstTrailingBit(hits);
+      hits = hits & (hits - 1u);
+      via = b;
+    } else if (pendPar != NO_PARENT) {
+      b = pendB;
+      par = pendPar;
+      via = par;
+      pendPar = NO_PARENT;
+    } else {
+      if (welds == 0u) {
+        break;
+      }
+      b = firstTrailingBit(welds);
+      welds = welds & (welds - 1u);
+      let q0 = off + b * PART_WORDS;
+      let j = vec3<i32>(bitcast<i32>(idx[q0 + 18u]), bitcast<i32>(idx[q0 + 19u]), bitcast<i32>(idx[q0 + 20u]));
+      if (any(abs(p - j) > vec3<i32>(1))) {
+        continue;
+      }
+      par = idx[q0 + 21u];
+      via = b;
+      pendB = b;
+      pendPar = par;
+    }
+    let q = vec3<i32>(floor(affineAt(off + via * PART_WORDS, wp)));
+    if (any(q < vec3<i32>(0)) || any(q >= size)) {
+      continue;
+    }
+    let v = modelValue(mi, q, false);
+    if (v == 0u) {
+      continue;
+    }
+    let pid = modelValue(mi, q, true);
+    if (pid == b + 1u || (par != NO_PARENT && pid == par + 1u)) {
+      return v;
+    }
+  }
+  return 0u;
 }
 
 /** Palette slot of the instanced voxel at world cell `p`, or 0. */
@@ -137,21 +238,33 @@ fn instanceVoxel(p : vec3<i32>) -> u32 {
   for (var i = 0u; i < n; i = i + 1u) {
     let k = idx[U.listOff + start + i];
     let o = U.instOff + k * INST_WORDS;
-    let mi = U.modelsOff + idx[o + 8u] * MODEL_WORDS;
+    // The world cells the instance can touch: most samples in a listed cell miss it here.
+    let lo = vec3<i32>(bitcast<i32>(idx[o + 17u]), bitcast<i32>(idx[o + 18u]), bitcast<i32>(idx[o + 19u]));
+    let hi = vec3<i32>(bitcast<i32>(idx[o + 20u]), bitcast<i32>(idx[o + 21u]), bitcast<i32>(idx[o + 22u]));
+    if (any(p < lo) || any(p >= hi)) {
+      continue;
+    }
+    let mi = U.modelsOff + idx[o + 12u] * MODEL_WORDS;
+    let flags = idx[o + 14u];
+    if (PARTS && (flags & INST_PARTS) != 0u) {
+      let v = partsVoxel(o, mi, p, wp);
+      if (v != 0u) {
+        return idx[o + 13u] + v - 1u;
+      }
+      continue;
+    }
     let size = vec3<i32>(i32(idx[mi + 4u]), i32(idx[mi + 5u]), i32(idx[mi + 6u]));
     var q = vec3<i32>(floor(toModel(k, wp)));
     // Mirrored instances flip the voxel index along x, after the turn.
-    if ((idx[o + 10u] & 1u) != 0u) {
+    if ((flags & INST_MIRROR) != 0u) {
       q.x = size.x - 1 - q.x;
     }
     if (any(q < vec3<i32>(0)) || any(q >= size)) {
       continue;
     }
-    let qu = toU(q);
-    let e = gridEntry(idx[mi], vec3<u32>(idx[mi + 1u], idx[mi + 2u], idx[mi + 3u]), q);
-    let v = brickVoxel(e, toI(qu % 8u));
+    let v = modelValue(mi, q, false);
     if (v != 0u) {
-      return idx[o + 9u] + v - 1u;
+      return idx[o + 13u] + v - 1u;
     }
   }
   return 0u;
@@ -175,6 +288,18 @@ fn sampleVoxel(p : vec3<i32>) -> u32 {
   return instanceVoxel(p);
 }
 
+/** The world's own voxel at `p`, ignoring instances (the device self-test). */
+fn worldVoxel(p : vec3<i32>) -> u32 {
+  if (any(p < vec3<i32>(0)) || any(p >= vec3<i32>(U.gridSize))) {
+    return 0u;
+  }
+  let e = worldEntry(p);
+  if (e == 0u) {
+    return 0u;
+  }
+  return brickVoxel(e, toI(toU(p) % 8u));
+}
+
 fn isSolid(p : vec3<i32>) -> bool {
   return sampleVoxel(p) != 0u;
 }
@@ -191,14 +316,46 @@ fn instanceNear(c : vec3<i32>) -> bool {
   }
   let start = cl >> 8u;
   let wc = vec3<f32>(c * COARSE_B) + vec3<f32>(4.0);
+  let blo = c * COARSE_B;
+  let bhi = blo + vec3<i32>(COARSE_B);
   for (var i = 0u; i < n; i = i + 1u) {
     let k = idx[U.listOff + start + i];
     let o = U.instOff + k * INST_WORDS;
-    let mi = U.modelsOff + idx[o + 8u] * MODEL_WORDS;
+    let ilo = vec3<i32>(bitcast<i32>(idx[o + 17u]), bitcast<i32>(idx[o + 18u]), bitcast<i32>(idx[o + 19u]));
+    let ihi = vec3<i32>(bitcast<i32>(idx[o + 20u]), bitcast<i32>(idx[o + 21u]), bitcast<i32>(idx[o + 22u]));
+    // A brick more than one brick away from the instance's cells cannot hold its voxels (the
+    // NEAR clamp below reaches one brick past a model's edge).
+    if (any(blo >= ihi + vec3<i32>(COARSE_B)) || any(bhi <= ilo - vec3<i32>(COARSE_B))) {
+      continue;
+    }
+    let mi = U.modelsOff + idx[o + 12u] * MODEL_WORDS;
+    let flags = idx[o + 14u];
+    if (PARTS && (flags & INST_PARTS) != 0u) {
+      // Posed parts: the brick may hold voxels where a mask brick it overlaps has a part or a
+      // weld in it.
+      let m0 = idx[o + 23u];
+      let dims = max((ihi - ilo + vec3<i32>(MASK_B - 1)) / MASK_B, vec3<i32>(1));
+      let c0 = clamp((blo - ilo) / MASK_B, vec3<i32>(0), dims - vec3<i32>(1));
+      let c1 = clamp((bhi - vec3<i32>(1) - ilo) / MASK_B, vec3<i32>(0), dims - vec3<i32>(1));
+      if (any(bhi <= ilo) || any(blo >= ihi)) {
+        continue;
+      }
+      for (var z = c0.z; z <= c1.z; z = z + 1) {
+        for (var y = c0.y; y <= c1.y; y = y + 1) {
+          for (var x = c0.x; x <= c1.x; x = x + 1) {
+            let bi = U.partsOff + m0 + u32(x + y * dims.x + z * dims.x * dims.y) * 2u;
+            if ((idx[bi] | idx[bi + 1u]) != 0u) {
+              return true;
+            }
+          }
+        }
+      }
+      continue;
+    }
     let size = vec3<i32>(i32(idx[mi + 4u]), i32(idx[mi + 5u]), i32(idx[mi + 6u]));
     let bdim = (size + vec3<i32>(COARSE_B - 1)) / COARSE_B;
     var qm = toModel(k, wc);
-    if ((idx[o + 10u] & 1u) != 0u) {
+    if ((flags & INST_MIRROR) != 0u) {
       qm.x = f32(size.x) - qm.x;
     }
     let qb = vec3<i32>(floor(qm / f32(COARSE_B)));
@@ -294,14 +451,17 @@ fn voxelIn(q : BrickQuery, p : vec3<i32>) -> u32 {
   if (!q.inGrid || any(p < vec3<i32>(0)) || any(p >= vec3<i32>(U.gridSize))) {
     return 0u;
   }
+  // One call site for the instance lookup (it is large): a world voxel wins, else instances where
+  // the world is empty but the brick is solid or near one.
+  var inst = q.near;
   if (q.entry != 0u) {
     let v = brickVoxel(q.entry, toI(toU(p) % 8u));
     if (v != 0u || (!INSTANCES || U.instanceCount == 0u)) {
       return v;
     }
-    return instanceVoxel(p);
+    inst = true;
   }
-  if (q.near) {
+  if (inst) {
     return instanceVoxel(p);
   }
   return 0u;
