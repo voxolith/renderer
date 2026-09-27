@@ -122,8 +122,8 @@ fn cellList(p : vec3<i32>) -> u32 {
 
 /**
  * The instances that may have voxels in the brick containing `p` (in range): (first word in idx,
- * count, flags). A crowded static cell keeps a table with, per 16^3 sub-cell, a short list of just
- * the instances whose occupied model bricks reach it (in the cell list's order) and a mask of which
+ * count, flags). A static cell keeps a table with, per 16^3 sub-cell, a short list of just
+ * the instances that can draw in it (in the cell list's order) and a mask of which
  * of its 8 bricks they reach; other cells give their whole list. Flags: bit 0 = the answer is exact
  * per brick (a count of 0 means nothing there), bit 1 = the whole sub-cell is empty. See
  * buildSubLists in renderer.ts (each table is followed by its lists).

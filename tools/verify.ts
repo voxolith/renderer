@@ -7,6 +7,8 @@ import { makeSparse, sparseCount, sparseFromDense, sparseGet, sparseSet, sparseT
 import { OccupancyGrid } from "../src/occupancy";
 import { seededRandom } from "../src/random";
 import { makePerf } from "../src/perf";
+import { buildSubLists, readSubLists, type SubListInstance } from "../src/sublists";
+import { INST_WORDS, packInstance, sampleInstance } from "../src/instance";
 
 let failed = 0;
 let checks = 0;
@@ -240,6 +242,85 @@ console.log("adaptive render scale:");
   ok(still.lateChanges === 0, `with timed retries off, a still view never changes scale once settled (${still.lateChanges})`);
   const fast = simulate(8, 20);
   ok(fast.scale === 1, "a cheap scene still climbs to full resolution");
+}
+
+
+console.log("\nsub-cell instance tables:");
+
+// For random models and placements (turned, tilted, mirrored, fractional), every world cell an
+// instance draws (sampleInstance, the shader's CPU twin, at voxel centres) is listed by its
+// sub-cell's table for its brick; and a build that misplaces instances (shifted, mirror flip dropped)
+// is caught.
+{
+  const rng = seededRandom(777);
+  const world = { x: 192, y: 96, z: 192 };
+  const brickDim: [number, number, number] = [world.x / 8, world.y / 8, world.z / 8];
+  const topDim: [number, number, number] = [Math.ceil(world.x / 64), Math.ceil(world.y / 64), Math.ceil(world.z / 64)];
+  const models = Array.from({ length: 4 }, (_, mi) => {
+    const size = { x: 5 + Math.floor(rng() * 20), y: 5 + Math.floor(rng() * 24), z: 5 + Math.floor(rng() * 20) };
+    const data = new Uint8Array(size.x * size.y * size.z);
+    // A few blobs and single voxels (sparse, like leaves).
+    for (let i = 0; i < data.length; i++) if (rng() < (mi === 0 ? 0.02 : 0.08)) data[i] = 1 + Math.floor(rng() * 3);
+    const subs = new Set<string>();
+    let i = 0;
+    for (let z = 0; z < size.z; z++) for (let y = 0; y < size.y; y++) for (let x = 0; x < size.x; x++, i++) if (data[i]) subs.add(`${x >> 1},${y >> 1},${z >> 1}`);
+    const flat = (st: Set<string>) => Int32Array.from([...st].flatMap((k) => k.split(",").map(Number)));
+    return { size, data, subs: flat(subs) };
+  });
+  const placed: SubListInstance[] = [];
+  const words = new Uint32Array(INST_WORDS * 64);
+  const boxes: number[][] = [];
+  for (let k = 0; k < 60; k++) {
+    const mi = k % models.length, m = models[mi];
+    const kind = rng();
+    const inst = {
+      x: 30 + rng() * 130, y: 10 + rng() * 50, z: 30 + rng() * 130, base: 1,
+      yaw: kind < 0.3 ? (Math.floor(rng() * 4) * Math.PI) / 2 : rng() * Math.PI * 2,
+      mirror: rng() < 0.3,
+      rotation: kind > 0.85 ? (() => { const a = rng() * 3, b = rng() * 3; const ca = Math.cos(a), sa = Math.sin(a), cb = Math.cos(b), sb = Math.sin(b); return [cb, -sb * ca, sb * sa, sb, cb * ca, -cb * sa, 0, sa, ca]; })() : undefined,
+    };
+    const { box } = packInstance(inst, { size: m.size }, mi, words, k * INST_WORDS);
+    boxes.push(box);
+    placed.push({ inst, size: m.size, subs: m.subs });
+  }
+  const perCell = new Map<number, number[]>();
+  placed.forEach((_, k) => {
+    const b = boxes[k];
+    for (let cz = Math.max(0, Math.floor((b[2] - 1) / 64)); cz <= Math.min(topDim[2] - 1, Math.floor((b[5] + 1) / 64)); cz++)
+      for (let cy = Math.max(0, Math.floor((b[1] - 1) / 64)); cy <= Math.min(topDim[1] - 1, Math.floor((b[4] + 1) / 64)); cy++)
+        for (let cx = Math.max(0, Math.floor((b[0] - 1) / 64)); cx <= Math.min(topDim[0] - 1, Math.floor((b[3] + 1) / 64)); cx++) {
+          const ci = cx + cy * topDim[0] + cz * topDim[0] * topDim[1];
+          let l = perCell.get(ci);
+          if (!l) perCell.set(ci, (l = []));
+          l.push(k);
+        }
+  });
+  const sampleModel = (mi: number) => {
+    const m = models[mi];
+    return { size: m.size, voxel: (x: number, y: number, z: number) => m.data[x + y * m.size.x + z * m.size.x * m.size.y], part: () => 0 };
+  };
+  const check = (build: typeof buildSubLists) => {
+    const built = build(brickDim, topDim, perCell, placed, 255, 192);
+    let drawn = 0, unlisted = 0, first = "";
+    placed.forEach((_, k) => {
+      const b = boxes[k], sm = sampleModel(k % models.length);
+      for (let z = Math.max(0, Math.floor(b[2]) - 1); z <= Math.min(world.z - 1, Math.ceil(b[5]) + 1); z++)
+        for (let y = Math.max(0, Math.floor(b[1]) - 1); y <= Math.min(world.y - 1, Math.ceil(b[4]) + 1); y++)
+          for (let x = Math.max(0, Math.floor(b[0]) - 1); x <= Math.min(world.x - 1, Math.ceil(b[3]) + 1); x++) {
+            if (!sampleInstance(words, k * INST_WORDS, undefined, sm, x, y, z)) continue;
+            drawn++;
+            const l = readSubLists(built, topDim, x, y, z);
+            if (!l || !l.includes(k)) { unlisted++; first ||= `instance ${k} at ${x},${y},${z}`; }
+          }
+    });
+    return { drawn, unlisted, first, pairs: built.stats.pairs };
+  };
+  const r = check(buildSubLists);
+  ok(r.drawn > 5000 && r.unlisted === 0, `every drawn cell is listed for its brick (${r.drawn} cells, ${r.pairs} sub-cell entries)`, `${r.unlisted} unlisted, first ${r.first}`);
+  // The check itself: shift every instance a little, or drop the mirror flip, and it must fail.
+  const shifted = check((d, t, pc, pl, m, g) => buildSubLists(d, t, pc, pl.map((p) => ({ ...p, inst: { ...p.inst, x: p.inst.x + 0.3 } })), m, g));
+  const unflipped = check((d, t, pc, pl, m, g) => buildSubLists(d, t, pc, pl.map((p) => ({ ...p, inst: { ...p.inst, mirror: false } })), m, g));
+  ok(shifted.unlisted > 0 && unflipped.unlisted > 0, `  and a build that misplaces them is caught (${shifted.unlisted} and ${unflipped.unlisted} cells unlisted)`);
 }
 
 console.log(`\n${failed ? `${failed} of ${checks} checks FAILED` : `ALL ${checks} CHECKS PASSED`}`);

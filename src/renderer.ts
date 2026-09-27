@@ -23,13 +23,14 @@ import temporalWesl from "./shaders/temporal.wesl?raw";
 import raymarchWesl from "./shaders/raymarch.wesl?raw";
 import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
-import { blockCells, INST_WORDS, MAX_PARTS, maxPoseWords, packInstance, packPose, partBoxes } from "./instance";
+import { INST_WORDS, MAX_PARTS, maxPoseWords, packInstance, packPose, partBoxes } from "./instance";
 import { GpuTimer } from "./timer";
 import { TemporalHistory } from "./temporal";
 
 export type { DirtyBox };
-import { BrickGrid, BrickPool, BLOCK_ENTRIES, BRICK_B, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS, TOP_B, emptyEdit, type BrickEdit } from "./brick";
+import { BrickGrid, BrickPool, BLOCK_ENTRIES, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS, TOP_B, emptyEdit, type BrickEdit } from "./brick";
 import { sparseDims, type SparseVoxels } from "./sparse";
+import { buildSubLists, type SubListInstance } from "./sublists";
 import { LIGHT_FLOATS, MAX_LIGHTS, packLights, type PointLight } from "./lights";
 import type { AtmosphereParams } from "./atmosphere";
 
@@ -87,7 +88,7 @@ const UNIFORM_FLOATS = 144;
 // instances drawn with parts. One buffer keeps the pass within the default
 // limit of 8 storage buffers per stage. Instance and part records are laid out
 // in instance.ts (INST_WORDS, PART_WORDS), shared with the CPU sampler. The
-// last region, "subs", holds the per-sub-cell instance lists of crowded static
+// last region, "subs", holds the per-sub-cell instance lists of static
 // cells (see buildSubLists).
 type RegionName = "tops" | "blocks" | "cells" | "list" | "inst" | "models" | "parts" | "subs";
 const REGIONS: RegionName[] = ["tops", "blocks", "cells", "list", "inst", "models", "parts", "subs"];
@@ -95,8 +96,6 @@ const REGIONS: RegionName[] = ["tops", "blocks", "cells", "list", "inst", "model
 const MODEL_WORDS = 8;
 /** Instances per top cell list; more are dropped (with a console warning). */
 const MAX_CELL_INSTANCES = 255;
-/** Static cells with at least this many instances get per-sub-cell lists. */
-const SUB_MIN = 8;
 
 /** A model drawn by instances; see Renderer.addModel. */
 export interface ModelSource {
@@ -175,8 +174,8 @@ interface GpuModel {
   partTopOff?: number;
   partBoxes?: Int32Array;
   joints?: ModelSource["joints"];
-  /** The model's occupied bricks, as x, y, z triples (for the sub-cell lists). */
-  occupied: Int32Array;
+  /** The model's occupied 2³ sub-cells, as x, y, z triples (for the sub-cell lists). */
+  subs: Int32Array;
 }
 
 /** Options for {@link createRenderer}. */
@@ -1063,7 +1062,7 @@ export class Renderer {
     }
     let id = this.models.indexOf(null);
     if (id < 0) id = this.models.push(null) - 1;
-    this.models[id] = { grid, topOff, size: { ...src.size }, partGrid, partTopOff, partBoxes: boxes, joints: src.joints, occupied: occupiedBlocks(src) };
+    this.models[id] = { grid, topOff, size: { ...src.size }, partGrid, partTopOff, partBoxes: boxes, joints: src.joints, subs: occupiedSubs(src) };
     if (this.modelData.length < (id + 1) * MODEL_WORDS) this.modelData = growU32(this.modelData, (id + 1) * MODEL_WORDS);
     const m = id * MODEL_WORDS;
     this.modelData.set([topOff, grid.topDim[0], grid.topDim[1], grid.topDim[2], src.size.x, src.size.y, src.size.z, partGrid ? partTopOff! + 1 : 0], m);
@@ -1166,76 +1165,23 @@ export class Renderer {
   }
 
   /**
-   * Split each crowded static cell's list by 16^3 sub-cell (4^3 per cell): a sub-cell lists only
-   * the instances whose occupied model bricks can show a voxel in it, in the cell list's order (so
-   * the first hit is the same instance), and masks which of its 8 world bricks they reach. A sample
-   * then tests a handful of instances instead of every one whose box reaches the cell, which is
-   * what dense canopies cost; a ray skips bricks and sub-cells nothing reaches without asking the
-   * models; and "may be here" is about 3 voxels loose instead of the model grids' one-brick NEAR
-   * shell. Lists over the cell cap, and cells moving instances touch, keep their whole list.
+   * Split each static cell's list by 16^3 sub-cell (4^3 per cell): a sub-cell lists only the
+   * instances that can show a voxel in it, in the cell list's order (so the first hit is the same
+   * instance), and masks which of its 8 world bricks they reach. A sample then tests a handful of
+   * instances instead of every one whose box reaches the cell, and a ray skips bricks and sub-cells
+   * nothing reaches without asking the models. What an instance reaches is found from its model's
+   * occupied 2³ sub-cells and the world voxel centres that sample them (see sublists.ts). Lists
+   * over the cell cap, and cells moving instances touch, keep their whole list.
    */
   private buildSubLists(perCell: Map<number, number[]>, placed: readonly Instance[]): void {
-    const cells = this.cellData.length;
-    const [tx, ty] = this.bricks.topDim;
-    const table = new Int32Array(cells).fill(-1);
-    let tables = 0;
-    for (const [ci, l] of perCell) if (l.length >= SUB_MIN && l.length <= MAX_CELL_INSTANCES) table[ci] = tables++;
-    const slots = tables * 64;
-    // (slot, instance) pairs in instance order, each pair once, then a counting sort by slot.
-    let pairSlot = new Uint32Array(1 << 16), pairK = new Uint32Array(1 << 16), n = 0;
-    const counts = new Uint32Array(slots), last = new Int32Array(slots).fill(-1), masks = new Uint8Array(slots);
-    const [bx, by, bz] = this.bricks.dim;
-    const mark = (k: number, x0: number, y0: number, z0: number, x1: number, y1: number, z1: number) => {
-      const gx0 = Math.max(0, Math.floor(x0 / BRICK_B)), gx1 = Math.min(bx - 1, Math.floor(x1 / BRICK_B));
-      const gy0 = Math.max(0, Math.floor(y0 / BRICK_B)), gy1 = Math.min(by - 1, Math.floor(y1 / BRICK_B));
-      const gz0 = Math.max(0, Math.floor(z0 / BRICK_B)), gz1 = Math.min(bz - 1, Math.floor(z1 / BRICK_B));
-      for (let gz = gz0; gz <= gz1; gz++)
-        for (let gy = gy0; gy <= gy1; gy++)
-          for (let gx = gx0; gx <= gx1; gx++) {
-            const t = table[(gx >> 3) + (gy >> 3) * tx + (gz >> 3) * tx * ty];
-            if (t < 0) continue;
-            const slot = t * 64 + ((gx >> 1) & 3) + ((gy >> 1) & 3) * 4 + ((gz >> 1) & 3) * 16;
-            masks[slot] |= 1 << ((gx & 1) + (gy & 1) * 2 + (gz & 1) * 4);
-            if (last[slot] === k) continue;
-            last[slot] = k;
-            counts[slot]++;
-            if (n === pairSlot.length) { pairSlot = growU32(pairSlot, n * 2); pairK = growU32(pairK, n * 2); }
-            pairSlot[n] = slot;
-            pairK[n++] = k;
-          }
-    };
-    if (tables) {
-      for (let k = 0; k < placed.length; k++) {
-        const inst = placed[k], m = this.models[inst.model]!;
-        if (inst.parts && m.partBoxes) {
-          // Posed: anywhere in its box.
-          const b = this.instBox, o = k * 6;
-          mark(k, b[o] - 1, b[o + 1] - 1, b[o + 2] - 1, b[o + 3] + 1, b[o + 4] + 1, b[o + 5] + 1);
-        } else {
-          blockCells(inst, m.size, m.occupied, BRICK_B, (x0, y0, z0, x1, y1, z1) => mark(k, x0, y0, z0, x1, y1, z1));
-        }
-      }
-    }
-    // Each table is followed by its lists; a table entry is (list offset from the table << 16) |
-    // (brick mask << 8) | count.
-    this.staticSubs = new Uint32Array(cells);
-    this.subLen = cells + slots + n;
-    if (this.subData.length < this.subLen) this.subData = new Uint32Array(this.subLen);
-    const base = new Uint32Array(tables);
-    let at = cells;
-    for (let t = 0; t < tables; t++) {
-      base[t] = at;
-      at += 64;
-      for (let s = 0; s < 64; s++) {
-        const slot = t * 64 + s, c = counts[slot];
-        this.subData[base[t] + s] = (((at - base[t]) << 16) | (masks[slot] << 8) | c) >>> 0;
-        counts[slot] = at;
-        at += c;
-      }
-    }
-    for (let i = 0; i < n; i++) this.subData[counts[pairSlot[i]]++] = pairK[i];
-    for (let ci = 0; ci < cells; ci++) if (table[ci] >= 0) this.staticSubs[ci] = base[table[ci]] + 1;
-    this.subData.set(this.staticSubs);
+    const input = placed.map((inst, k): SubListInstance => {
+      const m = this.models[inst.model]!;
+      return { inst, size: m.size, subs: m.subs, posedBox: inst.parts && m.partBoxes ? this.instBox.subarray(k * 6, k * 6 + 6) : undefined };
+    });
+    const built = buildSubLists(this.bricks.dim, this.bricks.topDim, perCell, input, MAX_CELL_INSTANCES, Math.max(...this.gridSize));
+    this.subData = built.data;
+    this.subLen = built.data.length;
+    this.staticSubs = built.cellWords;
   }
 
   private dynamicList: readonly Instance[] = [];
@@ -1888,25 +1834,34 @@ function runs(slots: number[], gap = 1): [number, number][] {
   return out;
 }
 
-/** A model's occupied bricks as x, y, z triples (from its sparse bricks, or a scan when dense). */
-function occupiedBlocks(src: ModelSource): Int32Array {
-  const seen = new Set<number>(), out: number[] = [];
-  const add = (x: number, y: number, z: number) => {
-    const key = x + y * 4096 + z * 16777216;
-    if (!seen.has(key)) { seen.add(key); out.push(x, y, z); }
-  };
+/** The occupied 2³ sub-cells of a model, as x, y, z triples. */
+function occupiedSubs(src: ModelSource): Int32Array {
+  const out: number[] = [];
+  const { x: sx, y: sy, z: sz } = src.size;
   if (src.sparse) {
+    // A brick is exactly 4³ sub-cells, so each brick's own are distinct.
     const [dx, dy] = sparseDims(src.size);
+    const here = new Uint8Array(64);
     for (const [key, cells] of src.sparse.bricks) {
-      if (cells.some((v) => v !== 0)) add(key % dx, Math.floor(key / dx) % dy, Math.floor(key / (dx * dy)));
+      const X = (key % dx) * 4, Y = (Math.floor(key / dx) % dy) * 4, Z = Math.floor(key / (dx * dy)) * 4;
+      here.fill(0);
+      for (let i = 0; i < cells.length; i++) if (cells[i]) here[((i & 7) >> 1) + (((i >> 3) & 7) >> 1) * 4 + ((i >> 6) >> 1) * 16] = 1;
+      for (let j = 0; j < 64; j++) if (here[j]) out.push(X + (j & 3), Y + ((j >> 2) & 3), Z + (j >> 4));
     }
-  } else if (src.data) {
-    const { x: sx, y: sy, z: sz } = src.size;
-    let i = 0;
-    for (let z = 0; z < sz; z++)
-      for (let y = 0; y < sy; y++)
-        for (let x = 0; x < sx; x++, i++) if (src.data[i]) add(x >> 3, y >> 3, z >> 3);
+    return Int32Array.from(out);
   }
+  // Brick by brick, so that neighbours in the list are neighbours in space (the bake caches by brick).
+  const d = src.data;
+  if (!d) return new Int32Array(0);
+  const at = (x: number, y: number, z: number) => x < sx && y < sy && z < sz && d[x + y * sx + z * sx * sy] !== 0;
+  for (let z0 = 0; z0 < sz; z0 += 8)
+    for (let y0 = 0; y0 < sy; y0 += 8)
+      for (let x0 = 0; x0 < sx; x0 += 8)
+        for (let z = z0; z < z0 + 8 && z < sz; z += 2)
+          for (let y = y0; y < y0 + 8 && y < sy; y += 2)
+            for (let x = x0; x < x0 + 8 && x < sx; x += 2)
+              if (at(x, y, z) || at(x + 1, y, z) || at(x, y + 1, z) || at(x + 1, y + 1, z) || at(x, y, z + 1) || at(x + 1, y, z + 1) || at(x, y + 1, z + 1) || at(x + 1, y + 1, z + 1))
+                out.push(x >> 1, y >> 1, z >> 1);
   return Int32Array.from(out);
 }
 

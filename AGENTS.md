@@ -20,8 +20,11 @@ exercises it (examples: orbit, world, instances, rigged, nightwood) in a WebGPU 
 - `src/renderer.ts`: `createRenderer` and the `Renderer` class, covering:
   - uniforms (144 words; the layout is in `shaders/uniforms.wesl`);
   - the index buffer regions (`REGIONS`: tops, blocks, cells, list, inst, models, parts, subs);
-  - models and instances (`addModel`, `setInstances`, sub-cell tables for crowded cells);
+  - models and instances (`addModel`, `setInstances`, and the sub-cell tables built by `src/sublists.ts`);
   - the fragment and compute pipelines (`pipeline: "auto"`), quality, debug modes and GPU timings.
+- `src/sublists.ts`: the sub-cell tables of static instance cells (headless, so verify checks
+  them against `sampleInstance`): which instances can draw in each 16³ sub-cell and brick, from
+  each model's occupied 2³ sub-cells and the world voxel centres that sample them.
 - `src/brick.ts`: `BrickGrid` / `BrickPool` (8³ bricks, 64³ top cells, 4- and 8-bit payloads,
   `NEAR_BIT` on model grids). `src/sparse.ts` holds sparse models (`modelAt`).
 - `src/instance.ts`: instance and pose packing (`INST_WORDS`, `PART_WORDS`, `MASK_B`,
