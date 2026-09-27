@@ -17,12 +17,21 @@ fn inShadow(origin : vec3<f32>, rd : vec3<f32>) -> bool {
   let steps = min(i32(U.shadowSteps), SHADOW_STEPS);
   var qb = vec3<i32>(-2147483647);
   var q : BrickQuery;
-  for (var i = 0; i < steps; i = i + 1) {
+  // Every cell the ray reaches is tested at the top of the next iteration, whether a step or a skip
+  // got it there (a skip lands on the first cell past the block, which may be solid), as `walk`
+  // does. The origin's own cell is not. One lookup and one voxel test, so each is compiled once.
+  for (var i = 0; i <= steps; i = i + 1) {
     if (any(cell < vec3<i32>(0)) || any(cell >= vec3<i32>(U.gridSize))) {
       return false;
     }
     let b = brickOf(cell);
     if (any(b != qb)) { qb = b; q = queryBrick(cell); }
+    if (i > 0 && voxelIn(q, cell) != 0u) {
+      return true;
+    }
+    if (i == steps) {
+      break;
+    }
     if ((U.debug < 0.5 || U.debug > 9.5) && !q.solid) {
       let seed = skipBlock(origin, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
@@ -32,11 +41,6 @@ fn inShadow(origin : vec3<f32>, rd : vec3<f32>) -> bool {
     let mask = stepMask(sideDist);
     sideDist += mask * deltaDist;
     cell += vec3<i32>(mask) * stepDir;
-    let nb = brickOf(cell);
-    if (any(nb != qb)) { qb = nb; q = queryBrick(cell); }
-    if (voxelIn(q, cell) != 0u) {
-      return true;
-    }
   }
   return false;
 }
@@ -55,7 +59,8 @@ fn occludedTo(origin : vec3<f32>, rd : vec3<f32>, maxT : f32) -> bool {
   let steps = min(i32(U.shadowSteps), SHADOW_STEPS);
   var qb = vec3<i32>(-2147483647);
   var q : BrickQuery;
-  for (var i = 0; i < steps; i = i + 1) {
+  // As inShadow: each cell reached, by a step or a skip, is tested at the top of the next iteration.
+  for (var i = 0; i <= steps; i = i + 1) {
     if (any(cell < vec3<i32>(0)) || any(cell >= vec3<i32>(U.gridSize))) {
       return false;
     }
@@ -64,6 +69,12 @@ fn occludedTo(origin : vec3<f32>, rd : vec3<f32>, maxT : f32) -> bool {
     }
     let b = brickOf(cell);
     if (any(b != qb)) { qb = b; q = queryBrick(cell); }
+    if (i > 0 && voxelIn(q, cell) != 0u) {
+      return true;
+    }
+    if (i == steps) {
+      break;
+    }
     if ((U.debug < 0.5 || U.debug > 9.5) && !q.solid) {
       let seed = skipBlock(origin, rd, cell, deltaDist, skipSize(cell));
       cell = seed.cell;
@@ -73,14 +84,6 @@ fn occludedTo(origin : vec3<f32>, rd : vec3<f32>, maxT : f32) -> bool {
     let mask = stepMask(sideDist);
     sideDist += mask * deltaDist;
     cell += vec3<i32>(mask) * stepDir;
-    if (length(vec3<f32>(cell) + vec3<f32>(0.5) - origin) > reach) {
-      return false;
-    }
-    let nb = brickOf(cell);
-    if (any(nb != qb)) { qb = nb; q = queryBrick(cell); }
-    if (voxelIn(q, cell) != 0u) {
-      return true;
-    }
   }
   return false;
 }
