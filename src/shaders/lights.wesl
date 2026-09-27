@@ -80,3 +80,49 @@ fn lightGlow(ro : vec3<f32>, rd : vec3<f32>, tMax : f32) -> vec3<f32> {
   }
   return sum;
 }
+
+// Point lighting for temporal accumulation, split three ways at `p` with normal `n`: `free`, the
+// lights that cast no shadows; `open`, the shadowed lights as if nothing blocked them; and `lit`,
+// the same lights with their shadow rays (only when `trace`; else 0). The rays aim at a point
+// `jitter` (voxels, in a ball of the light's size) off each light's centre, so accumulated
+// samples give soft point shadows. See temporal.wesl for how `lit / open` is kept.
+struct PointSplit {
+  free : vec3<f32>,
+  open : vec3<f32>,
+  lit  : vec3<f32>,
+};
+
+fn pointLightingSplit(p : vec3<f32>, n : vec3<f32>, trace : bool, jitter : vec3<f32>) -> PointSplit {
+  var s : PointSplit;
+  s.free = vec3<f32>(0.0);
+  s.open = vec3<f32>(0.0);
+  s.lit = vec3<f32>(0.0);
+  let count = u32(U.lightCount);
+  for (var i = 0u; i < count; i = i + 1u) {
+    let l = pointLightAt(i);
+    let d = l.pos - p;
+    let dist = length(d);
+    if (dist >= l.range) { continue; }
+    let dir = d / max(dist, 1e-4);
+    let ndl = dot(n, dir);
+    if (ndl <= 0.0) { continue; }
+    let x = dist / l.range;
+    let window = (1.0 - x * x) * (1.0 - x * x);
+    let e = l.color * (ndl * window / (1.0 + dist * dist * FALLOFF_K));
+    if (!(l.shadows && U.shadowSteps > 0.5)) {
+      s.free += e;
+      continue;
+    }
+    s.open += e;
+    if (trace) {
+      let dj = d + jitter;
+      let lj = length(dj);
+      var vis = 1.0;
+      if (occludedTo(p, dj / max(lj, 1e-4), lj)) {
+        vis = SHADOW_FLOOR;
+      }
+      s.lit += e * vis;
+    }
+  }
+  return s;
+}

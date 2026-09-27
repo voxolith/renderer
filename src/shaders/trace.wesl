@@ -13,6 +13,11 @@ struct Hit {
   normal : vec3<f32>,
   color  : vec3<f32>,
   mat    : u32,
+  /**
+   * Distance along the ray to where it enters the hit cell (from the ray's origin), exact for the
+   * cell's box. Shading still measures fog and glow to the face centre; this is for reprojection.
+   */
+  t      : f32,
   /** Loop iterations the walk took (fine steps plus skips), for the step heatmap. */
   steps  : i32,
 };
@@ -36,6 +41,14 @@ fn traverse(ro : vec3<f32>, rd : vec3<f32>, tStart : f32) -> Hit {
 // water sees below the surface (the bed, a sunken rock, the far bank).
 fn traverseUnderWater(ro : vec3<f32>, rd : vec3<f32>, tStart : f32) -> Hit {
   return walk(ro, rd, tStart, true);
+}
+
+// Where the ray enters `cell`: the last of its three slab entries (no earlier than tStart). An
+// axis the ray runs parallel to never bounds the entry.
+fn cellEntry(ro : vec3<f32>, rd : vec3<f32>, cell : vec3<i32>, tStart : f32) -> f32 {
+  let plane = vec3<f32>(cell) + select(vec3<f32>(1.0), vec3<f32>(0.0), rd > vec3<f32>(0.0));
+  let tp = select((plane - ro) / rd, vec3<f32>(-1e30), abs(rd) < vec3<f32>(1e-12));
+  return max(max(max(tp.x, tp.y), tp.z), tStart);
 }
 
 fn walk(ro : vec3<f32>, rd : vec3<f32>, tStart : f32, skipWater : bool) -> Hit {
@@ -87,6 +100,7 @@ fn walk(ro : vec3<f32>, rd : vec3<f32>, tStart : f32, skipWater : bool) -> Hit {
       h.color = palette[c].rgb;
       h.mat = c;
       h.steps = i;
+      h.t = cellEntry(ro, rd, cell, tStart);
       return h;
     }
     // Advance along the axis with the smallest accumulated distance.

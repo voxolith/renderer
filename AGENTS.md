@@ -27,6 +27,9 @@ exercises it (examples: orbit, world, instances, rigged, nightwood) in a WebGPU 
 - `src/instance.ts`: instance and pose packing (`INST_WORDS`, `PART_WORDS`, `MASK_B`,
   `POSE_HEADER`, `MAX_PARTS`), and `sampleInstance`, the CPU twin of the shader's instance
   sampling. The engine's checks use it.
+- `src/temporal.ts`: `TemporalHistory`, the state behind `RenderQuality.temporal` (history
+  textures, the previous camera, per-brick-column change stamps, resets); its shader side is
+  `shaders/temporal.wesl` and the `trace_temporal*` kernels in `raymarch.wesl`.
 - `src/stamper.ts` (`GridStamper`, movers against a dense world copy), `src/device.ts`
   (`initGpu`, features, `gpu.software`), `src/timer.ts` (timestamp queries),
   `src/perf.ts` (`makePerf`, adaptive render scale), `src/frameLoop.ts` (`makeFrameLoop`),
@@ -51,11 +54,17 @@ exercises it (examples: orbit, world, instances, rigged, nightwood) in a WebGPU 
     `grid.wesl`;
   - `BRICK_B` (8) and `TOP_B` (64) (`brick.ts`) match `COARSE_B` and `TOP_B` in `grid.wesl`;
   - `MODEL_WORDS` matches in `renderer.ts` and `grid.wesl`;
-  - the uniform word map matches in `renderer.ts` (`render`) and `uniforms.wesl`.
+  - the uniform word map matches in `renderer.ts` (`render`) and `uniforms.wesl`;
+  - the `Temporal` block and its flag bits match in `temporal.ts` and `temporal.wesl`.
 - **Keep the shader small.** SwiftShader's compile time explodes with inlined copies of large
   functions. Keep one call site per big lookup (AO is one loop with one `isSolid`; instance
   sampling is one function). Optional features sit behind pipeline override constants
-  (`INSTANCES`, `PARTS`), so scenes without them compile them away.
+  (`INSTANCES`, `PARTS`), so scenes without them compile them away. Temporal accumulation has
+  entry points of its own (`trace_temporal*`), so no other pipeline references its code or bindings.
+- **Temporal is opt-in and exact when off.** With `temporal: false` the plain kernels run the
+  same arithmetic as before it existed. Anything that changes voxels or instances must reach
+  `TemporalHistory.mark` (edits, the moving set) or `reset` (a new static set, a full rebuild),
+  or the history ghosts.
 - **Adreno 7xx quirks** (see the comments in `grid.wesl`):
   - index arithmetic is unsigned, and lookups take voxel coordinates, not brick coordinates
     computed elsewhere;

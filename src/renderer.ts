@@ -19,11 +19,13 @@ import waterWesl from "./shaders/water.wesl?raw";
 import fogWesl from "./shaders/fog.wesl?raw";
 import precipWesl from "./shaders/precip.wesl?raw";
 import selftestWesl from "./shaders/selftest.wesl?raw";
+import temporalWesl from "./shaders/temporal.wesl?raw";
 import raymarchWesl from "./shaders/raymarch.wesl?raw";
 import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
 import { blockCells, INST_WORDS, MAX_PARTS, maxPoseWords, packInstance, packPose, partBoxes } from "./instance";
 import { GpuTimer } from "./timer";
+import { TemporalHistory } from "./temporal";
 
 export type { DirtyBox };
 import { BrickGrid, BrickPool, BLOCK_ENTRIES, BRICK_B, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS, TOP_B, emptyEdit, type BrickEdit } from "./brick";
@@ -50,6 +52,7 @@ const WESL_SRC: Record<string, string> = {
   "./fog.wesl": fogWesl,
   "./precip.wesl": precipWesl,
   "./selftest.wesl": selftestWesl,
+  "./temporal.wesl": temporalWesl,
   "./raymarch.wesl": raymarchWesl,
 };
 
@@ -262,6 +265,12 @@ export interface FrameParams extends AtmosphereParams {
   lightDir: Vec3;
   /** Key light colour and strength. */
   lightColor: Vec3;
+  /**
+   * Angular radius of the key light in radians, which sets how soft its shadows' edges are with
+   * `RenderQuality.temporal` (they widen with the distance to the caster). Default 0.02 (about
+   * 1.1°); the real sun's is about 0.0047. Without temporal, shadows are hard.
+   */
+  lightAngle?: number;
   /** Ambient light from above (hemisphere, sky side). */
   ambientSky: Vec3;
   /** Ambient light from below (hemisphere, ground side). */
@@ -296,6 +305,18 @@ export interface RenderQuality {
   shadowSteps: number;
   /** Face ambient occlusion (8 neighbour lookups per hit). */
   ao: boolean;
+  /**
+   * Temporal accumulation (compute pipeline only; off in every preset): the key light's shadow,
+   * AO and point-light shadows are kept per pixel across frames and reused wherever a pixel still
+   * sees the same voxel face, so they are traced only until they have converged. Shadows turn soft
+   * (see `FrameParams.lightAngle`), and a still view costs about the primary rays alone. Near
+   * edits and moving instances they are traced every frame, hard, as without it; a frame in which
+   * most of the world changed (a crowd over the whole map) is rendered without it. After the view
+   * stops changing the image needs a few dozen more frames to settle: keep rendering while
+   * `Renderer.converging()` is true (`makeFrameLoop` does, given `converging`). Needs about
+   * 32 bytes per pixel of history. With the `"fragment"` pipeline it has no effect.
+   */
+  temporal: boolean;
 }
 
 /** Names of the `QUALITY_PRESETS`; "low" has no shadows or AO. */
@@ -303,9 +324,9 @@ export type QualityPreset = "low" | "medium" | "high";
 
 /** Presets consumers can offer in a UI; `high` matches the engine's original look. */
 export const QUALITY_PRESETS: Record<QualityPreset, RenderQuality> = {
-  low: { maxSteps: 256, shadowSteps: 0, ao: false },
-  medium: { maxSteps: 512, shadowSteps: 48, ao: true },
-  high: { maxSteps: 768, shadowSteps: 90, ao: true },
+  low: { maxSteps: 256, shadowSteps: 0, ao: false, temporal: false },
+  medium: { maxSteps: 512, shadowSteps: 48, ao: true, temporal: false },
+  high: { maxSteps: 768, shadowSteps: 90, ao: true, temporal: false },
 };
 
 /** Optional infinite ground-plane drawn on ray-miss below `y` (off by default). */
@@ -433,6 +454,13 @@ export class Renderer {
   };
   private debugMode = 0;
   private quality: RenderQuality = { ...QUALITY_PRESETS.high };
+  /** RenderQuality.temporal's history, made when first used. */
+  private temporal: TemporalHistory | null = null;
+  /** Whether the last frame was rendered with temporal accumulation. */
+  private temporalLast = false;
+  private makeTemporalPipeline: ((variant: number, canvas: boolean) => GPUComputePipeline) | null = null;
+  /** Temporal kernels by variant (as computePipelines). */
+  private readonly temporalPipelines: (GPUComputePipeline | undefined)[] = [];
 
   /**
    * Prefer `createRenderer`, which links the shader for you. `shaderCode` is
@@ -595,6 +623,17 @@ export class Renderer {
         layout: canvas ? canvasPipelineLayout! : computeLayout,
         compute: { module, entryPoint: canvas ? (rgba ? "trace_canvas_rgba" : "trace_canvas_bgra") : "trace_main", constants: { 0: instances ? 1 : 0, 1: parts ? 1 : 0, 2: this.tile[0], 3: this.tile[1] } },
       });
+    this.makeTemporalPipeline = (variant, canvas) => {
+      this.temporal ??= new TemporalHistory(device, this.gridSize);
+      return device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [layout, canvas ? this.canvasLayout! : this.frameLayout, this.temporal.layout] }),
+        compute: {
+          module,
+          entryPoint: canvas ? (rgba ? "trace_temporal_rgba" : "trace_temporal_bgra") : "trace_temporal",
+          constants: { 0: variant > 0 ? 1 : 0, 1: variant === 2 ? 1 : 0, 2: this.tile[0], 3: this.tile[1] },
+        },
+      });
+    };
     this.pipelineMode = opts.pipeline ?? defaultPipeline();
     this.useCompute = this.pipelineMode !== "fragment";
     if (this.useCompute) {
@@ -785,16 +824,49 @@ export class Renderer {
    */
   setQuality(q: Partial<RenderQuality> | QualityPreset): void {
     const src = typeof q === "string" ? QUALITY_PRESETS[q] : q;
-    this.quality = {
+    const next: RenderQuality = {
       maxSteps: Math.max(16, Math.min(4096, Math.round(src.maxSteps ?? this.quality.maxSteps))),
       shadowSteps: Math.max(0, Math.min(512, Math.round(src.shadowSteps ?? this.quality.shadowSteps))),
       ao: src.ao ?? this.quality.ao,
+      temporal: src.temporal ?? this.quality.temporal,
     };
+    const q0 = this.quality;
+    if (next.maxSteps !== q0.maxSteps || next.shadowSteps !== q0.shadowSteps || next.ao !== q0.ao || next.temporal !== q0.temporal) this.resetHistory();
+    this.quality = next;
   }
 
   /** The knobs in effect (a copy). */
   getQuality(): RenderQuality {
     return { ...this.quality };
+  }
+
+  /**
+   * Whether the picture is still converging: true for a few dozen frames after the view, the
+   * lights or the scene last changed, while `RenderQuality.temporal` accumulates. A render-on-demand
+   * app renders again while it is true, for example by giving `makeFrameLoop` the option
+   * `converging: () => renderer.converging()`, or by calling `loop.invalidate()` after `render`
+   * while it holds. Always false without temporal accumulation.
+   */
+  converging(): boolean {
+    return this.temporalLast && !!this.temporal?.converging();
+  }
+
+  /** Start the temporal history over (no-op without it). */
+  private resetHistory(): void {
+    this.temporal?.reset();
+  }
+
+  /** Voxels in an inclusive box changed: temporal history around it is traced afresh. */
+  private markChanged(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): void {
+    if (this.temporal && this.quality.temporal) this.temporal.mark(x0, y0, z0, x1, y1, z1);
+  }
+
+  /** markChanged for instance boxes [from, to) of `boxes` (six numbers each). */
+  private markBoxes(boxes: Float64Array, from: number, to: number): void {
+    for (let k = from; k < to; k++) {
+      const o = k * 6;
+      this.markChanged(boxes[o], boxes[o + 1], boxes[o + 2], boxes[o + 3], boxes[o + 4], boxes[o + 5]);
+    }
   }
 
   /**
@@ -805,6 +877,7 @@ export class Renderer {
    * each primary ray took, blue (few) to red (the `maxSteps` cap).
    */
   setDebug(v: number): void {
+    if (v !== this.debugMode) this.resetHistory();
     this.debugMode = v;
   }
 
@@ -825,6 +898,8 @@ export class Renderer {
     this.materialBuffer.destroy();
     this.lightBuffer.destroy();
     this.uniformBuffer.destroy();
+    this.temporal?.destroy();
+    this.temporal = null;
   }
 
   /**
@@ -854,6 +929,8 @@ export class Renderer {
    * the box selects a region of it, it is not a standalone sub-grid.
    */
   updateVoxels(data: Uint8Array, box?: DirtyBox): void {
+    if (box) this.markChanged(box.x0, box.y0, box.z0, box.x1, box.y1, box.z1);
+    else this.resetHistory();
     this.commit(box ? this.bricks.rebuildBox(data, box) : this.bricks.rebuildAll(data));
   }
 
@@ -886,6 +963,7 @@ export class Renderer {
    * ```
    */
   edit(box: DirtyBox, fill: (cells: Uint8Array, ox: number, oy: number, oz: number) => boolean): void {
+    this.markChanged(box.x0, box.y0, box.z0, box.x1, box.y1, box.z1);
     this.commit(this.bricks.editBox(box, fill));
   }
 
@@ -912,12 +990,16 @@ export class Renderer {
   editMany(boxes: readonly DirtyBox[], fill: (cells: Uint8Array, ox: number, oy: number, oz: number) => boolean): void {
     if (!boxes.length) return;
     const edit = emptyEdit();
-    for (const box of boxes) this.bricks.editBox(box, fill, edit);
+    for (const box of boxes) {
+      this.bricks.editBox(box, fill, edit);
+      this.markChanged(box.x0, box.y0, box.z0, box.x1, box.y1, box.z1);
+    }
     this.commit(edit);
   }
 
   /** Free every brick in `box` — see BrickGrid.clearBox. */
   clear(box: DirtyBox): void {
+    this.markChanged(box.x0, box.y0, box.z0, box.x1, box.y1, box.z1);
     this.commit(this.bricks.clearBox(box));
   }
 
@@ -1037,6 +1119,8 @@ export class Renderer {
       this.rebuildDynamic();
       return;
     }
+    // A new static set can change any surface's shading: start the history over.
+    this.resetHistory();
     // Static: instances [0, n), lists [0, total), and the cell entries they give.
     const perCell = new Map<number, number[]>();
     this.staticCount = 0;
@@ -1213,6 +1297,8 @@ export class Renderer {
    */
   private rebuildDynamic(): void {
     let n = this.staticCount;
+    // Temporal history near the moving set, where it was and where it is now, is traced afresh.
+    if (this.temporal) this.markBoxes(this.instBox, this.staticCount, this.instCount);
     // Clear the moving area when it holds far more than the last moving set used (poses that are no
     // longer shown); this frame's poses are then packed afresh.
     if (this.partLen - this.staticPartLen > Math.max(1 << 16, 4 * this.movingPoseWords)) {
@@ -1238,6 +1324,7 @@ export class Renderer {
       n++;
     }
     const dynCount = n - this.staticCount;
+    if (this.temporal) this.markBoxes(this.instBox, this.staticCount, n);
     this.movingPoseWords = used;
     let at = this.staticListLen;
     const touched: number[] = [];
@@ -1613,13 +1700,29 @@ export class Renderer {
     const view = target?.view ?? this.gpu.context.getCurrentTexture().createView();
     const encoder = device.createCommandEncoder();
     this.timer?.begin();
-    // "auto" keeps frames with GPU-posed instances on the fragment path (faster for that kernel).
+    // "auto" keeps frames with GPU-posed instances on the fragment path (faster for that kernel),
+    // unless temporal accumulation is on: it lives in the compute path, and saves more than that.
     const posed = this.instCount > 0 && this.partLen > 0;
-    if (this.useCompute && !(this.pipelineMode === "auto" && posed)) {
-      this.renderCompute(encoder, view, width, height, !target);
+    const q = this.quality;
+    let temporal = q.temporal && this.useCompute && this.debugMode === 0 && (q.shadowSteps > 0 || q.ao);
+    if (temporal && this.temporal?.crowded()) {
+      // Most of the world changed for this frame: accumulating would trace everything anyway.
+      this.temporal.skip();
+      temporal = false;
+    }
+    if (temporal && !this.temporalLast) this.temporal?.reset();
+    this.temporalLast = temporal;
+    if (this.useCompute && (temporal || !(this.pipelineMode === "auto" && posed))) {
+      let group: GPUBindGroup | undefined;
+      if (temporal) {
+        this.temporal ??= new TemporalHistory(device, this.gridSize);
+        group = this.temporal.prepare(u, p.lightDir, p.lightAngle ?? 0.02, p.effectScale ?? 1, this.lightData, this.lightCount, width, height);
+      }
+      this.renderCompute(encoder, view, width, height, !target, group);
       const readC = this.timer?.resolve(encoder);
       device.queue.submit([encoder.finish()]);
       readC?.();
+      if (temporal) this.temporal!.finish();
       return;
     }
     const pass = encoder.beginRenderPass({
@@ -1646,16 +1749,20 @@ export class Renderer {
   }
 
   /** The compute path: shade into the frame texture, then present it into `view`. */
-  private renderCompute(encoder: GPUCommandEncoder, view: GPUTextureView, width: number, height: number, toCanvas: boolean): void {
+  private renderCompute(encoder: GPUCommandEncoder, view: GPUTextureView, width: number, height: number, toCanvas: boolean, temporal?: GPUBindGroup): void {
     const { device } = this.gpu;
     const variant = this.instCount > 0 ? (this.partLen > 0 ? 2 : 1) : 0;
-    if (toCanvas && this.canvasLayout) {
+    const direct = toCanvas && !!this.canvasLayout;
+    const pipe = temporal
+      ? (this.temporalPipelines[variant + (direct ? 3 : 0)] ??= this.makeTemporalPipeline!(variant, direct))
+      : (this.computePipelines[variant + (direct ? 3 : 0)] ??= this.makeComputePipeline(variant > 0, variant === 2, direct));
+    if (direct) {
       // Shade straight into the canvas: one pass.
-      const pipe = (this.computePipelines[variant + 3] ??= this.makeComputePipeline(variant > 0, variant === 2, true));
       const cp = encoder.beginComputePass({ timestampWrites: this.timer?.passWrites("trace") as GPUComputePassTimestampWrites | undefined });
       cp.setPipeline(pipe);
       cp.setBindGroup(0, this.bindGroup);
-      cp.setBindGroup(1, device.createBindGroup({ layout: this.canvasLayout, entries: [{ binding: this.canvasBinding, resource: view }] }));
+      cp.setBindGroup(1, device.createBindGroup({ layout: this.canvasLayout!, entries: [{ binding: this.canvasBinding, resource: view }] }));
+      if (temporal) cp.setBindGroup(2, temporal);
       cp.dispatchWorkgroups(Math.ceil(width / this.tile[0]), Math.ceil(height / this.tile[1]));
       cp.end();
       return;
@@ -1674,11 +1781,11 @@ export class Renderer {
         present: device.createBindGroup({ layout: this.presentLayout!, entries: [{ binding: 0, resource: tv }] }),
       };
     }
-    const pipe = (this.computePipelines[variant] ??= this.makeComputePipeline(variant > 0, variant === 2));
     const cp = encoder.beginComputePass({ timestampWrites: this.timer?.passWrites("trace") as GPUComputePassTimestampWrites | undefined });
     cp.setPipeline(pipe);
     cp.setBindGroup(0, this.bindGroup);
     cp.setBindGroup(1, this.frame.out);
+    if (temporal) cp.setBindGroup(2, temporal);
     cp.dispatchWorkgroups(Math.ceil(width / this.tile[0]), Math.ceil(height / this.tile[1]));
     cp.end();
     const pp = encoder.beginRenderPass({

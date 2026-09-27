@@ -4,20 +4,21 @@
 // (trace_main) that writes the frame into a storage texture for the present
 // pass. Imports pull in only what's used (the linker drops the rest).
 
-import package::uniforms::U;
+import package::uniforms::{U, palette};
 import package::intersect::intersectBox;
-import package::trace::traverse;
+import package::trace::{traverse, Hit};
 import package::shadow::inShadow;
 import package::ao::faceAO;
 import package::background::background;
 import package::highlight::highlightEdge;
 import package::materials::matOf;
-import package::lights::{pointLighting, lightGlow};
+import package::lights::{pointLighting, pointLightingSplit, lightGlow};
 import package::water::shadeWater;
 import package::fog::{applyFog, applySkyFog};
 import package::precip::precipitation;
 import package::shadow::occludedTo;
 import package::selftest::{selfTest, selfTest2, selfTest3};
+import package::temporal::{T, History, histOut, faceHash, sideOf, packHistory, unpackHistory, lookupHistory, changedAt, faceSample, coneDir, FLAG_HOLD, FLAG_FORCE_KEY, FLAG_FORCE_POINT, FLAG_POINT_SHADOWS};
 
 struct VsOut {
   @builtin(position) pos : vec4<f32>,
@@ -113,6 +114,203 @@ fn trace_canvas_rgba(@builtin(global_invocation_id) id : vec3<u32>) {
   textureStore(canvasRgba, id.xy, shadePixel(vec4<f32>(vec2<f32>(id.xy) + vec2<f32>(0.5), 0.0, 1.0)));
 }
 
+// The primary ray through a pixel centre: NDC `uv` in [-1, 1] (y up), origin and direction.
+struct Primary {
+  uv  : vec2<f32>,
+  ro  : vec3<f32>,
+  dir : vec3<f32>,
+};
+
+fn primaryRay(fragCoord : vec2<f32>) -> Primary {
+  var r : Primary;
+  r.uv = (fragCoord / U.resolution) * 2.0 - 1.0;
+  r.dir = normalize(
+    U.camFwd +
+    U.camRight * (r.uv.x * U.aspect * U.tanHalfFov) +
+    U.camUp * (-r.uv.y * U.tanHalfFov),
+  );
+  r.ro = U.camPos;
+  return r;
+}
+
+// --- temporal accumulation (RenderQuality.temporal; see temporal.wesl) ---------------------------
+//
+// The same shading, with the key shadow, AO and point shadows taken from the pixel's history where
+// it still sees the same face. A tile (one workgroup) traces a term when any of its pixels must
+// (no history, or a change there) or, on its turn (1 frame in T.rate), when any has not yet
+// converged; the rays cost the whole tile anyway (its lanes run in lockstep), so every pixel in a
+// tracing tile takes the sample. Converged pixels hold their value, so a still image is stable.
+
+// Bits of the terms some pixel of this tile needs traced now (1 key, 2 AO, 4 point), and those
+// wanted on the tile's turn (the same, shifted by 3).
+var<workgroup> tileNeeds : atomic<u32>;
+
+fn temporalPixel(px : vec2<u32>, tile : vec2<u32>) -> vec4<f32> {
+  // Only what the shading needs after the rays stays live across them (the hit's cell, normal,
+  // material and distance, and the raw history texel): the walks, with instance sampling inside,
+  // are where registers bind. The ray and the colour are recomputed afterwards.
+  let inside = f32(px.x) < U.resolution.x && f32(px.y) < U.resolution.y;
+  var hit = false;
+  var cell = vec3<i32>(0);
+  var nrm = vec3<f32>(0.0);
+  var mat = 0u;
+  var t = 0.0;
+  var hv = vec4<u32>(0u);
+  var hash = 0u;
+  var terms = 0u;
+  var fresh = false;
+  if (inside) {
+    let r = primaryRay(vec2<f32>(px) + vec2<f32>(0.5));
+    let box = intersectBox(r.ro, r.dir);
+    let tNear = max(box.x, 0.0);
+    if (box.y >= tNear) {
+      let h = traverse(r.ro, r.dir, tNear);
+      hit = h.hit;
+      cell = h.cell;
+      nrm = h.normal;
+      mat = h.mat;
+      t = h.t;
+    }
+    if (hit) {
+      hash = faceHash(cell, nrm);
+      hv = lookupHistory(r.ro + r.dir * t, hash, nrm);
+      fresh = hv.x == 0u || changedAt(cell);
+      // The terms this face has: a key shadow if it faces the light, AO, point shadows.
+      terms = select(0u, 1u, U.shadowSteps > 0.5 && dot(nrm, U.lightDir) > 0.0) | select(0u, 2u, U.aoEnabled > 0.5) |
+        select(0u, 4u, U.lightCount > 0.5 && (T.flags & FLAG_POINT_SHADOWS) != 0u);
+      var need = select(0u, terms, fresh);
+      need |= terms & (select(0u, 1u, (T.flags & FLAG_FORCE_KEY) != 0u) | select(0u, 4u, (T.flags & FLAG_FORCE_POINT) != 0u));
+      let open = !fresh && ((hv.z >> 26u) < u32(T.cap) || (T.flags & FLAG_HOLD) == 0u);
+      let want = select(0u, terms, open);
+      if ((need | (want << 3u)) != 0u) {
+        atomicOr(&tileNeeds, need | (want << 3u));
+      }
+    }
+  }
+  workgroupBarrier();
+  let bits = atomicLoad(&tileNeeds);
+  if (!inside) {
+    return vec4<f32>(0.0);
+  }
+  if (!hit) {
+    textureStore(histOut, px, vec4<u32>(0u));
+    let r = primaryRay(vec2<f32>(px) + vec2<f32>(0.5));
+    return vec4<f32>(missColor(r.ro, r.dir, vec2<f32>(r.uv.x, -r.uv.y)), 1.0);
+  }
+
+  let turn = (((tile.x & 1u) * 2u + (tile.y & 1u) * 3u + T.frame) % max(T.rate, 1u)) == 0u;
+  let traced = (bits | select(0u, bits >> 3u, turn)) & 7u & terms;
+  let forceKey = (T.flags & FLAG_FORCE_KEY) != 0u;
+  let forcePoint = (T.flags & FLAG_FORCE_POINT) != 0u;
+  // A pixel starting over takes the unjittered sample (today's hard shadow, exactly); the soft
+  // shadow builds up from the jittered ones after it. The face's next sample is its count; once
+  // converged (a moving light keeps sampling), the frame number.
+  let n0 = hv.z >> 26u;
+  let k = select(n0, T.frame, n0 >= u32(T.cap));
+  let hitCenter = vec3<f32>(cell) + vec3<f32>(0.5) + nrm * 0.5;
+
+  // AO: the same every sample (it has no noise); history saves the lookups.
+  var sAo = 1.0;
+  if ((traced & 2u) != 0u) {
+    sAo = faceAO(cell, nrm);
+  }
+  // Key light: visibility 0 (shadowed) .. 1.
+  var sKey = 1.0;
+  if ((traced & 1u) != 0u) {
+    let L = normalize(U.lightDir);
+    var l = L;
+    if (!fresh && !forceKey) {
+      let lj = coneDir(L, faceSample(hash, k), T.spread);
+      if (dot(nrm, lj) > 0.0) { l = lj; }
+    }
+    sKey = select(1.0, 0.0, inShadow(hitCenter, l));
+  }
+  // Point lights: shadowed over unshadowed irradiance, applied to this frame's unshadowed.
+  var jv = vec3<f32>(0.0);
+  if (!fresh && !forcePoint && (traced & 4u) != 0u) {
+    // A point on the light's sphere.
+    let v = faceSample(hash ^ 0x9e3779b9u, k);
+    let z = 2.0 * v.x - 1.0;
+    let rxy = sqrt(max(1.0 - z * z, 0.0));
+    jv = vec3<f32>(rxy * cos(6.2831853 * v.y), z, rxy * sin(6.2831853 * v.y)) * T.lampRadius;
+  }
+  let ps = pointLightingSplit(hitCenter, nrm, (traced & 4u) != 0u, jv);
+
+  // Fold the samples into the history.
+  var hist : History;
+  hist.valid = false;
+  hist.count = 0u;
+  if (hv.x != 0u) { hist = unpackHistory(hv); }
+  let blend = !fresh && (hist.count < u32(T.cap) || (T.flags & FLAG_HOLD) == 0u);
+  let count = select(min(hist.count + 1u, u32(T.cap)), 1u, fresh);
+  let w = 1.0 / f32(max(count, 1u));
+  var next : History;
+  next.valid = true;
+  next.count = select(hist.count, count, fresh || (blend && traced != 0u));
+  next.key = select(1.0, hist.key, hist.valid && (terms & 1u) != 0u);
+  if ((traced & 1u) != 0u) {
+    if (fresh || forceKey) { next.key = sKey; } else if (blend) { next.key = mix(hist.key, sKey, w); }
+  }
+  next.ao = select(1.0, hist.ao, hist.valid && (terms & 2u) != 0u);
+  if ((traced & 2u) != 0u) {
+    next.ao = sAo;
+  }
+  next.ratio = select(vec3<f32>(1.0), hist.ratio, hist.valid && (terms & 4u) != 0u);
+  if ((traced & 4u) != 0u) {
+    let s = select(vec3<f32>(1.0), ps.lit / max(ps.open, vec3<f32>(1e-6)), ps.open > vec3<f32>(1e-6));
+    if (fresh || forcePoint) { next.ratio = s; } else if (blend) { next.ratio = mix(hist.ratio, s, w); }
+  }
+  textureStore(histOut, px, packHistory(hash, t, sideOf(nrm), next));
+
+  var h : Hit;
+  h.hit = true;
+  h.cell = cell;
+  h.normal = nrm;
+  h.mat = mat;
+  h.color = palette[mat].rgb;
+  h.t = t;
+  let c = shadeHit(primaryRay(vec2<f32>(px) + vec2<f32>(0.5)), h, mix(0.6, 1.0, next.key), next.ao, ps.free + ps.open * next.ratio);
+  if (T.show > 1.5) {
+    // Development view 2: samples averaged (black none .. white converged); red where no history
+    // was found, blue where a change stamp forced a restart.
+    if (hv.x == 0u) { return vec4<f32>(1.0, 0.0, 0.0, 1.0); }
+    if (fresh) { return vec4<f32>(0.0, 0.0, 1.0, 1.0); }
+    return vec4<f32>(vec3<f32>(f32(next.count) / T.cap), 1.0);
+  }
+  if (T.show > 0.5) {
+    // Development view 1: what this tile traced, red key, green AO, blue point; white where the
+    // pixel started over.
+    let tint = vec3<f32>(f32(traced & 1u), f32((traced >> 1u) & 1u), f32((traced >> 2u) & 1u));
+    return vec4<f32>(mix(c.rgb * 0.5, select(tint, vec3<f32>(1.0), fresh), 0.5), 1.0);
+  }
+  return c;
+}
+
+// The temporal kernels, one per output as for the plain ones: the frame texture, or the canvas.
+@compute @workgroup_size(WG_X, WG_Y)
+fn trace_temporal(@builtin(global_invocation_id) id : vec3<u32>, @builtin(workgroup_id) wg : vec3<u32>) {
+  let c = temporalPixel(id.xy, wg.xy);
+  if (id.x < u32(U.resolution.x) && id.y < u32(U.resolution.y)) {
+    textureStore(frameOut, id.xy, c);
+  }
+}
+
+@compute @workgroup_size(WG_X, WG_Y)
+fn trace_temporal_bgra(@builtin(global_invocation_id) id : vec3<u32>, @builtin(workgroup_id) wg : vec3<u32>) {
+  let c = temporalPixel(id.xy, wg.xy);
+  if (id.x < u32(U.resolution.x) && id.y < u32(U.resolution.y)) {
+    textureStore(canvasBgra, id.xy, c);
+  }
+}
+
+@compute @workgroup_size(WG_X, WG_Y)
+fn trace_temporal_rgba(@builtin(global_invocation_id) id : vec3<u32>, @builtin(workgroup_id) wg : vec3<u32>) {
+  let c = temporalPixel(id.xy, wg.xy);
+  if (id.x < u32(U.resolution.x) && id.y < u32(U.resolution.y)) {
+    textureStore(canvasRgba, id.xy, c);
+  }
+}
+
 /** The colour of the pixel whose centre is `fragCoord.xy` (in pixels, as @builtin(position) gives it). */
 fn shadePixel(fragCoord : vec4<f32>) -> vec4<f32> {
   if (U.debug > 6.5 && U.debug < 7.5) {
@@ -124,14 +322,10 @@ fn shadePixel(fragCoord : vec4<f32>) -> vec4<f32> {
   if (U.debug > 8.5 && U.debug < 9.5) {
     return vec4<f32>(selfTest3(fragCoord.xy), 1.0);
   }
-  // NDC in [-1, 1], y up.
-  let uv = (fragCoord.xy / U.resolution) * 2.0 - 1.0;
-  let dir = normalize(
-    U.camFwd +
-    U.camRight * (uv.x * U.aspect * U.tanHalfFov) +
-    U.camUp * (-uv.y * U.tanHalfFov),
-  );
-  let ro = U.camPos;
+  let r = primaryRay(fragCoord.xy);
+  let uv = r.uv;
+  let dir = r.dir;
+  let ro = r.ro;
 
   let box = intersectBox(ro, dir);
   let tNear = max(box.x, 0.0);
@@ -154,7 +348,7 @@ fn shadePixel(fragCoord : vec4<f32>) -> vec4<f32> {
   let n = h.normal;
   let ndl = max(dot(n, L), 0.0);
 
-  // Soft shadow ray from just outside the hit face toward the light.
+  // Shadow ray from the centre of the hit face toward the light.
   let hitCenter = vec3<f32>(h.cell) + vec3<f32>(0.5) + n * 0.5;
   var shadow = 1.0;
   if (U.shadowSteps > 0.5 && ndl > 0.0 && inShadow(hitCenter, L)) {
@@ -165,6 +359,28 @@ fn shadePixel(fragCoord : vec4<f32>) -> vec4<f32> {
   if (U.aoEnabled > 0.5) {
     ao = faceAO(h.cell, n);
   }
+
+  // Point lights, each with its own range-limited shadow ray.
+  var point = vec3<f32>(0.0);
+  if (U.lightCount > 0.5) {
+    point = pointLighting(hitCenter, n, true);
+  }
+  return shadeHit(r, h, shadow, ao, point);
+}
+
+/**
+ * The colour of a primary hit, given its traced terms: `shadow` the key light's factor (0.6 in
+ * shadow .. 1 lit), `ao` the face occlusion (1 open) and `point` the point lights' irradiance.
+ * Everything else (ambient, materials, water, fog, weather) is evaluated here, every frame.
+ */
+fn shadeHit(r : Primary, h : Hit, shadow : f32, ao : f32, point : vec3<f32>) -> vec4<f32> {
+  let uv = r.uv;
+  let dir = r.dir;
+  let ro = r.ro;
+  let L = normalize(U.lightDir);
+  let n = h.normal;
+  let ndl = max(dot(n, L), 0.0);
+  let hitCenter = vec3<f32>(h.cell) + vec3<f32>(0.5) + n * 0.5;
 
   // Hemispheric ambient (sky above, ground bounce below) — time-of-day tinted
   // via uniforms so the scene shifts warm/day → cool/night.
@@ -197,9 +413,9 @@ fn shadePixel(fragCoord : vec4<f32>) -> vec4<f32> {
 
   // Key light tinted by the sun/moon colour.
   var color = albedo * (ambient + (ndl * 0.55 * shadow + fill) * U.lightColor) * ao;
-  // Point lights, each with its own range-limited shadow ray.
+  // Point lights (traced by the caller).
   if (U.lightCount > 0.5) {
-    color += albedo * pointLighting(hitCenter, n, true) * ao;
+    color += albedo * point * ao;
   }
   // Wet upward faces pick up a soft sheen from the key light.
   if (U.wet > 0.0 && !isWater && n.y > 0.5) {

@@ -26,6 +26,13 @@ export interface FrameLoopOptions {
   maxFps?: number;
   /** Start in continuous mode (default false). */
   continuous?: boolean;
+  /**
+   * Asked after each rendered frame: while it returns true another frame is drawn, as if
+   * `invalidate()` had been called. Pass `() => renderer.converging()` when the renderer
+   * accumulates over frames (`RenderQuality.temporal`), so the picture settles after the view
+   * stops, then the loop goes idle again.
+   */
+  converging?: () => boolean;
 }
 
 /**
@@ -80,6 +87,10 @@ export function makeFrameLoop(opts: FrameLoopOptions): FrameLoop {
     last = now;
     dirty = false;
     opts.render(now, dt);
+    if (opts.converging?.()) {
+      dirty = true;
+      schedule();
+    }
   }
 
   const loop: FrameLoop = {
