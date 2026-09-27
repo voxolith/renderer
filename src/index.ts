@@ -33,6 +33,8 @@ export type {
   ModelSource,
   Instance,
   RendererOptions,
+  RendererLoadHook,
+  RendererLoadPhase,
 } from "./renderer";
 
 // Render-on-demand loop (browser only; not part of ./core).

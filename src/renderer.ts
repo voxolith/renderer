@@ -190,6 +190,65 @@ export interface RendererOptions {
    * compare them).
    */
   pipeline?: "fragment" | "compute" | "auto";
+  /**
+   * Load reporting, for a host that times its loading (the engine's load tracker). Called
+   * synchronously with `"start"` and `"end"` around each loading step:
+   *
+   * - `"shaders"`: linking the WESL modules into WGSL in {@link createRenderer}. The linked code is
+   *   cached for every renderer on the page, so after the first one this is a short phase.
+   * - `"pipelines"`: creating the shader module (label `"module"`) and each pipeline. The label
+   *   names the variant: `"fragment"`, `"fragment+instances"`, `"fragment+parts"`, `"compute"`,
+   *   `"compute+instances"`, `"compute+parts"`, `"temporal"`, `"temporal+instances"`,
+   *   `"temporal+parts"` (compute and temporal ones end in `"+canvas"` when they write the canvas
+   *   directly) and `"present"`. The base pipelines are made in the constructor; the other variants
+   *   compile lazily, on the first frame that needs one, so their start and end land inside that
+   *   frame's `render` call.
+   *
+   * WebGPU may finish a compile asynchronously; these phases time the synchronous calls, which is
+   * where drivers usually block. A throwing hook is caught and logged once, and never breaks
+   * rendering.
+   */
+  onLoad?: RendererLoadHook;
+}
+
+/** The loading steps {@link RendererOptions.onLoad} reports. */
+export type RendererLoadPhase = "shaders" | "pipelines";
+
+/**
+ * The callback of {@link RendererOptions.onLoad}: `phase` is the step, `kind` whether it starts or
+ * ends, and `label` the variant (for `"pipelines"`, e.g. `"fragment+instances"`).
+ */
+export type RendererLoadHook = (phase: RendererLoadPhase, kind: "start" | "end", label?: string) => void;
+
+/** Hooks that threw once, so each is logged only the first time. */
+const failedLoadHooks = new WeakSet<RendererLoadHook>();
+
+/** Call a load hook, never letting it throw into loading or rendering. */
+function reportLoad(hook: RendererLoadHook, phase: RendererLoadPhase, kind: "start" | "end", label?: string): void {
+  try {
+    hook(phase, kind, label);
+  } catch (err) {
+    if (!failedLoadHooks.has(hook)) {
+      failedLoadHooks.add(hook);
+      console.error("voxolith: RendererOptions.onLoad threw (reported once)", err);
+    }
+  }
+}
+
+/** Run `make` between a start and an end report, when there is a hook. */
+function timedLoad<T>(hook: RendererLoadHook | undefined, phase: RendererLoadPhase, label: string | undefined, make: () => T): T {
+  if (!hook) return make();
+  reportLoad(hook, phase, "start", label);
+  try {
+    return make();
+  } finally {
+    reportLoad(hook, phase, "end", label);
+  }
+}
+
+/** A pipeline variant's label for RendererOptions.onLoad. */
+function variantLabel(base: string, instances: boolean, parts: boolean, canvas = false): string {
+  return base + (parts ? "+parts" : instances ? "+instances" : "") + (canvas ? "+canvas" : "");
 }
 
 /** The pipeline a renderer uses when RendererOptions.pipeline is not given. */
@@ -476,7 +535,8 @@ export class Renderer {
         // via setClipBounds, and the full grid is the safe default until then.
         [[0, 0, 0], [scene.size.x - 1, scene.size.y - 1, scene.size.z - 1]];
 
-    const module = device.createShaderModule({ code: shaderCode });
+    const onLoad = opts.onLoad;
+    const module = timedLoad(onLoad, "pipelines", "module", () => device.createShaderModule({ code: shaderCode }));
 
     // Sparse brick form of the grid. The caller's dense array stays the source
     // of truth; this is the mirror the GPU reads.
@@ -588,7 +648,7 @@ export class Renderer {
     // Instance sampling is a pipeline constant (grid.wesl INSTANCES), and so is
     // sampling instances drawn with parts (PARTS), so a scene never pays for
     // code it does not use: compiled-in code costs even when never taken.
-    this.makePipeline = (instances, parts = false) =>
+    this.makePipeline = (instances, parts = false) => timedLoad(onLoad, "pipelines", variantLabel("fragment", instances, parts), () =>
       device.createRenderPipeline({
         layout: pipelineLayout,
         vertex: { module, entryPoint: "vs" },
@@ -599,7 +659,7 @@ export class Renderer {
           constants: { 0: instances ? 1 : 0, 1: parts ? 1 : 0 },
         },
         primitive: { topology: "triangle-list" },
-      });
+      }));
     this.pipeline = this.makePipeline(false);
     this.timer = gpu.features?.has("timestamp-query") ? new GpuTimer(device) : null;
 
@@ -617,35 +677,37 @@ export class Renderer {
       ? device.createBindGroupLayout({ entries: [{ binding: this.canvasBinding, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: rgba ? "rgba8unorm" : "bgra8unorm" } }] })
       : null;
     const canvasPipelineLayout = this.canvasLayout ? device.createPipelineLayout({ bindGroupLayouts: [layout, this.canvasLayout] }) : null;
-    this.makeComputePipeline = (instances, parts = false, canvas = false) =>
+    this.makeComputePipeline = (instances, parts = false, canvas = false) => timedLoad(onLoad, "pipelines", variantLabel("compute", instances, parts, canvas), () =>
       device.createComputePipeline({
         layout: canvas ? canvasPipelineLayout! : computeLayout,
         compute: { module, entryPoint: canvas ? (rgba ? "trace_canvas_rgba" : "trace_canvas_bgra") : "trace_main", constants: { 0: instances ? 1 : 0, 1: parts ? 1 : 0, 2: this.tile[0], 3: this.tile[1] } },
-      });
+      }));
     this.makeTemporalPipeline = (variant, canvas) => {
-      this.temporal ??= new TemporalHistory(device, this.gridSize);
-      return device.createComputePipeline({
-        layout: device.createPipelineLayout({ bindGroupLayouts: [layout, canvas ? this.canvasLayout! : this.frameLayout, this.temporal.layout] }),
+      const temporal = (this.temporal ??= new TemporalHistory(device, this.gridSize));
+      return timedLoad(onLoad, "pipelines", variantLabel("temporal", variant > 0, variant === 2, canvas), () => device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [layout, canvas ? this.canvasLayout! : this.frameLayout, temporal.layout] }),
         compute: {
           module,
           entryPoint: canvas ? (rgba ? "trace_temporal_rgba" : "trace_temporal_bgra") : "trace_temporal",
           constants: { 0: variant > 0 ? 1 : 0, 1: variant === 2 ? 1 : 0, 2: this.tile[0], 3: this.tile[1] },
         },
-      });
+      }));
     };
     this.pipelineMode = opts.pipeline ?? defaultPipeline();
     this.useCompute = this.pipelineMode !== "fragment";
     if (this.useCompute) {
       this.computePipelines[this.canvasLayout ? 3 : 0] = this.makeComputePipeline(false, false, !!this.canvasLayout);
-      const presentModule = device.createShaderModule({ code: PRESENT_WGSL });
-      this.presentLayout = device.createBindGroupLayout({
+      const presentLayout = (this.presentLayout = device.createBindGroupLayout({
         entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } }],
-      });
-      this.presentPipeline = device.createRenderPipeline({
-        layout: device.createPipelineLayout({ bindGroupLayouts: [this.presentLayout] }),
-        vertex: { module: presentModule, entryPoint: "vs" },
-        fragment: { module: presentModule, entryPoint: "fs", targets: [{ format: gpu.format }] },
-        primitive: { topology: "triangle-list" },
+      }));
+      this.presentPipeline = timedLoad(onLoad, "pipelines", "present", () => {
+        const presentModule = device.createShaderModule({ code: PRESENT_WGSL });
+        return device.createRenderPipeline({
+          layout: device.createPipelineLayout({ bindGroupLayouts: [presentLayout] }),
+          vertex: { module: presentModule, entryPoint: "vs" },
+          fragment: { module: presentModule, entryPoint: "fs", targets: [{ format: gpu.format }] },
+          primitive: { topology: "triangle-list" },
+        });
       });
     }
 
@@ -1782,7 +1844,14 @@ export class Renderer {
  * ```
  */
 export async function createRenderer(gpu: GpuContext, scene: RenderScene, opts: RendererOptions = {}): Promise<Renderer> {
-  const renderer = new Renderer(gpu, scene, await raymarchShaderCode(), opts);
+  if (opts.onLoad) reportLoad(opts.onLoad, "shaders", "start");
+  let code: string;
+  try {
+    code = await raymarchShaderCode();
+  } finally {
+    if (opts.onLoad) reportLoad(opts.onLoad, "shaders", "end");
+  }
+  const renderer = new Renderer(gpu, scene, code, opts);
   // A development hook: tools (the workspace's gpu-bench) read timings from the page's renderers
   // through globalThis.__voxolithRenderers without every app wiring it up. Weak, so it keeps
   // nothing alive.
