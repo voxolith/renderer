@@ -35,6 +35,7 @@ export type {
   RendererOptions,
   RendererLoadHook,
   RendererLoadPhase,
+  PrepareNeeds,
 } from "./renderer";
 
 // Render-on-demand loop (browser only; not part of ./core).

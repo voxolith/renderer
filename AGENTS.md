@@ -21,7 +21,12 @@ exercises it (examples: orbit, world, instances, rigged, nightwood) in a WebGPU 
   - uniforms (144 words; the layout is in `shaders/uniforms.wesl`);
   - the index buffer regions (`REGIONS`: tops, blocks, cells, list, inst, models, parts, subs);
   - models and instances (`addModel`, `setInstances`, and the sub-cell tables built by `src/sublists.ts`);
-  - the fragment and compute pipelines (`pipeline: "auto"`), quality, debug modes and GPU timings.
+  - the fragment and compute pipelines (`pipeline: "auto"`), `prepare` (async warm-up of the
+    variants `render` would pick), quality, debug modes and GPU timings.
+- `src/placement.ts`: the static placement bake (`bakePlacement`, `PlacementBaker`), headless and
+  worker-safe; `setInstances` runs it inline, a host can run it in a worker and hand the result to
+  `applyPlacement`. Both must upload the same bytes (verify checks it against a mock device,
+  `tools/mock-gpu.ts`, which also loads `renderer.ts` under bun).
 - `src/sublists.ts`: the sub-cell tables of static instance cells (headless, so verify checks
   them against `sampleInstance`): which instances can draw in each 16³ sub-cell and brick, from
   each model's occupied 2³ sub-cells and the world voxel centres that sample them.

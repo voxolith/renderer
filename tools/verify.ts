@@ -9,6 +9,10 @@ import { seededRandom } from "../src/random";
 import { makePerf } from "../src/perf";
 import { buildSubLists, readSubLists, type SubListInstance } from "../src/sublists";
 import { INST_WORDS, packInstance, sampleInstance } from "../src/instance";
+import { PlacementBaker, placementTransferables } from "../src/placement";
+import { installRawLoader, mockGpu } from "./mock-gpu";
+
+const warn0 = console.warn;
 
 let failed = 0;
 let checks = 0;
@@ -321,6 +325,197 @@ console.log("\nsub-cell instance tables:");
   const shifted = check((d, t, pc, pl, m, g) => buildSubLists(d, t, pc, pl.map((p) => ({ ...p, inst: { ...p.inst, x: p.inst.x + 0.3 } })), m, g));
   const unflipped = check((d, t, pc, pl, m, g) => buildSubLists(d, t, pc, pl.map((p) => ({ ...p, inst: { ...p.inst, mirror: false } })), m, g));
   ok(shifted.unlisted > 0 && unflipped.unlisted > 0, `  and a build that misplaces them is caught (${shifted.unlisted} and ${unflipped.unlisted} cells unlisted)`);
+}
+
+console.log("\nplacement bake (the renderer against a mock device):");
+
+// The static set baked off the main thread (placementInput → a worker's PlacementBaker, through
+// structured cloning and transfer → applyPlacement) must upload exactly what setInstances does:
+// every buffer byte for byte, on a scene with dropped over-limit cells, posed instances sharing
+// poses, a removed model and a moving set on top.
+installRawLoader();
+const { Renderer } = await import("../src/renderer");
+const placementScene = await import("./placement-scene");
+{
+  const make = () => {
+    const mock = mockGpu();
+    const r = new Renderer(mock.gpu, placementScene.world(), "", { pipeline: "compute" });
+    const ids = placementScene.addModels(r);
+    return { mock, r, ids };
+  };
+  const A = make(), B = make();
+  const { staticSet, staticSet2, moving, moving2 } = placementScene.lists(A.ids);
+  const baker = new PlacementBaker();
+  const registered = new Set<number>();
+  const viaWorker = (list: typeof staticSet) => {
+    // What a host does: register models the worker lacks (once), post the input, apply the reply.
+    for (const id of B.ids.all) {
+      const m = B.r.placementModel(id);
+      if (m && !registered.has(m.key)) { baker.register(structuredClone(m)); registered.add(m.key); }
+    }
+    const bake = baker.bake(structuredClone(B.r.placementInput(list)));
+    return structuredClone(bake, { transfer: placementTransferables(bake) });
+  };
+  const same = (what: string) => {
+    let diff = -1, where = "";
+    if (A.mock.buffers.length !== B.mock.buffers.length) where = `${A.mock.buffers.length} vs ${B.mock.buffers.length} buffers`;
+    else A.mock.buffers.forEach((a, i) => {
+      const b = B.mock.buffers[i];
+      if (a.size !== b.size) { where ||= `buffer ${i}: ${a.size} vs ${b.size} bytes`; return; }
+      if (diff < 0) for (let j = 0; j < a.size; j++) if (a.bytes[j] !== b.bytes[j]) { diff = j; where = `buffer ${i} byte ${j}`; break; }
+    });
+    ok(!where, what, where);
+  };
+  A.r.setInstances(moving, { dynamic: true });
+  B.r.setInstances(moving, { dynamic: true });
+  const warn = console.warn;
+  const warned: string[] = [];
+  console.warn = (m: string) => warned.push(m);
+  A.r.setInstances(staticSet);
+  const bake1 = viaWorker(staticSet);
+  B.r.applyPlacement(bake1);
+  console.warn = warn;
+  ok(bake1.dropped > 0 && warned.length === 2 && warned[0] === warned[1], `the scene drops over-limit cell entries (${bake1.dropped}), and both paths warn alike`);
+  ok(bake1.parts.length > 0 && bake1.stats.tables > 0 && bake1.count === staticSet.length - placementScene.removedCount(staticSet, A.ids), `  it has posed instances (${bake1.parts.length} pose words), ${bake1.stats.tables} sub-cell tables and skips the removed model's instances`);
+  same("  a static set applied from a worker bake uploads the same bytes as setInstances, under a moving set");
+  A.r.setInstances(moving2, { dynamic: true });
+  B.r.setInstances(moving2, { dynamic: true });
+  same("  and a new moving set on top of it too");
+  console.warn = () => {};
+  A.r.setInstances(staticSet2);
+  B.r.applyPlacement(viaWorker(staticSet2));
+  same("  a second static set");
+  A.r.setInstances(staticSet);
+  B.r.applyPlacement(bake1);
+  console.warn = warn;
+  same("  re-applying the first bake after moving sets used it");
+  A.r.setInstances([], { dynamic: true });
+  B.r.setInstances([], { dynamic: true });
+  same("  and emptying the moving set");
+  // Progress: (0, total) first, (total, total) last, never decreasing, throttled by time; and the
+  // same bytes as a bake without it. A clock that moves 10 ms a reading makes the throttle let
+  // calls through on a scene this small (a real bake of it takes a few ms).
+  {
+    const input = structuredClone(B.r.placementInput(staticSet));
+    const plain = baker.bake(input);
+    const calls: [number, number][] = [];
+    const now = performance.now;
+    let clock = 0;
+    performance.now = () => (clock += 10);
+    let reported: typeof plain;
+    try { reported = baker.bake(input, { onProgress: (done, total) => calls.push([done, total]) }); } finally { performance.now = now; }
+    const total = calls[0]?.[1] ?? 0;
+    const bytes = (b: typeof plain) => placementTransferables(b).map((a) => new Uint8Array(a));
+    const same = bytes(plain).every((a, i) => { const b = bytes(reported)[i]; return a.length === b.length && a.every((v, j) => v === b[j]); });
+    ok(
+      calls.length > 2 && total > 0 && calls[0][0] === 0 && calls.at(-1)![0] === total && calls.every(([d, t], i) => t === total && (i === 0 || d >= calls[i - 1][0])),
+      `  bake progress runs from 0 to its fixed total (${total} units, ${calls.length} calls) and never goes back`,
+      JSON.stringify(calls.slice(0, 5)),
+    );
+    let quiet = 0;
+    performance.now = () => 0;
+    try { baker.bake(input, { onProgress: () => quiet++ }); } finally { performance.now = now; }
+    ok(same && quiet === 2, "  and changes no byte of the bake; a bake quicker than the throttle reports only its first and last call", `same ${same}, ${quiet} calls`);
+  }
+  // A bake made before a model changed must not draw the wrong model.
+  B.r.removeModel(B.ids.tree);
+  let threw = "";
+  try { B.r.applyPlacement(bake1); } catch (e) { threw = String(e); }
+  ok(threw.includes("removed or replaced"), "  applying a bake after its model was removed throws", threw);
+  let unregistered = "";
+  try { new PlacementBaker().bake(structuredClone(A.r.placementInput(staticSet))); } catch (e) { unregistered = String(e); }
+  ok(unregistered.includes("not registered"), "  baking against a model the worker lacks throws", unregistered);
+}
+
+console.log("\npipeline warm-up (prepare):");
+
+// prepare() must compile, asynchronously, every variant render() then picks, so frames after it
+// make no pipeline synchronously; whatever the pipeline mode, canvas kind, instances, poses,
+// temporal accumulation and offscreen targets.
+{
+  const frame = placementScene.frame();
+  let bad = "";
+  let cases = 0;
+  for (const mode of ["fragment", "compute", "auto"] as const)
+    for (const canvasStorage of [false, true])
+      for (const temporal of [false, true])
+      for (const deferPipelines of [false, true]) {
+        cases++;
+        const mock = mockGpu({ canvasStorage });
+        const r = new Renderer(mock.gpu, placementScene.world(), "", { pipeline: mode, deferPipelines });
+        if (deferPipelines && mock.pipelines.length && !bad) bad = `${mode}: deferPipelines still made ${mock.pipelines.length} in the constructor`;
+        const ids = placementScene.addModels(r);
+        const { staticSet, moving } = placementScene.lists(ids);
+        console.warn = () => {};
+        r.setInstances(staticSet);
+        console.warn = warn0;
+        r.setInstances(moving, { dynamic: true });
+        r.setQuality({ temporal });
+        const p = r.prepare({ target: true });
+        await mock.flush();
+        await p;
+        const made = mock.pipelines.length;
+        const target = { view: {} as GPUTextureView, width: 32, height: 24 };
+        // Posed and not, temporal and not (debug mode 1 turns it off), canvas and target.
+        for (const posed of [true, false]) {
+          r.setInstances(posed ? moving : moving.filter((m) => !m.parts), { dynamic: true });
+          for (const debug of [0, 1]) {
+            r.setDebug(debug);
+            r.render(frame);
+            r.render(frame, target);
+          }
+        }
+        r.setInstances([], { dynamic: true });
+        r.setInstances([]);
+        r.render(frame);
+        r.render(frame, target);
+        const sync = mock.pipelines.slice(made);
+        if (sync.length && !bad) bad = `${mode}, canvasStorage ${canvasStorage}, temporal ${temporal}, defer ${deferPipelines}: render made ${sync.map((q) => `${q.entry}${JSON.stringify(q.constants)}`).join(", ")}`;
+        const again = mock.pipelines.length;
+        await r.prepare({ target: true });
+        if (mock.pipelines.length !== again && !bad) bad = `${mode}: a second prepare compiled again`;
+      }
+  ok(!bad, `after prepare, render makes no pipeline in ${cases} mode, canvas, temporal and deferPipelines combinations`, bad);
+
+  // deferPipelines with a frame before prepare: the base pipelines are made synchronously, as today.
+  {
+    let fallback = "";
+    for (const mode of ["fragment", "compute", "auto"] as const)
+      for (const canvasStorage of [false, true]) {
+        const mock = mockGpu({ canvasStorage });
+        const r = new Renderer(mock.gpu, placementScene.world(), "", { pipeline: mode, deferPipelines: true });
+        r.render(frame);
+        r.render(frame, { view: {} as GPUTextureView, width: 32, height: 24 });
+        const want = mode === "fragment" ? 1 : canvasStorage ? 3 : 2; // plain [+ canvas kernel] + frame kernel + present
+        if ((mock.pipelines.length !== want || mock.pipelines.some((q) => q.async)) && !fallback) fallback = `${mode}, canvasStorage ${canvasStorage}: ${mock.pipelines.length} made`;
+        const p = r.prepare({ target: true });
+        await mock.flush();
+        await p;
+        if (mock.pipelines.length !== want && !fallback) fallback = `${mode}: prepare recompiled what render made`;
+      }
+    ok(!fallback, "  with deferPipelines, a frame before prepare makes the base pipelines synchronously, and prepare then skips them", fallback);
+  }
+
+  // Concurrent calls share compiles; a frame during a compile makes its own, and keeps it.
+  const mock = mockGpu();
+  const events: string[] = [];
+  const r = new Renderer(mock.gpu, placementScene.world(), "", { pipeline: "compute", onLoad: (ph, kind, label) => { if (ph === "pipelines") events.push(`${kind} ${label}`); } });
+  const ids = placementScene.addModels(r);
+  console.warn = () => {};
+  r.setInstances(placementScene.lists(ids).staticSet.filter((i) => !i.parts));
+  console.warn = warn0;
+  events.length = 0;
+  const base = mock.pipelines.length;
+  const p1 = r.prepare(), p2 = r.prepare();
+  r.render(frame);
+  const syncMade = mock.pipelines.length - base;
+  await mock.flush();
+  await Promise.all([p1, p2]);
+  const asyncMade = mock.pipelines.length - base - syncMade;
+  r.render(frame);
+  const used = mock.drawn[mock.drawn.length - 1];
+  ok(syncMade === 1 && asyncMade === 1 && !used.async, `two concurrent prepares compile once; a frame meanwhile compiles synchronously and keeps its pipeline (${syncMade} sync, ${asyncMade} async)`);
+  ok(events.join(" | ") === "start compute+instances | start compute+instances | end compute+instances | end compute+instances", "  onLoad reports the async compile from call to ready, beside the synchronous one", events.join(" | "));
 }
 
 console.log(`\n${failed ? `${failed} of ${checks} checks FAILED` : `ALL ${checks} CHECKS PASSED`}`);

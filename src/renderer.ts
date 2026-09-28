@@ -30,7 +30,7 @@ import { TemporalHistory } from "./temporal";
 export type { DirtyBox };
 import { BrickGrid, BrickPool, BLOCK_ENTRIES, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS, TOP_B, emptyEdit, type BrickEdit } from "./brick";
 import { sparseDims, type SparseVoxels } from "./sparse";
-import { buildSubLists, type SubListInstance } from "./sublists";
+import { MAX_CELL_INSTANCES, bakePlacement, type PlacementBake, type PlacementInput, type PlacementInstance, type PlacementModel } from "./placement";
 import { LIGHT_FLOATS, MAX_LIGHTS, packLights, type PointLight } from "./lights";
 import type { AtmosphereParams } from "./atmosphere";
 
@@ -94,8 +94,10 @@ type RegionName = "tops" | "blocks" | "cells" | "list" | "inst" | "models" | "pa
 const REGIONS: RegionName[] = ["tops", "blocks", "cells", "list", "inst", "models", "parts", "subs"];
 /** u32 words per model: top offset, top dims, size, part grid top offset + 1 (0 = no parts). */
 const MODEL_WORDS = 8;
-/** Instances per top cell list; more are dropped (with a console warning). */
-const MAX_CELL_INSTANCES = 255;
+/** The next `PlacementModel.key` / `poseKey`: unique on the page, never reused. */
+let nextPlacementKey = 1;
+/** A `poseKey` per distinct part boxes object (models passing the same one share poses). */
+const poseKeys = new WeakMap<Int32Array, number>();
 
 /** A model drawn by instances; see Renderer.addModel. */
 export interface ModelSource {
@@ -174,8 +176,8 @@ interface GpuModel {
   partTopOff?: number;
   partBoxes?: Int32Array;
   joints?: ModelSource["joints"];
-  /** The model's occupied 2³ sub-cells, as x, y, z triples (for the sub-cell lists). */
-  subs: Int32Array;
+  /** What the placement bake reads (occupied 2³ sub-cells and so on), with its registration key. */
+  placement: PlacementModel;
 }
 
 /** Options for {@link createRenderer}. */
@@ -202,13 +204,39 @@ export interface RendererOptions {
    *   `"temporal+parts"` (compute and temporal ones end in `"+canvas"` when they write the canvas
    *   directly) and `"present"`. The base pipelines are made in the constructor; the other variants
    *   compile lazily, on the first frame that needs one, so their start and end land inside that
-   *   frame's `render` call.
+   *   frame's `render` call, unless {@link Renderer.prepare} compiled them first.
    *
-   * WebGPU may finish a compile asynchronously; these phases time the synchronous calls, which is
-   * where drivers usually block. A throwing hook is caught and logged once, and never breaks
+   * WebGPU may finish a compile asynchronously; for pipelines made synchronously these phases time
+   * the calls, which return before the browser has compiled (Chrome finishes on first use). The
+   * variants {@link Renderer.prepare} compiles are reported from the call to the pipeline being
+   * ready, which is the real compile. A throwing hook is caught and logged once, and never breaks
    * rendering.
    */
   onLoad?: RendererLoadHook;
+  /**
+   * Skip creating the base pipelines in the constructor (the plain fragment pass, the plain compute
+   * kernel and the compute path's present pass), so that {@link Renderer.prepare} compiles them
+   * asynchronously with the rest, measured by `onLoad`, and a loading screen can await the whole
+   * compile. A frame rendered before `prepare` has made them creates them synchronously, as for any
+   * variant. Default false: the constructor makes them, as it always has. The shader module is still
+   * created in the constructor (every pipeline needs it, and creating it does not compile them).
+   */
+  deferPipelines?: boolean;
+}
+
+/**
+ * The pipeline variants {@link Renderer.prepare} compiles. Each field left out is taken from the
+ * renderer's current state.
+ */
+export interface PrepareNeeds {
+  /** Instances will be drawn (default: any is placed now). */
+  instances?: boolean;
+  /** Instances posed on the GPU (`Instance.parts`) will be drawn (default: a placed one is posed now). */
+  parts?: boolean;
+  /** Temporal accumulation will be on (default: `RenderQuality.temporal` now). No effect with the fragment pipeline. */
+  temporal?: boolean;
+  /** Frames will be rendered into an offscreen `RenderTarget`, not only the canvas (default false). */
+  target?: boolean;
 }
 
 /** The loading steps {@link RendererOptions.onLoad} reports. */
@@ -411,7 +439,8 @@ export interface FloorParams {
  */
 export class Renderer {
   private readonly gpu: GpuContext;
-  private readonly pipeline: GPURenderPipeline;
+  /** The plain fragment pass; null until made when `deferPipelines` is set. */
+  private pipeline: GPURenderPipeline | null = null;
   /** The same pass with instance sampling compiled in; made when a scene first places one. */
   private instancedPipeline: GPURenderPipeline | null = null;
   private partsPipeline: GPURenderPipeline | null = null;
@@ -421,6 +450,13 @@ export class Renderer {
   private readonly useCompute: boolean;
   private readonly pipelineMode: "fragment" | "compute" | "auto";
   private readonly makeComputePipeline: (instances: boolean, parts?: boolean, canvas?: boolean) => GPUComputePipeline;
+  /** Pipeline descriptors by variant, shared by the synchronous makers and `prepare`. */
+  private readonly fragmentDesc: (instances: boolean, parts: boolean) => GPURenderPipelineDescriptor;
+  private readonly computeDesc: (instances: boolean, parts: boolean, canvas: boolean) => GPUComputePipelineDescriptor;
+  private readonly temporalDesc: (variant: number, canvas: boolean) => GPUComputePipelineDescriptor;
+  private readonly onLoad: RendererLoadHook | undefined;
+  /** `prepare`'s compiles in flight, by variant key. */
+  private readonly preparing = new Map<string, Promise<void>>();
   /** Bind layout for writing the canvas directly (GpuContext.canvasStorage), else null. */
   private readonly canvasLayout: GPUBindGroupLayout | null;
   private readonly canvasBinding: number;
@@ -429,6 +465,9 @@ export class Renderer {
   private readonly frameLayout: GPUBindGroupLayout;
   private presentLayout: GPUBindGroupLayout | null = null;
   private presentPipeline: GPURenderPipeline | null = null;
+  /** The present pass's descriptor (its module made on first use), and its synchronous maker. */
+  private presentDesc: (() => GPURenderPipelineDescriptor) | null = null;
+  private makePresent: (() => GPURenderPipeline) | null = null;
   /** The compute path's frame (rgba16float), with its bind groups; remade when the size changes. */
   private frame: { tex: GPUTexture; w: number; h: number; out: GPUBindGroup; present: GPUBindGroup } | null = null;
   /** GPU time per pass, when the device has `timestamp-query`. */
@@ -473,7 +512,6 @@ export class Renderer {
   private partData = new Uint32Array(4096);
   private partLen = 0;
   private staticPartLen = 0;
-  private staticPoses = new WeakMap<object, Map<Int32Array, { off: number; box: number[] }>>();
   private movingPoses = new WeakMap<object, Map<Int32Array, { off: number; box: number[] }>>();
   /** Words of the moving area the poses shown in the last moving set use. */
   private movingPoseWords = 0;
@@ -516,7 +554,7 @@ export class Renderer {
   private temporal: TemporalHistory | null = null;
   /** Whether the last frame was rendered with temporal accumulation. */
   private temporalLast = false;
-  private makeTemporalPipeline: ((variant: number, canvas: boolean) => GPUComputePipeline) | null = null;
+  private readonly makeTemporalPipeline: (variant: number, canvas: boolean) => GPUComputePipeline;
   /** Temporal kernels by variant (as computePipelines). */
   private readonly temporalPipelines: (GPUComputePipeline | undefined)[] = [];
 
@@ -535,7 +573,7 @@ export class Renderer {
         // via setClipBounds, and the full grid is the safe default until then.
         [[0, 0, 0], [scene.size.x - 1, scene.size.y - 1, scene.size.z - 1]];
 
-    const onLoad = opts.onLoad;
+    const onLoad = (this.onLoad = opts.onLoad);
     const module = timedLoad(onLoad, "pipelines", "module", () => device.createShaderModule({ code: shaderCode }));
 
     // Sparse brick form of the grid. The caller's dense array stays the source
@@ -648,19 +686,21 @@ export class Renderer {
     // Instance sampling is a pipeline constant (grid.wesl INSTANCES), and so is
     // sampling instances drawn with parts (PARTS), so a scene never pays for
     // code it does not use: compiled-in code costs even when never taken.
+    this.fragmentDesc = (instances, parts) => ({
+      layout: pipelineLayout,
+      vertex: { module, entryPoint: "vs" },
+      fragment: {
+        module,
+        entryPoint: "fs",
+        targets: [{ format: gpu.format }],
+        constants: { 0: instances ? 1 : 0, 1: parts ? 1 : 0 },
+      },
+      primitive: { topology: "triangle-list" },
+    });
     this.makePipeline = (instances, parts = false) => timedLoad(onLoad, "pipelines", variantLabel("fragment", instances, parts), () =>
-      device.createRenderPipeline({
-        layout: pipelineLayout,
-        vertex: { module, entryPoint: "vs" },
-        fragment: {
-          module,
-          entryPoint: "fs",
-          targets: [{ format: gpu.format }],
-          constants: { 0: instances ? 1 : 0, 1: parts ? 1 : 0 },
-        },
-        primitive: { topology: "triangle-list" },
-      }));
-    this.pipeline = this.makePipeline(false);
+      device.createRenderPipeline(this.fragmentDesc(instances, parts)));
+    const defer = !!opts.deferPipelines;
+    if (!defer) this.pipeline = this.makePipeline(false);
     this.timer = gpu.features?.has("timestamp-query") ? new GpuTimer(device) : null;
 
     // The compute path: the same shading (raymarch.wesl shadePixel) in 8x8 compute tiles, written
@@ -677,38 +717,47 @@ export class Renderer {
       ? device.createBindGroupLayout({ entries: [{ binding: this.canvasBinding, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: rgba ? "rgba8unorm" : "bgra8unorm" } }] })
       : null;
     const canvasPipelineLayout = this.canvasLayout ? device.createPipelineLayout({ bindGroupLayouts: [layout, this.canvasLayout] }) : null;
+    this.computeDesc = (instances, parts, canvas) => ({
+      layout: canvas ? canvasPipelineLayout! : computeLayout,
+      compute: { module, entryPoint: canvas ? (rgba ? "trace_canvas_rgba" : "trace_canvas_bgra") : "trace_main", constants: { 0: instances ? 1 : 0, 1: parts ? 1 : 0, 2: this.tile[0], 3: this.tile[1] } },
+    });
     this.makeComputePipeline = (instances, parts = false, canvas = false) => timedLoad(onLoad, "pipelines", variantLabel("compute", instances, parts, canvas), () =>
-      device.createComputePipeline({
-        layout: canvas ? canvasPipelineLayout! : computeLayout,
-        compute: { module, entryPoint: canvas ? (rgba ? "trace_canvas_rgba" : "trace_canvas_bgra") : "trace_main", constants: { 0: instances ? 1 : 0, 1: parts ? 1 : 0, 2: this.tile[0], 3: this.tile[1] } },
-      }));
-    this.makeTemporalPipeline = (variant, canvas) => {
+      device.createComputePipeline(this.computeDesc(instances, parts, canvas)));
+    this.temporalDesc = (variant, canvas) => {
       const temporal = (this.temporal ??= new TemporalHistory(device, this.gridSize));
-      return timedLoad(onLoad, "pipelines", variantLabel("temporal", variant > 0, variant === 2, canvas), () => device.createComputePipeline({
+      return {
         layout: device.createPipelineLayout({ bindGroupLayouts: [layout, canvas ? this.canvasLayout! : this.frameLayout, temporal.layout] }),
         compute: {
           module,
           entryPoint: canvas ? (rgba ? "trace_temporal_rgba" : "trace_temporal_bgra") : "trace_temporal",
           constants: { 0: variant > 0 ? 1 : 0, 1: variant === 2 ? 1 : 0, 2: this.tile[0], 3: this.tile[1] },
         },
-      }));
+      };
+    };
+    this.makeTemporalPipeline = (variant, canvas) => {
+      // Made before the load report starts, as before: the history's layout is part of the descriptor.
+      this.temporal ??= new TemporalHistory(device, this.gridSize);
+      return timedLoad(onLoad, "pipelines", variantLabel("temporal", variant > 0, variant === 2, canvas), () => device.createComputePipeline(this.temporalDesc(variant, canvas)));
     };
     this.pipelineMode = opts.pipeline ?? defaultPipeline();
     this.useCompute = this.pipelineMode !== "fragment";
     if (this.useCompute) {
-      this.computePipelines[this.canvasLayout ? 3 : 0] = this.makeComputePipeline(false, false, !!this.canvasLayout);
+      if (!defer) this.computePipelines[this.canvasLayout ? 3 : 0] = this.makeComputePipeline(false, false, !!this.canvasLayout);
       const presentLayout = (this.presentLayout = device.createBindGroupLayout({
         entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } }],
       }));
-      this.presentPipeline = timedLoad(onLoad, "pipelines", "present", () => {
-        const presentModule = device.createShaderModule({ code: PRESENT_WGSL });
-        return device.createRenderPipeline({
+      let presentModule: GPUShaderModule | null = null;
+      this.presentDesc = () => {
+        presentModule ??= device.createShaderModule({ code: PRESENT_WGSL });
+        return {
           layout: device.createPipelineLayout({ bindGroupLayouts: [presentLayout] }),
           vertex: { module: presentModule, entryPoint: "vs" },
           fragment: { module: presentModule, entryPoint: "fs", targets: [{ format: gpu.format }] },
           primitive: { topology: "triangle-list" },
-        });
-      });
+        };
+      };
+      this.makePresent = () => timedLoad(onLoad, "pipelines", "present", () => device.createRenderPipeline(this.presentDesc!()));
+      if (!defer) this.presentPipeline = this.makePresent();
     }
 
     this.bindGroup = this.makeBindGroup();
@@ -1124,7 +1173,16 @@ export class Renderer {
     }
     let id = this.models.indexOf(null);
     if (id < 0) id = this.models.push(null) - 1;
-    this.models[id] = { grid, topOff, size: { ...src.size }, partGrid, partTopOff, partBoxes: boxes, joints: src.joints, subs: occupiedSubs(src) };
+    const placement: PlacementModel = { key: nextPlacementKey++, size: { ...src.size }, subs: occupiedSubs(src) };
+    if (boxes) {
+      let poseKey = poseKeys.get(boxes);
+      if (poseKey === undefined) poseKeys.set(boxes, (poseKey = nextPlacementKey++));
+      placement.partBoxes = boxes;
+      placement.poseKey = poseKey;
+    }
+    if (src.joints) placement.joints = src.joints;
+    this.models[id] = { grid, topOff, size: { ...src.size }, partGrid, partTopOff, partBoxes: boxes, joints: src.joints, placement };
+    this.modelsByKey.set(placement.key, this.models[id]!);
     if (this.modelData.length < (id + 1) * MODEL_WORDS) this.modelData = growU32(this.modelData, (id + 1) * MODEL_WORDS);
     const m = id * MODEL_WORDS;
     this.modelData.set([topOff, grid.topDim[0], grid.topDim[1], grid.topDim[2], src.size.x, src.size.y, src.size.z, partGrid ? partTopOff! + 1 : 0], m);
@@ -1151,6 +1209,7 @@ export class Renderer {
       m.partGrid.free();
       this.topFree.push([m.partTopOff!, m.partGrid.top.length]);
     }
+    this.modelsByKey.delete(m.placement.key);
     this.models[id] = null;
   }
 
@@ -1162,6 +1221,11 @@ export class Renderer {
    *
    * Each 64^3 top cell draws at most 255 instances; more are dropped with a
    * console warning. Instances naming a removed model are skipped.
+   *
+   * A static set blocks the main thread while its per-cell lists and sub-cell
+   * tables are built (seconds for a large fine scene). To build them in a
+   * worker instead, use `placementInput`, `bakePlacement` (or a
+   * `PlacementBaker`) and `applyPlacement`: the same bake, so the same result.
    *
    * @param list - The whole static set, or the whole moving set.
    * @param opts - `dynamic: true` for the moving set.
@@ -1180,82 +1244,128 @@ export class Renderer {
       this.rebuildDynamic();
       return;
     }
+    // The static set: the same bake a worker can run (placement.ts), here on the main thread.
+    this.applyPlacement(bakePlacement(this.placementInput(list), (key) => this.modelsByKey.get(key)?.placement));
+  }
+
+  /**
+   * What the placement bake reads about model `id`, for a worker that bakes static sets off the
+   * main thread: send it once after `addModel` (register it with a `PlacementBaker`) and drop its
+   * `key` after `removeModel`. Plain data; posting it copies `subs`, its biggest array. The
+   * returned object is the renderer's own, so don't change it.
+   *
+   * @param id - A model id from `addModel`.
+   * @returns The model's placement data, or null when there is no such model.
+   */
+  placementModel(id: number): PlacementModel | null {
+    return this.models[id]?.placement ?? null;
+  }
+
+  /**
+   * The input of `bakePlacement` for a static set: the instances' own fields (plain,
+   * structured-clone-friendly copies; instances of removed models left out), the model keys they
+   * name and this renderer's grid. Cheap (a copy of the list), so it is what the main thread does
+   * before posting a bake to a worker.
+   *
+   * @param list - The whole static set, as for `setInstances`.
+   * @returns The input; post it to a worker, or pass it to `bakePlacement` directly.
+   *
+   * @example
+   * ```ts
+   * // Main thread: register models once, then bake the static set on a worker.
+   * worker.postMessage({ type: "model", model: renderer.placementModel(treeId) });
+   * worker.postMessage({ type: "bake", id: 1, input: renderer.placementInput(trees) });
+   * worker.onmessage = ({ data }) => { renderer.applyPlacement(data.bake); loop.invalidate(); };
+   * ```
+   */
+  placementInput(list: readonly Instance[]): PlacementInput {
+    const models: number[] = [];
+    const instances: PlacementInstance[] = [];
+    for (const inst of list) {
+      const m = this.models[inst.model];
+      if (!m) continue;
+      models[inst.model] = m.placement.key;
+      const p: PlacementInstance = { model: inst.model, x: inst.x, y: inst.y, z: inst.z, base: inst.base };
+      if (inst.anchor !== undefined) p.anchor = inst.anchor;
+      if (inst.yaw !== undefined) p.yaw = inst.yaw;
+      if (inst.rotation !== undefined) p.rotation = inst.rotation;
+      if (inst.mirror !== undefined) p.mirror = inst.mirror;
+      if (inst.parts !== undefined) p.parts = inst.parts;
+      instances.push(p);
+    }
+    for (let i = 0; i < models.length; i++) models[i] ??= 0;
+    const [bx, by, bz] = this.bricks.dim, [tx, ty, tz] = this.bricks.topDim;
+    return { grid: { brickDim: [bx, by, bz], topDim: [tx, ty, tz], gridMax: Math.max(...this.gridSize) }, models, instances };
+  }
+
+  /**
+   * Replace the static set with a baked one (`bakePlacement`, on a worker or not): what
+   * `setInstances(list)` does after its bake, so the result is identical to it. The moving set
+   * stays and is redrawn on top. The renderer takes over the bake's arrays (don't reuse them); a
+   * bake can be applied again later.
+   *
+   * Throws when the bake no longer fits: another renderer's grid, or a model it names was removed
+   * or replaced since `placementInput` (bake again then).
+   *
+   * @param bake - The baked static set.
+   */
+  applyPlacement(bake: PlacementBake): void {
+    const g = bake.grid, [bx, by, bz] = this.bricks.dim, [tx, ty, tz] = this.bricks.topDim;
+    if (g.brickDim[0] !== bx || g.brickDim[1] !== by || g.brickDim[2] !== bz || g.topDim[0] !== tx || g.topDim[1] !== ty || g.topDim[2] !== tz || g.gridMax !== Math.max(...this.gridSize)) {
+      throw new Error("applyPlacement: the bake is for another grid");
+    }
+    bake.models.forEach((key, id) => {
+      if (key && this.models[id]?.placement.key !== key) throw new Error(`applyPlacement: model ${id} was removed or replaced since the bake; bake again`);
+    });
     // A new static set can change any surface's shading: start the history over.
     this.resetHistory();
-    // Static: instances [0, n), lists [0, total), and the cell entries they give.
-    const perCell = new Map<number, number[]>();
-    this.staticCount = 0;
-    // A new static set repacks the store from the start, so both areas start over.
-    this.partLen = 0;
-    this.staticPoses = new WeakMap();
+    // Static: instances [0, n), their poses first in the store, lists [0, total), and the cell
+    // entries they give. A new static set repacks the pose store from the start, so both areas
+    // start over.
+    const n = bake.count;
+    if (this.instData.length < n * INST_WORDS) this.instData = growU32(this.instData, n * INST_WORDS);
+    this.instData.set(bake.inst.subarray(0, n * INST_WORDS));
+    if (this.instBox.length < n * 6) { const nb = new Float64Array(Math.max(64, n * 12)); nb.set(this.instBox); this.instBox = nb; }
+    this.instBox.set(bake.boxes.subarray(0, n * 6));
+    this.staticCount = n;
+    if (this.partData.length < bake.parts.length) this.partData = growU32(this.partData, bake.parts.length);
+    this.partData.set(bake.parts);
+    this.partLen = this.staticPartLen = bake.parts.length;
     this.movingPoses = new WeakMap();
     this.movingPoseWords = 0;
     this.poseDirty = [];
-    const placed: Instance[] = [];
-    for (const inst of list) {
-      const k = this.writeInstance(inst, this.staticCount);
-      if (k < 0) continue;
-      placed.push(inst);
-      this.cellsOf(k, (ci) => {
-        let l = perCell.get(ci);
-        if (!l) perCell.set(ci, (l = []));
-        l.push(k);
-      });
-      this.staticCount++;
-    }
-    this.staticPartLen = this.partLen;
-    for (const ci of this.staticTouched) this.staticCells[ci] = 0;
-    this.staticTouched = [];
-    let total = 0;
-    for (const l of perCell.values()) total += Math.min(MAX_CELL_INSTANCES, l.length);
-    if (this.listData.length < total) this.listData = growU32(this.listData, total);
-    let at = 0, dropped = 0;
-    for (const [ci, l] of perCell) {
-      const n = Math.min(MAX_CELL_INSTANCES, l.length);
-      dropped += l.length - n;
-      this.staticCells[ci] = (at << 8) | n;
-      for (let i = 0; i < n; i++) this.listData[at++] = l[i];
-      this.staticTouched.push(ci);
-    }
-    if (dropped) console.warn(`setInstances: ${dropped} cell entries over the ${MAX_CELL_INSTANCES}-per-cell limit were dropped`);
-    this.buildSubLists(perCell, placed);
-    this.staticListLen = total;
+    this.staticCells.set(bake.cells);
+    if (this.listData.length < bake.list.length) this.listData = growU32(this.listData, bake.list.length);
+    this.listData.set(bake.list);
+    this.staticListLen = bake.list.length;
+    if (bake.dropped) console.warn(`setInstances: ${bake.dropped} cell entries over the ${MAX_CELL_INSTANCES}-per-cell limit were dropped`);
+    // The sub-cell tables (see sublists.ts): a sample tests only the instances that can draw in its
+    // 16³ sub-cell. Their pointer words are restored from the copy, since a moving set clears
+    // those of the cells it touches.
+    this.subData = bake.subs;
+    this.subData.set(bake.subCells);
+    this.subLen = bake.subs.length;
+    this.staticSubs = bake.subCells;
     this.cellData.set(this.staticCells);
     this.cellTouched = [];
     this.staticDirty = true;
     this.rebuildDynamic();
   }
 
-  /**
-   * Split each static cell's list by 16^3 sub-cell (4^3 per cell): a sub-cell lists only the
-   * instances that can show a voxel in it, in the cell list's order (so the first hit is the same
-   * instance), and masks which of its 8 world bricks they reach. A sample then tests a handful of
-   * instances instead of every one whose box reaches the cell, and a ray skips bricks and sub-cells
-   * nothing reaches without asking the models. What an instance reaches is found from its model's
-   * occupied 2³ sub-cells and the world voxel centres that sample them (see sublists.ts). Lists
-   * over the cell cap, and cells moving instances touch, keep their whole list.
-   */
-  private buildSubLists(perCell: Map<number, number[]>, placed: readonly Instance[]): void {
-    const input = placed.map((inst, k): SubListInstance => {
-      const m = this.models[inst.model]!;
-      return { inst, size: m.size, subs: m.subs, posedBox: inst.parts && m.partBoxes ? this.instBox.subarray(k * 6, k * 6 + 6) : undefined };
-    });
-    const built = buildSubLists(this.bricks.dim, this.bricks.topDim, perCell, input, MAX_CELL_INSTANCES, Math.max(...this.gridSize));
-    this.subData = built.data;
-    this.subLen = built.data.length;
-    this.staticSubs = built.cellWords;
-  }
-
   private dynamicList: readonly Instance[] = [];
   private staticCount = 0;
   private staticListLen = 0;
   private staticCells = new Uint32Array(0);
-  private staticTouched: number[] = [];
+  /** Every model by its `PlacementModel.key`. */
+  private readonly modelsByKey = new Map<number, GpuModel>();
   private staticDirty = false;
 
-  /** The packed pose for these part transforms of model `m`, packing it into the store the first time. */
-  private poseOf(parts: ArrayLike<number>, m: GpuModel, moving: boolean): { off: number; box: number[] } {
-    const cache = moving ? this.movingPoses : this.staticPoses;
+  /**
+   * The packed pose for these part transforms of model `m` in the moving area, packing it the first
+   * time. (The static set's poses are packed by its bake, placement.ts, the same way.)
+   */
+  private poseOf(parts: ArrayLike<number>, m: GpuModel): { off: number; box: number[] } {
+    const cache = this.movingPoses;
     const key = parts as unknown as object;
     let byBoxes = cache.get(key);
     if (!byBoxes) cache.set(key, (byBoxes = new Map()));
@@ -1273,12 +1383,12 @@ export class Renderer {
     return pose;
   }
 
-  /** Write instance `k`'s words; returns k, or -1 when its model is gone. The packing is instance.ts's, shared with the CPU sampler. */
-  private writeInstance(inst: Instance, k: number, moving = false): number {
+  /** Write moving instance `k`'s words; returns k, or -1 when its model is gone. The packing is instance.ts's, shared with the CPU sampler. */
+  private writeInstance(inst: Instance, k: number): number {
     const m = this.models[inst.model];
     if (!m) return -1;
     if (this.instData.length < (k + 1) * INST_WORDS) this.instData = growU32(this.instData, (k + 1) * INST_WORDS);
-    const pose = inst.parts && m.partBoxes ? this.poseOf(inst.parts, m, moving) : undefined;
+    const pose = inst.parts && m.partBoxes ? this.poseOf(inst.parts, m) : undefined;
     const { box } = packInstance(inst, { size: m.size, partBoxes: m.partBoxes, joints: m.joints }, inst.model, this.instData, k * INST_WORDS, pose);
     if (this.instBox.length < (k + 1) * 6) { const nb = new Float64Array(Math.max(64, (k + 1) * 12)); nb.set(this.instBox); this.instBox = nb; }
     this.instBox.set(box, k * 6);
@@ -1317,7 +1427,7 @@ export class Renderer {
     let used = 0;
     const perCell = new Map<number, number[]>();
     for (const inst of this.dynamicList) {
-      const k = this.writeInstance(inst, n, true);
+      const k = this.writeInstance(inst, n);
       if (k < 0) continue;
       if (inst.parts && !seen.has(inst.parts as unknown as object)) {
         seen.add(inst.parts as unknown as object);
@@ -1744,9 +1854,10 @@ export class Renderer {
       ],
       timestampWrites: this.timer?.passWrites("trace") as GPURenderPassTimestampWrites | undefined,
     });
-    let pipeline = this.pipeline;
+    let pipeline: GPURenderPipeline;
     if (this.instCount > 0 && this.partLen > 0) pipeline = this.partsPipeline ??= this.makePipeline(true, true);
     else if (this.instCount > 0) pipeline = this.instancedPipeline ??= this.makePipeline(true);
+    else pipeline = this.pipeline ??= this.makePipeline(false);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, this.bindGroup);
     pass.draw(3);
@@ -1756,13 +1867,130 @@ export class Renderer {
     read?.();
   }
 
+  /**
+   * Compile, ahead of use, the pipeline variants the scene will need, and resolve when they are
+   * ready. Without it, each variant beyond the base one (instances, posed instances, temporal, the
+   * offscreen kernels) is created synchronously by the first `render` that needs it, and the
+   * browser stalls that frame (or the next submit) while it compiles: seconds a variant on a
+   * software adapter. An app awaits this behind its loading screen, after placing its instances
+   * and choosing its quality; one that never calls it behaves as before.
+   *
+   * It compiles with `createRenderPipelineAsync` / `createComputePipelineAsync`, so the
+   * `RendererOptions.onLoad` `"pipelines"` phase with the variant's label runs from the call to
+   * the pipeline being ready: that is the real compile, which the synchronous calls never show.
+   *
+   * With `RendererOptions.deferPipelines` it compiles the base pipelines too (the plain fragment
+   * pass or compute kernel, and the present pass), so the whole compile can be awaited and timed.
+   *
+   * It covers what `render` can choose under the renderer's `pipeline` mode: with `"auto"` the
+   * compute kernels, plus the fragment pass for posed instances (which `auto` draws as fragments
+   * unless temporal accumulation is on); the kernels that write the canvas directly, and with
+   * `target` the ones that write an offscreen `RenderTarget`. Variants already made are skipped,
+   * and calls share compiles in flight, so calling it again (after adding posed instances,
+   * turning temporal on) costs only what is new. A frame that needs a variant still compiling
+   * does not wait for it: it compiles it synchronously, as without `prepare`, and the async
+   * result is dropped when it arrives. So await it before the first frame that needs a variant.
+   * A compile that fails rejects the promise, and `render` then tries synchronously as before.
+   *
+   * @param needs - The variants to compile. A field left out is taken from the current state:
+   *   `instances` when any instance is placed, `parts` when a placed one is posed, `temporal`
+   *   when the quality has it on; `target` defaults to false.
+   * @returns Resolves when every variant asked for is ready.
+   *
+   * @example
+   * ```ts
+   * renderer.setInstances(trees);
+   * renderer.setQuality(saved ?? "medium");
+   * await renderer.prepare({ parts: true }); // rats arrive later, posed on the GPU
+   * screen.ready();
+   * ```
+   */
+  prepare(needs: PrepareNeeds = {}): Promise<void> {
+    const instances = needs.instances ?? this.instCount > 0;
+    const parts = needs.parts ?? (this.instCount > 0 && this.partLen > 0);
+    const temporal = this.useCompute && (needs.temporal ?? this.quality.temporal);
+    const variants = [0, ...(instances ? [1] : []), ...(parts ? [2] : [])];
+    // Kernels writing the canvas directly when it allows it; with `target`, the frame-texture ones too.
+    const canvases = [...new Set([!!this.canvasLayout, ...(needs.target ? [false] : [])])];
+    const jobs: Promise<void>[] = [];
+    for (const v of variants) {
+      if (!this.useCompute) {
+        jobs.push(this.prepareVariant("fragment", v, false));
+        continue;
+      }
+      for (const canvas of canvases) {
+        // "auto" never draws posed instances with the plain compute kernel.
+        if (this.pipelineMode === "compute" || v < 2) jobs.push(this.prepareVariant("compute", v, canvas));
+        if (temporal) jobs.push(this.prepareVariant("temporal", v, canvas));
+      }
+      if (this.pipelineMode === "auto" && v === 2) jobs.push(this.prepareVariant("fragment", 2, false));
+    }
+    // The compute path's present pass, wherever a kernel writes the frame texture instead of the canvas.
+    if (this.useCompute && canvases.includes(false)) jobs.push(this.preparePresent());
+    return Promise.all(jobs).then(() => undefined);
+  }
+
+  /** prepareVariant for the present pass. */
+  private preparePresent(): Promise<void> {
+    if (this.presentPipeline) return Promise.resolve();
+    const inFlight = this.preparing.get("present");
+    if (inFlight) return inFlight;
+    const onLoad = this.onLoad;
+    if (onLoad) reportLoad(onLoad, "pipelines", "start", "present");
+    const done = this.gpu.device.createRenderPipelineAsync(this.presentDesc!()).then((p) => {
+      this.presentPipeline ??= p;
+    }).finally(() => {
+      this.preparing.delete("present");
+      if (onLoad) reportLoad(onLoad, "pipelines", "end", "present");
+    });
+    this.preparing.set("present", done);
+    return done;
+  }
+
+  /** Compile one variant asynchronously into its lazy cache, unless it is there or in flight. */
+  private prepareVariant(path: "fragment" | "compute" | "temporal", v: number, canvas: boolean): Promise<void> {
+    const slot = v + (canvas ? 3 : 0);
+    const cached = (): boolean =>
+      path === "fragment" ? !!(v === 0 ? this.pipeline : v === 1 ? this.instancedPipeline : this.partsPipeline)
+      : path === "compute" ? !!this.computePipelines[slot]
+      : !!this.temporalPipelines[slot];
+    if (cached()) return Promise.resolve();
+    const id = `${path}${slot}`;
+    const inFlight = this.preparing.get(id);
+    if (inFlight) return inFlight;
+    const { device } = this.gpu;
+    const label = variantLabel(path, v > 0, v === 2, canvas);
+    const onLoad = this.onLoad;
+    if (onLoad) reportLoad(onLoad, "pipelines", "start", label);
+    const made: Promise<void> = path === "fragment"
+      ? device.createRenderPipelineAsync(this.fragmentDesc(v > 0, v === 2)).then((p) => {
+          // A frame that needed it meanwhile made it synchronously: keep that one.
+          if (!cached()) {
+            if (v === 0) this.pipeline = p;
+            else if (v === 1) this.instancedPipeline = p;
+            else this.partsPipeline = p;
+          }
+        })
+      : device.createComputePipelineAsync(path === "compute" ? this.computeDesc(v > 0, v === 2, canvas) : this.temporalDesc(v, canvas)).then((p) => {
+          if (cached()) return;
+          if (path === "compute") this.computePipelines[slot] = p;
+          else this.temporalPipelines[slot] = p;
+        });
+    const done = made.finally(() => {
+      this.preparing.delete(id);
+      if (onLoad) reportLoad(onLoad, "pipelines", "end", label);
+    });
+    this.preparing.set(id, done);
+    return done;
+  }
+
   /** The compute path: shade into the frame texture, then present it into `view`. */
   private renderCompute(encoder: GPUCommandEncoder, view: GPUTextureView, width: number, height: number, toCanvas: boolean, temporal?: GPUBindGroup): void {
     const { device } = this.gpu;
     const variant = this.instCount > 0 ? (this.partLen > 0 ? 2 : 1) : 0;
     const direct = toCanvas && !!this.canvasLayout;
     const pipe = temporal
-      ? (this.temporalPipelines[variant + (direct ? 3 : 0)] ??= this.makeTemporalPipeline!(variant, direct))
+      ? (this.temporalPipelines[variant + (direct ? 3 : 0)] ??= this.makeTemporalPipeline(variant, direct))
       : (this.computePipelines[variant + (direct ? 3 : 0)] ??= this.makeComputePipeline(variant > 0, variant === 2, direct));
     if (direct) {
       // Shade straight into the canvas: one pass.
@@ -1800,7 +2028,7 @@ export class Renderer {
       colorAttachments: [{ view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" }],
       timestampWrites: this.timer?.passWrites("present") as GPURenderPassTimestampWrites | undefined,
     });
-    pp.setPipeline(this.presentPipeline!);
+    pp.setPipeline((this.presentPipeline ??= this.makePresent!()));
     pp.setBindGroup(0, this.frame.present);
     pp.draw(3);
     pp.end();

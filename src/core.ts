@@ -49,6 +49,10 @@ export { seededRandom, hashSeed } from "./random";
 export { INST_WORDS, PART_WORDS, POSE_HEADER, INST_MIRROR, INST_PARTS, NO_PARENT, MASK_B, MAX_PARTS, placement, packInstance, packPose, maxPoseWords, partBoxes, sampleInstance, mulAffine, invertAffine } from "./instance";
 export type { Affine, PackModel, PackInstance, SampleModel } from "./instance";
 
+// The static placement bake, worker-safe: Renderer.placementInput → bakePlacement → Renderer.applyPlacement.
+export { bakePlacement, placementTransferables, PlacementBaker } from "./placement";
+export type { PlacementModel, PlacementGrid, PlacementInstance, PlacementInput, PlacementBake, PlacementBakeOptions } from "./placement";
+
 export { GridStamper } from "./stamper";
 export type { StampVoxel } from "./stamper";
 

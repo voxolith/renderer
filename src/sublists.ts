@@ -51,7 +51,8 @@ export function sampleSlack(gridMax: number): number {
 /**
  * Build the sub-cell tables for the static cells in `perCell` (top cell index → instance indices,
  * at most `maxList` each; longer lists are not split) of a world with `brickDim` bricks and
- * `topDim` top cells, `gridMax` voxels on its longest side.
+ * `topDim` top cells, `gridMax` voxels on its longest side. `marked`, when given, is called after
+ * each instance has been marked (with its index; the marking is nearly all of the build's time).
  */
 export function buildSubLists(
   brickDim: readonly [number, number, number],
@@ -60,6 +61,7 @@ export function buildSubLists(
   placed: readonly SubListInstance[],
   maxList: number,
   gridMax: number,
+  marked?: (k: number) => void,
 ): SubLists {
   const cells = topDim[0] * topDim[1] * topDim[2];
   const [tx, ty] = topDim;
@@ -104,6 +106,7 @@ export function buildSubLists(
         // Posed: anywhere in its box.
         const b = p.posedBox;
         mark(k, b[0] - 1, b[1] - 1, b[2] - 1, b[3] + 1, b[4] + 1, b[5] + 1);
+        if (marked) marked(k);
         continue;
       }
       // Every occupied 2³ sub-cell's world box: centre = fwd · (sub-cell centre), half-extent |R| · 1.
@@ -139,6 +142,7 @@ export function buildSubLists(
               if (seenK[h] !== k || seenB[h] !== bi) markBrick(k, gx, gy, gz);
             }
       }
+      if (marked) marked(k);
     }
   }
   const data = new Uint32Array(cells + slots + n);
