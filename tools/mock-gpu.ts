@@ -26,9 +26,20 @@ export function installRawLoader(): void {
 /** A buffer that keeps its contents. */
 export interface MockBuffer {
   size: number;
+  /** `GPUBufferUsage` flags it was made with (copies check COPY_SRC / COPY_DST). */
+  usage: number;
   bytes: Uint8Array;
   destroyed: boolean;
   destroy(): void;
+}
+
+/** A buffer-to-buffer copy, recorded by a command encoder and run by `queue.submit`. */
+export interface MockCopy {
+  src: MockBuffer;
+  srcOffset: number;
+  dst: MockBuffer;
+  dstOffset: number;
+  size: number;
 }
 
 /** How a pipeline was made. */
@@ -46,6 +57,8 @@ export interface MockGpu {
   pipelines: MockPipeline[];
   /** The pipeline of every pass begun, in order. */
   drawn: MockPipeline[];
+  /** Every buffer copy submitted, in queue order. */
+  copies: MockCopy[];
   /** Resolve pending async pipeline creations (they wait for this, to model an in-flight compile). */
   flush(): Promise<void>;
 }
@@ -59,6 +72,7 @@ export function mockGpu(opts: { canvasStorage?: boolean; format?: GPUTextureForm
   const buffers: MockBuffer[] = [];
   const pipelines: MockPipeline[] = [];
   const drawn: MockPipeline[] = [];
+  const copies: MockCopy[] = [];
   let waiting: (() => void)[] = [];
   const texture = () => ({ createView: () => ({}), destroy() {} });
   const pipeline = (kind: "render" | "compute", async: boolean, d: GPURenderPipelineDescriptor | GPUComputePipelineDescriptor): MockPipeline => {
@@ -74,8 +88,8 @@ export function mockGpu(opts: { canvasStorage?: boolean; format?: GPUTextureForm
   };
   const device = {
     createShaderModule: () => ({}),
-    createBuffer: ({ size }: { size: number }) => {
-      const b: MockBuffer = { size, bytes: new Uint8Array(size), destroyed: false, destroy() { b.destroyed = true; } };
+    createBuffer: ({ size, usage }: { size: number; usage: number }) => {
+      const b: MockBuffer = { size, usage, bytes: new Uint8Array(size), destroyed: false, destroy() { b.destroyed = true; } };
       buffers.push(b);
       return b;
     },
@@ -87,9 +101,28 @@ export function mockGpu(opts: { canvasStorage?: boolean; format?: GPUTextureForm
     createComputePipeline: (d: GPUComputePipelineDescriptor) => pipeline("compute", false, d),
     createRenderPipelineAsync: (d: GPURenderPipelineDescriptor) => later(() => pipeline("render", true, d)),
     createComputePipelineAsync: (d: GPUComputePipelineDescriptor) => later(() => pipeline("compute", true, d)),
-    createCommandEncoder: () => ({ beginRenderPass: pass, beginComputePass: pass, finish: () => ({}) }),
+    // Commands run in queue order at submit, as on a real queue: after every writeBuffer made before
+    // the submit, before every one made after it. Copies are validated as WebGPU would (usage flags,
+    // 4-byte alignment, bounds, and no destroyed buffer at submit; destroying one after it is fine).
+    createCommandEncoder: () => {
+      const cmds: MockCopy[] = [];
+      return {
+        beginRenderPass: pass,
+        beginComputePass: pass,
+        copyBufferToBuffer(src: MockBuffer, srcOffset: number, dst: MockBuffer, dstOffset: number, size: number) {
+          if (size % 4 || srcOffset % 4 || dstOffset % 4) throw new Error("copyBufferToBuffer: offsets and size must be multiples of 4");
+          if (!(src.usage & 4)) throw new Error("copyBufferToBuffer: the source lacks COPY_SRC");
+          if (!(dst.usage & 8)) throw new Error("copyBufferToBuffer: the destination lacks COPY_DST");
+          if (src === dst) throw new Error("copyBufferToBuffer: source and destination are the same buffer");
+          if (srcOffset + size > src.size || dstOffset + size > dst.size) throw new Error("copyBufferToBuffer: past the end of a buffer");
+          cmds.push({ src, srcOffset, dst, dstOffset, size });
+        },
+        finish: () => ({ cmds }),
+      };
+    },
     queue: {
       writeBuffer(buf: MockBuffer, offset: number, data: ArrayBufferView, dataOffset = 0, size?: number) {
+        if (buf.destroyed) throw new Error("writeBuffer into a destroyed buffer");
         const el = (data as unknown as { BYTES_PER_ELEMENT?: number }).BYTES_PER_ELEMENT ?? 1;
         const n = size ?? (data.byteLength / el - dataOffset);
         const src = new Uint8Array(data.buffer, data.byteOffset + dataOffset * el, n * el);
@@ -97,7 +130,15 @@ export function mockGpu(opts: { canvasStorage?: boolean; format?: GPUTextureForm
         buf.bytes.set(src, offset);
       },
       writeTexture() {},
-      submit() {},
+      submit(list: { cmds?: MockCopy[] }[]) {
+        for (const cb of list) {
+          for (const c of cb.cmds ?? []) {
+            if (c.src.destroyed || c.dst.destroyed) throw new Error("submit: a copy names a buffer destroyed before the submit");
+            c.dst.bytes.set(c.src.bytes.subarray(c.srcOffset, c.srcOffset + c.size), c.dstOffset);
+            copies.push(c);
+          }
+        }
+      },
     },
   };
   const gpu = {
@@ -116,7 +157,7 @@ export function mockGpu(opts: { canvasStorage?: boolean; format?: GPUTextureForm
     canvasStorage: !!opts.canvasStorage,
   } as unknown as GpuContext;
   return {
-    gpu, buffers, pipelines, drawn,
+    gpu, buffers, pipelines, drawn, copies,
     async flush() {
       while (waiting.length) {
         const w = waiting;

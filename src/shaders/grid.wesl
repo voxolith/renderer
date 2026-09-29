@@ -8,7 +8,9 @@
 // Each world top cell lists the instances whose box touches it; a voxel the
 // world leaves empty is looked up in each of them, the world point turned
 // into the model's space. That is resampling at world voxel centres, so a
-// turned instance still reads as axis-aligned cubes, like a baked pose.
+// turned instance still reads as axis-aligned cubes, like a baked pose. A
+// model with a scale k is drawn as if upsampled k times: the cell in the
+// enlarged model's space, divided by k.
 //
 // Null entries are the empty-space skip at two sizes: a null top cell with no
 // instances skips 64 voxels, a null brick 8 (for instances, only where the
@@ -31,6 +33,8 @@ const PART_WORDS : u32 = 24u;
 const POSE_HEADER : u32 = 8u;
 const INST_MIRROR : u32 = 1u;
 const INST_PARTS : u32 = 2u;
+/** Flags bits 8-31 hold the model's scale - 1. Must match INST_SCALE_SHIFT in instance.ts. */
+const INST_SCALE_SHIFT : u32 = 8u;
 const NO_PARENT : u32 = 0xffffffffu;
 /** Brick edge of an instance's part mask grid. Must match MASK_B in instance.ts. */
 const MASK_B : i32 = 8;
@@ -43,6 +47,10 @@ const MASK_B : i32 = 8;
 // Pipeline constant: whether any instance is drawn with parts (posed on the GPU). Its own variant,
 // for the same reason: a scene of plain instances runs without the part sampling compiled in.
 @id(1) override PARTS : bool = false;
+// Pipeline constant: whether any placed instance draws a model at a scale above 1
+// (ModelOptions.scale). Its own variant too: compiled in, its few instructions in the per-sample
+// loop made render-bench frames 3-7% slower at 50 vox/m, in a scene with no scaled model at all.
+@id(4) override SCALED : bool = false;
 const MODEL_WORDS : u32 = 8u;
 
 // Index arithmetic is all unsigned: coordinates are converted once, after
@@ -294,6 +302,16 @@ fn instanceVoxelIn(r : vec2<u32>, p : vec3<i32>) -> u32 {
     }
     let size = vec3<i32>(i32(idx[mi + 4u]), i32(idx[mi + 5u]), i32(idx[mi + 6u]));
     var q = vec3<i32>(floor(toModel(k, wp)));
+    // A model drawn at scale ks: q is a cell of the model enlarged ks times (the instance's space),
+    // and the model's own is floor(q / ks). Dividing first leaves the mirror and the bounds test
+    // at the model's size exact (floor((ks size - 1 - q) / ks) = size - 1 - floor(q / ks)); a
+    // negative q goes to -1, outside either way. The scale sits in the flags word, already read.
+    if (SCALED) {
+      let ks = (flags >> INST_SCALE_SHIFT) + 1u;
+      if (ks > 1u) {
+        q = select(toI(toU(q) / ks), vec3<i32>(-1), q < vec3<i32>(0));
+      }
+    }
     // Mirrored instances flip the voxel index along x, after the turn.
     if ((flags & INST_MIRROR) != 0u) {
       q.x = size.x - 1 - q.x;
@@ -401,6 +419,14 @@ fn instanceNear(c : vec3<i32>, r : vec2<u32>) -> bool {
     let size = vec3<i32>(i32(idx[mi + 4u]), i32(idx[mi + 5u]), i32(idx[mi + 6u]));
     let bdim = (size + vec3<i32>(COARSE_B - 1)) / COARSE_B;
     var qm = toModel(k, wc);
+    // At scale ks, into the model's own voxels: the world brick then reaches at most 5.7 / ks of
+    // them from its centre, less than at scale 1, so the neighbour clamp below still covers it.
+    if (SCALED) {
+      let ks = (flags >> INST_SCALE_SHIFT) + 1u;
+      if (ks > 1u) {
+        qm = qm / f32(ks);
+      }
+    }
     if ((flags & INST_MIRROR) != 0u) {
       qm.x = f32(size.x) - qm.x;
     }

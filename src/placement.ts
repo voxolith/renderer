@@ -11,11 +11,24 @@
 // result is typed arrays that each own their buffer, so they transfer (`placementTransferables`).
 
 import { TOP_B } from "./brick";
-import { INST_WORDS, maxPoseWords, packInstance, packPose, type PackInstance } from "./instance";
-import { buildSubLists, type SubListInstance } from "./sublists";
+import { INST_MODEL, INST_WORDS, maxPoseWords, packInstance, packPose, placement, scaledSize, type PackInstance } from "./instance";
+import { buildSubLists, subPieces, type SubListInstance } from "./sublists";
 
 /** Instances per top cell list; more are dropped (with a console warning when applied). */
 export const MAX_CELL_INSTANCES = 255;
+
+/**
+ * The version of {@link PlacementBake}'s layout and meaning: the instance record and pose
+ * packing, the cell lists and the sub-cell tables, and what the bake computes from its input.
+ * A host that stores bakes (the engine's scene cache) keys them by it, so a renderer that bakes
+ * differently never applies a stored bake of an older one.
+ *
+ * Bump it whenever a bake of the same input and models would come out different: a changed
+ * word, array or field, a new one, or the same words computed another way. The renderer's
+ * verify holds a digest of a fixed scene's bake next to the version it was recorded under and
+ * fails when the bake changes and the version does not, so both are updated together.
+ */
+export const PLACEMENT_BAKE_VERSION = 1;
 
 /**
  * What the placement bake reads about one model: plain, structured-clone-friendly data. Get it
@@ -31,6 +44,11 @@ export interface PlacementModel {
   key: number;
   /** Extent in voxels. */
   size: { x: number; y: number; z: number };
+  /**
+   * The integer factor the model is drawn enlarged by (`ModelOptions.scale`); absent means 1, and
+   * the renderer leaves it out then, so a scale-1 model's data is what it was before scales.
+   */
+  scale?: number;
   /** The model's occupied 2³ sub-cells, as x, y, z triples (the biggest array; send it once). */
   subs: Int32Array;
   /** Per-part voxel boxes, for models added with parts (min x, y, z, max x, y, z each). */
@@ -172,10 +190,13 @@ export function bakePlacement(input: PlacementInput, model: (key: number) => Pla
   if (report) {
     units = new Float64Array(count);
     let marking = 0;
+    const fwd = new Float64Array(12);
     for (let k = 0; k < count; k++) {
       const p = instances[k], m = resolve(p.model);
       const { x, y, z } = m.size;
-      marking += units[k] = p.parts && m.partBoxes ? (Math.ceil(x / 8) + 2) * (Math.ceil(y / 8) + 2) * (Math.ceil(z / 8) + 2) : m.subs.length / 3;
+      // A scaled model's sub-cells are marked as pieces when turned (subPieces).
+      const pieces = m.scale && m.scale > 1 ? subPieces(placement(p, scaledSize(m.size, m.scale), fwd).fwd, m.scale) ** 3 : 1;
+      marking += units[k] = p.parts && m.partBoxes ? (Math.ceil(x / 8) + 2) * (Math.ceil(y / 8) + 2) * (Math.ceil(z / 8) + 2) : (m.subs.length / 3) * pieces;
     }
     total = count * PACK_UNITS + marking + Math.ceil(marking * FILL_SHARE);
     report(0, total);
@@ -200,9 +221,10 @@ export function bakePlacement(input: PlacementInput, model: (key: number) => Pla
   for (let k = 0; k < count; k++) {
     const p = instances[k];
     const m = resolve(p.model);
-    const pm = { size: m.size, partBoxes: m.partBoxes, joints: m.joints };
+    const pm = { size: m.size, scale: m.scale, partBoxes: m.partBoxes, joints: m.joints };
     let pose: { off: number; box: number[] } | undefined;
     if (p.parts && m.partBoxes) {
+      if ((m.scale ?? 1) !== 1) throw new Error(`bakePlacement: instance ${k} poses model ${p.model}, which is drawn at scale ${m.scale}; posing (Instance.parts) needs scale 1`);
       const key = p.parts as unknown as object;
       let byBoxes = poses.get(key);
       if (!byBoxes) poses.set(key, (byBoxes = new Map()));
@@ -218,7 +240,7 @@ export function bakePlacement(input: PlacementInput, model: (key: number) => Pla
     }
     const { box } = packInstance(p, pm, p.model, inst, k * INST_WORDS, pose);
     boxes.set(box, k * 6);
-    placed.push({ inst: p, size: m.size, subs: m.subs, posedBox: pose ? boxes.subarray(k * 6, k * 6 + 6) : undefined });
+    placed.push({ inst: p, size: m.size, scale: m.scale, subs: m.subs, posedBox: pose ? boxes.subarray(k * 6, k * 6 + 6) : undefined });
     // Every world top cell the box touches (with a voxel of slack each side).
     const cx0 = Math.max(0, Math.floor((box[0] - 1) / TOP_B)), cx1 = Math.min(tx - 1, Math.floor((box[3] + 1) / TOP_B));
     const cy0 = Math.max(0, Math.floor((box[1] - 1) / TOP_B)), cy1 = Math.min(ty - 1, Math.floor((box[4] + 1) / TOP_B));
@@ -271,6 +293,72 @@ export function bakePlacement(input: PlacementInput, model: (key: number) => Pla
 export function placementTransferables(bake: PlacementBake): ArrayBuffer[] {
   return [bake.inst, bake.boxes, bake.parts, bake.cells, bake.list, bake.subs, bake.subCells].map((a) => a.buffer);
 }
+
+/**
+ * A bake with the model ids taken out, for storing it beyond this page: every instance record
+ * names its model by order of first appearance in the static set (the first model named is 0,
+ * the next new one 1, and so on) instead of by renderer id, and `models` is empty. Nothing else
+ * in a bake depends on the ids (the lists and tables name instances by index, poses are shared
+ * by `parts` object and `poseKey` class, not by value), so this is the same for any ids the same
+ * set was baked under. Turn it back into a bake for this page's ids with {@link bindPlacement}.
+ * Normalising a normalised bake gives the same bake.
+ *
+ * @param bake - A bake from {@link bakePlacement} (or a normalised one).
+ * @returns A new bake with its own `inst` and `grid`; the other arrays are the given bake's own
+ *   (not copied), so transferring either transfers both.
+ */
+export function normalizePlacement(bake: PlacementBake): PlacementBake {
+  const inst = bake.inst.slice();
+  const canon = new Map<number, number>();
+  for (let k = 0; k < bake.count; k++) {
+    const o = k * INST_WORDS + INST_MODEL, id = inst[o];
+    let c = canon.get(id);
+    if (c === undefined) canon.set(id, (c = canon.size));
+    inst[o] = c;
+  }
+  return { ...bake, grid: copyGrid(bake.grid), models: [], inst, stats: { ...bake.stats } };
+}
+
+/**
+ * Bind a normalised bake ({@link normalizePlacement}) to the models of `input`: each record's
+ * model word becomes the renderer id the input's instance names, and `models` becomes the
+ * input's keys. The result equals, byte for byte, what {@link bakePlacement} makes of `input`,
+ * provided the input is the set the bake was made from with only its model ids and keys
+ * changed, and its models have the same placement data (size, sub-cells, part boxes, joints,
+ * and which of them share poses). A host storing bakes makes sure of that with its key (the
+ * engine's scene cache digests exactly those); this checks what it can without the models: the
+ * grid, the instance count and that the input names its models in the same pattern, and throws
+ * otherwise.
+ *
+ * @param bake - A normalised bake.
+ * @param input - The input to bind it to (from `Renderer.placementInput` on this page).
+ * @returns A new bake with its own `inst`, `grid` and `models`; the other arrays are the given
+ *   bake's own (not copied), ready for `Renderer.applyPlacement`.
+ */
+export function bindPlacement(bake: PlacementBake, input: PlacementInput): PlacementBake {
+  const g = bake.grid, h = input.grid;
+  if (g.gridMax !== h.gridMax || [0, 1, 2].some((a) => g.brickDim[a] !== h.brickDim[a] || g.topDim[a] !== h.topDim[a])) {
+    throw new Error("bindPlacement: the bake is for another grid");
+  }
+  const { instances } = input;
+  if (instances.length !== bake.count) throw new Error(`bindPlacement: the bake has ${bake.count} instances, the input ${instances.length}`);
+  const inst = bake.inst.slice();
+  const canon = new Map<number, number>();
+  for (let k = 0; k < bake.count; k++) {
+    const id = instances[k].model;
+    let c = canon.get(id);
+    if (c === undefined) {
+      if (!input.models[id]) throw new Error(`bindPlacement: an instance names model ${id}, which has no key in the input`);
+      canon.set(id, (c = canon.size));
+    }
+    const o = k * INST_WORDS + INST_MODEL;
+    if (inst[o] !== c) throw new Error(`bindPlacement: instance ${k} names model ${inst[o]} of the bake but the input's model ${c}; not a normalised bake of this set`);
+    inst[o] = id;
+  }
+  return { ...bake, grid: copyGrid(g), models: [...input.models], inst, stats: { ...bake.stats } };
+}
+
+const copyGrid = (g: PlacementGrid): PlacementGrid => ({ brickDim: [...g.brickDim], topDim: [...g.topDim], gridMax: g.gridMax });
 
 /**
  * The worker side of an off-main-thread placement: holds the models registered with it and bakes

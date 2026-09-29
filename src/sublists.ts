@@ -18,12 +18,16 @@
 // made the world page 4-12% slower.
 
 import { BRICK_B, TOP_B } from "./brick";
-import { placement, type PackInstance } from "./instance";
+import { placement, scaledSize, type PackInstance } from "./instance";
 
 /** One placed instance, as the build needs it. */
 export interface SubListInstance {
+  /** Its placement. */
   inst: PackInstance;
+  /** The model's extent in its own voxels. */
   size: { x: number; y: number; z: number };
+  /** The factor the model is drawn enlarged by (default 1). */
+  scale?: number;
   /** The model's occupied 2³ sub-cells (x, y, z triples), brick by brick (neighbours reach the same bricks). */
   subs: ArrayLike<number>;
   /** Posed instances: the world box (min x, y, z, max x, y, z); anything in it may be drawn. */
@@ -46,6 +50,22 @@ export interface SubLists {
  */
 export function sampleSlack(gridMax: number): number {
   return 1 / 64 + gridMax * 2 ** -20;
+}
+
+/**
+ * Pieces per axis each occupied sub-cell of a model drawn at `scale` is marked as, under the
+ * rotation `fwd` (a placement affine). An enlarged sub-cell is a cube 2 × scale voxels wide; its
+ * world box is exact when the rotation keeps axes (quarter turns, mirrors), but grows by up to
+ * 40% of its width under a yaw, so a turned one is split into pieces at most 8 voxels (a brick)
+ * wide, each with its own tighter box. Measured in verify's scaled scene (k = 2-10, mostly turned):
+ * 2811 sub-cell entries unsplit, 2661 with 8-voxel pieces, 2633 with 4-voxel ones at several times
+ * the marking. Not exported from the package.
+ */
+export function subPieces(fwd: ArrayLike<number>, scale: number): number {
+  if (scale === 1) return 1;
+  const a = (i: number) => Math.abs(fwd[i]);
+  const axial = [0, 4, 8].every((r) => Math.abs(a(r) + a(r + 1) + a(r + 2) - 1) < 1e-9);
+  return axial ? 1 : Math.ceil(scale / 4);
 }
 
 /**
@@ -111,15 +131,28 @@ export function buildSubLists(
       }
       // Every occupied 2³ sub-cell's world box: centre = fwd · (sub-cell centre), half-extent |R| · 1.
       // Mirroring flips the voxel index along x after the turn (see sampleInstance), so sub-cell x
-      // covers voxels size.x - 2x - 2 .. size.x - 2x - 1 before it.
-      placement(p.inst, p.size, fwd);
-      const ex = Math.abs(fwd[0]) + Math.abs(fwd[1]) + Math.abs(fwd[2]);
-      const ey = Math.abs(fwd[4]) + Math.abs(fwd[5]) + Math.abs(fwd[6]);
-      const ez = Math.abs(fwd[8]) + Math.abs(fwd[9]) + Math.abs(fwd[10]);
+      // covers voxels size.x - 2x - 2 .. size.x - 2x - 1 before it. At a scale k the instance's
+      // space is the model enlarged k times: the sub-cell is the cube of side 2k about k times its
+      // centre, marked whole or, when turned, as pieces (subPieces) of side 2k / n.
+      const ks = p.scale ?? 1;
+      placement(p.inst, scaledSize(p.size, ks), fwd);
+      const np = subPieces(fwd, ks), half = ks / np;
+      const ex = (Math.abs(fwd[0]) + Math.abs(fwd[1]) + Math.abs(fwd[2])) * half;
+      const ey = (Math.abs(fwd[4]) + Math.abs(fwd[5]) + Math.abs(fwd[6])) * half;
+      const ez = (Math.abs(fwd[8]) + Math.abs(fwd[9]) + Math.abs(fwd[10])) * half;
       const mir = !!p.inst.mirror, sxm = p.size.x;
       const subs = p.subs;
-      for (let i = 0; i < subs.length; i += 3) {
-        const mx = mir ? sxm - 2 * subs[i] - 1 : 2 * subs[i] + 1, my = 2 * subs[i + 1] + 1, mz = 2 * subs[i + 2] + 1;
+      const pieces = np * np * np;
+      // One pass per (sub-cell i, piece j): j runs through the pieces before i moves on.
+      for (let i = 0, j = 0; i < subs.length; j + 1 < pieces ? j++ : ((j = 0), (i += 3))) {
+        let mx = mir ? sxm - 2 * subs[i] - 1 : 2 * subs[i] + 1, my = 2 * subs[i + 1] + 1, mz = 2 * subs[i + 2] + 1;
+        if (ks !== 1) {
+          // Piece (a, b, c) of n³: its centre, in the enlarged model's voxels.
+          const a = j % np, b = Math.floor(j / np) % np, c = Math.floor(j / (np * np));
+          mx = ks * (mx - 1) + half * (2 * a + 1);
+          my = ks * (my - 1) + half * (2 * b + 1);
+          mz = ks * (mz - 1) + half * (2 * c + 1);
+        }
         const wx = fwd[0] * mx + fwd[1] * my + fwd[2] * mz + fwd[3];
         const wy = fwd[4] * mx + fwd[5] * my + fwd[6] * mz + fwd[7];
         const wz = fwd[8] * mx + fwd[9] * my + fwd[10] * mz + fwd[11];

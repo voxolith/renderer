@@ -23,13 +23,13 @@ import temporalWesl from "./shaders/temporal.wesl?raw";
 import raymarchWesl from "./shaders/raymarch.wesl?raw";
 import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
-import { INST_WORDS, MAX_PARTS, maxPoseWords, packInstance, packPose, partBoxes } from "./instance";
+import { INST_SCALE_SHIFT, INST_WORDS, maxPoseWords, modelScale, packInstance, packPose } from "./instance";
 import { GpuTimer } from "./timer";
 import { TemporalHistory } from "./temporal";
 
-export type { DirtyBox };
+export type { DirtyBox, ModelSource };
 import { BrickGrid, BrickPool, BLOCK_ENTRIES, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS, TOP_B, emptyEdit, type BrickEdit } from "./brick";
-import { sparseDims, type SparseVoxels } from "./sparse";
+import { ENCODED_MODEL_VERSION, encodeModel, type EncodedModel, type ModelSource } from "./encode";
 import { MAX_CELL_INSTANCES, bakePlacement, type PlacementBake, type PlacementInput, type PlacementInstance, type PlacementModel } from "./placement";
 import { LIGHT_FLOATS, MAX_LIGHTS, packLights, type PointLight } from "./lights";
 import type { AtmosphereParams } from "./atmosphere";
@@ -96,34 +96,13 @@ const REGIONS: RegionName[] = ["tops", "blocks", "cells", "list", "inst", "model
 const MODEL_WORDS = 8;
 /** The next `PlacementModel.key` / `poseKey`: unique on the page, never reused. */
 let nextPlacementKey = 1;
+// Slices of a pending model's payload (beginEncodedModel), about 1 MB each: 4-bit slots are 288
+// bytes (payload and palette), 8-bit ones 512, and an index block 2 KB rewritten entry by entry.
+const SLICE_SLOTS4 = 3640;
+const SLICE_SLOTS8 = 2048;
+const SLICE_BLOCKS = 256;
 /** A `poseKey` per distinct part boxes object (models passing the same one share poses). */
 const poseKeys = new WeakMap<Int32Array, number>();
-
-/** A model drawn by instances; see Renderer.addModel. */
-export interface ModelSource {
-  /** Extent in voxels. */
-  size: { x: number; y: number; z: number };
-  /** Dense role values, `x + y*sx + z*sx*sy`; or `sparse`. */
-  data?: Uint8Array;
-  sparse?: SparseVoxels;
-  /**
-   * Part index per voxel (dense models only), laid out like `data`: e.g. a skeleton's bone per
-   * voxel. A model with parts can be drawn with one transform per part (`Instance.parts`), posed
-   * on the GPU from this single rest model. Parts must be ordered parents first; at most 32.
-   */
-  parts?: Uint8Array;
-  /**
-   * Per part, its parent (-1 for none) and the joint where it meets it, in model voxels. Cells
-   * around a posed joint may be filled from either side, so a turned child stays attached.
-   */
-  joints?: readonly { parent: number; at: readonly [number, number, number] }[];
-  /**
-   * Per-part voxel boxes to use instead of this model's own (min x, y, z, max x, y, z each). Poses
-   * are packed per set of boxes, so copies of a model that pass the same boxes object (a creature's
-   * wounded copies, with the undamaged model's boxes, which contain theirs) share every pose.
-   */
-  partBoxes?: Int32Array;
-}
 
 /** One placement of a model: its anchor at a world position, turned about y. */
 export interface Instance {
@@ -135,7 +114,12 @@ export interface Instance {
   y: number;
   /** See `x`. */
   z: number;
-  /** Model anchor, in model voxels (default the base centre: size.x/2, 0, size.z/2). */
+  /**
+   * Model anchor, in the instance's voxels (default the base centre: size.x/2, 0, size.z/2). For a
+   * model added with a `scale` k these are the enlarged model's voxels (world resolution, k × the
+   * model's own size), so model voxel `a` has its low corner at `k · a`, and the default is k times
+   * the scale-1 default.
+   */
   anchor?: Vec3;
   /** Radians about +y; 0 leaves the model as authored. Turns pivot on the anchor voxel's centre. */
   yaw?: number;
@@ -163,8 +147,99 @@ export interface Instance {
    * Amounts of Animated Geometry" (HPG 2026, doi:10.1145/3820014), and Kao, Makowski, Fujieda and
    * Harada, "Voxel Deformation-Aware Neural Intersection Function" (EG 2026,
    * doi:10.2312/egs.20261026).
+   *
+   * Needs a model of scale 1: posing a model added with a `scale` throws.
    */
   parts?: ArrayLike<number>;
+}
+
+
+/** Options of `Renderer.addModel` and `Renderer.addEncodedModel`. */
+export interface ModelOptions {
+  /**
+   * Draw the model enlarged by this integer factor (default 1): each of its voxels covers
+   * `scale`³ world voxels, and an instance draws exactly what the model upsampled `scale` times
+   * by nearest neighbour would draw at scale 1 (the world voxel at p reads model voxel
+   * floor(q / scale), q being p's cell in the enlarged model), at any yaw, mirrored, at fractional
+   * positions, with the same shadows, AO and faces. A model built at 10 vox/m drawn in a 50 vox/m
+   * world takes 5. The instance's space is the enlarged model's, so `Instance.anchor` is in world
+   * voxels of it; the encoding is the same at any scale (scale is not part of it), so one encoding
+   * can be added at several.
+   *
+   * Instances of a scaled model cannot be posed (`Instance.parts` throws), since the posed path
+   * would need every part transform and mask grid at the enlarged size; draw it plain, or bake
+   * the pose.
+   */
+  scale?: number;
+}
+
+/**
+ * Brick counts for `Renderer.reserveBricks`: room for this many more bricks than the pools hold
+ * now, so content streamed in later (the ground of a chunked world, say) finds the pools already
+ * big enough. A brick is 8³ voxels; one with at most 15 distinct values takes a 4-bit slot, one
+ * with more an 8-bit slot, and a brick of one value throughout takes none. A good estimate is
+ * the `slots4` / `slots8` that `Renderer.stats()` reports after a comparable scene has loaded.
+ *
+ * Growing without a reservation is correct too, only more often: the pools grow by 1.5x steps,
+ * each a GPU-side copy, plus a copy of the CPU mirror whenever it doubles.
+ */
+export interface BrickReserve {
+  /** 4-bit bricks (palette of up to 15 values) to make room for. Default 0. */
+  bricks4?: number;
+  /** 8-bit bricks (more than 15 distinct values) to make room for. Default 0. */
+  bricks8?: number;
+}
+
+/**
+ * A model being added over several frames, from `Renderer.beginEncodedModel`. Its pool slots,
+ * index blocks and id are claimed at the start; `step` copies the payload into the CPU mirror and
+ * uploads it a slice at a time, and the step that finishes registers the model. Until then no
+ * instance may name its id (`setInstances` throws), and `placementModel(id)` is null.
+ *
+ * @example
+ * ```ts
+ * const pending = renderer.beginEncodedModel(encoded);
+ * const tick = () => {
+ *   if (!pending.step(4)) return void requestAnimationFrame(tick); // 4 ms a frame
+ *   renderer.setInstances([{ model: pending.id, base, x, y, z }]);
+ * };
+ * requestAnimationFrame(tick);
+ * ```
+ */
+export interface PendingModel {
+  /**
+   * Do up to `budgetMs` of the remaining work; `Infinity` finishes it. The work goes in slices of
+   * about 1 MB (0.3-0.5 ms each, measured in bun), and a step stops before a slice that would
+   * likely run past the budget (judged by the last one), but always does at least one, so a
+   * budget of 0 still progresses. The step that copies the last slice also registers the model.
+   *
+   * Throws after `cancel`.
+   *
+   * @param budgetMs - Milliseconds of main-thread time this call may use.
+   * @returns True when the model is fully added (and on every call after that).
+   */
+  step(budgetMs: number): boolean;
+  /** The model's id: valid for instances only once step() has returned true. */
+  readonly id: number;
+  /** Whether the model is fully added. */
+  readonly done: boolean;
+  /**
+   * The fraction of the model's payload copied and uploaded so far, by bytes (brick payloads,
+   * palettes and index blocks), from 0 at `beginEncodedModel` to 1 once done. It never goes
+   * back, and is a fair measure of the time left: an index block costs about 1.7 times as much
+   * per byte as a brick payload (its entries are rewritten), and blocks come last. After `cancel`
+   * it stays where it was.
+   */
+  readonly progress: number;
+  /**
+   * Give up: frees what was claimed. The id is not used. With nothing claimed in the pools since
+   * `beginEncodedModel`, the pools are as if it had never begun (the same slot counts, free lists
+   * and words at every slot in use; free slots it had reused keep what was copied into them, which
+   * nothing reads); otherwise its slots and blocks go onto the free lists. The pools' spare
+   * capacity and the index buffer's layout stay as `beginEncodedModel` grew them. A no-op once
+   * done (remove a finished model with `removeModel`) or cancelled.
+   */
+  cancel(): void;
 }
 
 interface GpuModel {
@@ -176,6 +251,8 @@ interface GpuModel {
   partTopOff?: number;
   partBoxes?: Int32Array;
   joints?: ModelSource["joints"];
+  /** The factor it is drawn enlarged by (`ModelOptions.scale`). */
+  scale: number;
   /** What the placement bake reads (occupied 2³ sub-cells and so on), with its registration key. */
   placement: PlacementModel;
 }
@@ -201,8 +278,9 @@ export interface RendererOptions {
    * - `"pipelines"`: creating the shader module (label `"module"`) and each pipeline. The label
    *   names the variant: `"fragment"`, `"fragment+instances"`, `"fragment+parts"`, `"compute"`,
    *   `"compute+instances"`, `"compute+parts"`, `"temporal"`, `"temporal+instances"`,
-   *   `"temporal+parts"` (compute and temporal ones end in `"+canvas"` when they write the canvas
-   *   directly) and `"present"`. The base pipelines are made in the constructor; the other variants
+   *   `"temporal+parts"` (the instanced ones followed by `"+scaled"` when a placed instance draws a
+   *   model at a scale above 1, and compute and temporal ones ending in `"+canvas"` when they write
+   *   the canvas directly) and `"present"`. The base pipelines are made in the constructor; the other variants
    *   compile lazily, on the first frame that needs one, so their start and end land inside that
    *   frame's `render` call, unless {@link Renderer.prepare} compiled them first.
    *
@@ -237,6 +315,11 @@ export interface PrepareNeeds {
   temporal?: boolean;
   /** Frames will be rendered into an offscreen `RenderTarget`, not only the canvas (default false). */
   target?: boolean;
+  /**
+   * Instances of models added with a `scale` above 1 will be drawn (default: a placed one is now).
+   * Their sampling is a variant of its own, so a scene without them does not pay for it.
+   */
+  scaled?: boolean;
 }
 
 /** The loading steps {@link RendererOptions.onLoad} reports. */
@@ -274,9 +357,21 @@ function timedLoad<T>(hook: RendererLoadHook | undefined, phase: RendererLoadPha
   }
 }
 
+// Pipeline variants by number: 0 plain, 1 instances, 2 instances with parts, and + 3 with scaled
+// models compiled in (grid.wesl SCALED; 4 and 5, never 3). Compute and temporal kernels that write
+// the canvas directly are at + 6 in their caches.
+/** Whether variant `v` samples instances (grid.wesl INSTANCES). */
+const vInstances = (v: number) => v % 3 > 0;
+/** Whether variant `v` samples posed instances (PARTS). */
+const vParts = (v: number) => v % 3 === 2;
+/** Whether variant `v` samples scaled models (SCALED). */
+const vScaled = (v: number) => v >= 3;
+/** The pipeline constants of variant `v` (the ids of grid.wesl's overrides). */
+const vConstants = (v: number): Record<number, number> => ({ 0: vInstances(v) ? 1 : 0, 1: vParts(v) ? 1 : 0, 4: vScaled(v) ? 1 : 0 });
+
 /** A pipeline variant's label for RendererOptions.onLoad. */
-function variantLabel(base: string, instances: boolean, parts: boolean, canvas = false): string {
-  return base + (parts ? "+parts" : instances ? "+instances" : "") + (canvas ? "+canvas" : "");
+function variantLabel(base: string, v: number, canvas = false): string {
+  return base + (vParts(v) ? "+parts" : vInstances(v) ? "+instances" : "") + (vScaled(v) ? "+scaled" : "") + (canvas ? "+canvas" : "");
 }
 
 /** The pipeline a renderer uses when RendererOptions.pipeline is not given. */
@@ -439,20 +534,21 @@ export interface FloorParams {
  */
 export class Renderer {
   private readonly gpu: GpuContext;
-  /** The plain fragment pass; null until made when `deferPipelines` is set. */
-  private pipeline: GPURenderPipeline | null = null;
-  /** The same pass with instance sampling compiled in; made when a scene first places one. */
-  private instancedPipeline: GPURenderPipeline | null = null;
-  private partsPipeline: GPURenderPipeline | null = null;
+  /**
+   * The fragment pass by variant (see vConstants): the plain one (undefined until made when
+   * `deferPipelines` is set), and the ones with instance sampling compiled in, made when a scene
+   * first needs one.
+   */
+  private readonly fragmentPipelines: (GPURenderPipeline | undefined)[] = [];
   /** Compute tile (workgroup) size in pixels. Tuning hook: globalThis.__voxolithTile = [x, y]. */
   private readonly tile: [number, number] = ((globalThis as { __voxolithTile?: [number, number] }).__voxolithTile ?? [8, 8]);
   /** Shading in a compute pass instead of the fragment stage (RendererOptions.pipeline). */
   private readonly useCompute: boolean;
   private readonly pipelineMode: "fragment" | "compute" | "auto";
-  private readonly makeComputePipeline: (instances: boolean, parts?: boolean, canvas?: boolean) => GPUComputePipeline;
+  private readonly makeComputePipeline: (variant: number, canvas: boolean) => GPUComputePipeline;
   /** Pipeline descriptors by variant, shared by the synchronous makers and `prepare`. */
-  private readonly fragmentDesc: (instances: boolean, parts: boolean) => GPURenderPipelineDescriptor;
-  private readonly computeDesc: (instances: boolean, parts: boolean, canvas: boolean) => GPUComputePipelineDescriptor;
+  private readonly fragmentDesc: (variant: number) => GPURenderPipelineDescriptor;
+  private readonly computeDesc: (variant: number, canvas: boolean) => GPUComputePipelineDescriptor;
   private readonly temporalDesc: (variant: number, canvas: boolean) => GPUComputePipelineDescriptor;
   private readonly onLoad: RendererLoadHook | undefined;
   /** `prepare`'s compiles in flight, by variant key. */
@@ -460,7 +556,7 @@ export class Renderer {
   /** Bind layout for writing the canvas directly (GpuContext.canvasStorage), else null. */
   private readonly canvasLayout: GPUBindGroupLayout | null;
   private readonly canvasBinding: number;
-  /** By variant: 0 plain, 1 instances, 2 instances with parts; +3 for the canvas-writing kernels. */
+  /** By variant (see vConstants); + 6 for the canvas-writing kernels. */
   private readonly computePipelines: (GPUComputePipeline | undefined)[] = [];
   private readonly frameLayout: GPUBindGroupLayout;
   private presentLayout: GPUBindGroupLayout | null = null;
@@ -472,7 +568,7 @@ export class Renderer {
   private frame: { tex: GPUTexture; w: number; h: number; out: GPUBindGroup; present: GPUBindGroup } | null = null;
   /** GPU time per pass, when the device has `timestamp-query`. */
   private readonly timer: GpuTimer | null;
-  private readonly makePipeline: (instances: boolean, parts?: boolean) => GPURenderPipeline;
+  private readonly makePipeline: (variant: number) => GPURenderPipeline;
   private readonly uniformBuffer: GPUBuffer;
   private readonly uniformData = new Float32Array(UNIFORM_FLOATS);
   private bindGroup: GPUBindGroup;
@@ -496,6 +592,8 @@ export class Renderer {
   private readonly topTexture: GPUTexture;
   private layout: Record<RegionName, { off: number; cap: number }>;
   private models: (GpuModel | null)[] = [];
+  /** Ids claimed by `beginEncodedModel` models not done yet (their `models` entry is still null). */
+  private readonly pendingIds = new Set<number>();
   private modelData = new Uint32Array(MODEL_WORDS * 16);
   /** Free ranges of the tops region after the world's own top level: [offset, length]. */
   private topFree: [number, number][] = [];
@@ -533,6 +631,8 @@ export class Renderer {
   private brickVox8: GPUBuffer;
   private slotCap4 = 0;
   private slotCap8 = 0;
+  /** How many times the GPU pools were reallocated (verify and benchmarks read it). */
+  private poolGrowths = 0;
   private readonly bindLayout: GPUBindGroupLayout;
   private materialBuffer: GPUBuffer;
   private readonly lightBuffer: GPUBuffer;
@@ -579,6 +679,9 @@ export class Renderer {
     // Sparse brick form of the grid. The caller's dense array stays the source
     // of truth; this is the mirror the GPU reads.
     this.pool = new BrickPool();
+    // The CPU mirror never outgrows what the GPU pools could hold, and past it claims throw the
+    // same error as the pools would (named after the limit to raise).
+    this.pool.setSlotLimits(this.poolSlotLimit(BRICK_WORDS_4), this.poolSlotLimit(BRICK_WORDS_8), (s4, s8) => this.poolFitError(s4, s8) ?? new Error("brick pool limit"));
     this.bricks = new BrickGrid(scene.size, scene.data, this.pool);
     this.coarseDim = [...this.bricks.dim] as Vec3;
     this.topEnd = this.bricks.top.length;
@@ -683,24 +786,25 @@ export class Renderer {
     this.bindLayout = layout;
 
     const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] });
-    // Instance sampling is a pipeline constant (grid.wesl INSTANCES), and so is
-    // sampling instances drawn with parts (PARTS), so a scene never pays for
-    // code it does not use: compiled-in code costs even when never taken.
-    this.fragmentDesc = (instances, parts) => ({
+    // Instance sampling is a pipeline constant (grid.wesl INSTANCES), and so are
+    // sampling instances drawn with parts (PARTS) and scaled models (SCALED), so
+    // a scene never pays for code it does not use: compiled-in code costs even
+    // when never taken.
+    this.fragmentDesc = (v) => ({
       layout: pipelineLayout,
       vertex: { module, entryPoint: "vs" },
       fragment: {
         module,
         entryPoint: "fs",
         targets: [{ format: gpu.format }],
-        constants: { 0: instances ? 1 : 0, 1: parts ? 1 : 0 },
+        constants: vConstants(v),
       },
       primitive: { topology: "triangle-list" },
     });
-    this.makePipeline = (instances, parts = false) => timedLoad(onLoad, "pipelines", variantLabel("fragment", instances, parts), () =>
-      device.createRenderPipeline(this.fragmentDesc(instances, parts)));
+    this.makePipeline = (v) => timedLoad(onLoad, "pipelines", variantLabel("fragment", v), () =>
+      device.createRenderPipeline(this.fragmentDesc(v)));
     const defer = !!opts.deferPipelines;
-    if (!defer) this.pipeline = this.makePipeline(false);
+    if (!defer) this.fragmentPipelines[0] = this.makePipeline(0);
     this.timer = gpu.features?.has("timestamp-query") ? new GpuTimer(device) : null;
 
     // The compute path: the same shading (raymarch.wesl shadePixel) in 8x8 compute tiles, written
@@ -717,12 +821,12 @@ export class Renderer {
       ? device.createBindGroupLayout({ entries: [{ binding: this.canvasBinding, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: rgba ? "rgba8unorm" : "bgra8unorm" } }] })
       : null;
     const canvasPipelineLayout = this.canvasLayout ? device.createPipelineLayout({ bindGroupLayouts: [layout, this.canvasLayout] }) : null;
-    this.computeDesc = (instances, parts, canvas) => ({
+    this.computeDesc = (v, canvas) => ({
       layout: canvas ? canvasPipelineLayout! : computeLayout,
-      compute: { module, entryPoint: canvas ? (rgba ? "trace_canvas_rgba" : "trace_canvas_bgra") : "trace_main", constants: { 0: instances ? 1 : 0, 1: parts ? 1 : 0, 2: this.tile[0], 3: this.tile[1] } },
+      compute: { module, entryPoint: canvas ? (rgba ? "trace_canvas_rgba" : "trace_canvas_bgra") : "trace_main", constants: { ...vConstants(v), 2: this.tile[0], 3: this.tile[1] } },
     });
-    this.makeComputePipeline = (instances, parts = false, canvas = false) => timedLoad(onLoad, "pipelines", variantLabel("compute", instances, parts, canvas), () =>
-      device.createComputePipeline(this.computeDesc(instances, parts, canvas)));
+    this.makeComputePipeline = (v, canvas) => timedLoad(onLoad, "pipelines", variantLabel("compute", v, canvas), () =>
+      device.createComputePipeline(this.computeDesc(v, canvas)));
     this.temporalDesc = (variant, canvas) => {
       const temporal = (this.temporal ??= new TemporalHistory(device, this.gridSize));
       return {
@@ -730,19 +834,19 @@ export class Renderer {
         compute: {
           module,
           entryPoint: canvas ? (rgba ? "trace_temporal_rgba" : "trace_temporal_bgra") : "trace_temporal",
-          constants: { 0: variant > 0 ? 1 : 0, 1: variant === 2 ? 1 : 0, 2: this.tile[0], 3: this.tile[1] },
+          constants: { ...vConstants(variant), 2: this.tile[0], 3: this.tile[1] },
         },
       };
     };
     this.makeTemporalPipeline = (variant, canvas) => {
       // Made before the load report starts, as before: the history's layout is part of the descriptor.
       this.temporal ??= new TemporalHistory(device, this.gridSize);
-      return timedLoad(onLoad, "pipelines", variantLabel("temporal", variant > 0, variant === 2, canvas), () => device.createComputePipeline(this.temporalDesc(variant, canvas)));
+      return timedLoad(onLoad, "pipelines", variantLabel("temporal", variant, canvas), () => device.createComputePipeline(this.temporalDesc(variant, canvas)));
     };
     this.pipelineMode = opts.pipeline ?? defaultPipeline();
     this.useCompute = this.pipelineMode !== "fragment";
     if (this.useCompute) {
-      if (!defer) this.computePipelines[this.canvasLayout ? 3 : 0] = this.makeComputePipeline(false, false, !!this.canvasLayout);
+      if (!defer) this.computePipelines[this.canvasLayout ? 6 : 0] = this.makeComputePipeline(0, !!this.canvasLayout);
       const presentLayout = (this.presentLayout = device.createBindGroupLayout({
         entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } }],
       }));
@@ -767,13 +871,20 @@ export class Renderer {
 
   /**
    * Resident voxel memory, for benchmarks and budgeting. `dense` is what the
-   * same grid would have cost as one 3D texture.
+   * same grid would have cost as one 3D texture. `slots4` / `slots8` are the
+   * brick payload slots claimed in the pools (world and models together, freed
+   * ones included), the counts `reserveBricks({ bricks4, bricks8 })` makes room
+   * for; `cap4` / `cap8` are how many the GPU pools hold now.
    */
-  stats(): { bricks: number; wide: number; bytes: number; dense: number } {
+  stats(): { bricks: number; wide: number; bytes: number; dense: number; slots4: number; slots8: number; cap4: number; cap8: number } {
     const st = this.bricks.stats();
     return {
       bricks: st.used,
       wide: st.wide,
+      slots4: this.pool.slots4,
+      slots8: this.pool.slots8,
+      cap4: this.slotCap4,
+      cap8: this.slotCap8,
       bytes:
         this.slotCap4 * (BRICK_WORDS_4 + PALETTE_WORDS) * 4 +
         this.slotCap8 * BRICK_WORDS_8 * 4 +
@@ -1125,6 +1236,7 @@ export class Renderer {
    * models are reused.
    *
    * @param src - Size plus dense `data` or `sparse` bricks.
+   * @param opts - The scale it is drawn at ({@link ModelOptions}).
    * @returns The id an `Instance` names in `model`.
    *
    * @example
@@ -1138,65 +1250,261 @@ export class Renderer {
    * ]);
    * ```
    */
-  addModel(src: ModelSource): number {
-    if (src.parts && !src.data) throw new Error("addModel: parts need a dense model (data)");
-    const grid = new BrickGrid(src.size, undefined, this.pool);
-    const edit = emptyEdit();
-    if (src.sparse) {
-      const [dx, dy] = sparseDims(src.size);
-      for (const [key, cells] of src.sparse.bricks) {
-        const bx = key % dx, by = Math.floor(key / dx) % dy, bz = Math.floor(key / (dx * dy));
-        const e = this.pool.encode(0, cells, edit);
-        if (e) grid.setEntry(bx, by, bz, e, edit);
-      }
-    } else if (src.data) {
-      const g = grid.rebuildAll(src.data);
-      for (const k of ["slots4", "slots8", "blocks", "tops"] as const) for (const v of g[k]) edit[k].push(v);
-    }
-    grid.markNear(edit);
+  addModel(src: ModelSource, opts?: ModelOptions): number {
+    if (opts?.scale !== undefined) modelScale(src.size, opts.scale);
+    return this.addEncodedModel(encodeModel(src), opts);
+  }
+
+  /**
+   * Add a model encoded by `encodeModel` (on a worker, say): what `addModel` does after its
+   * encode, so the result is identical to `addModel(src)`, and the id is the one it would return.
+   * The main-thread part is only claiming pool slots, copying the payload in and uploading it.
+   * The renderer takes over the model's arrays (don't reuse them; `subs` becomes the placement
+   * model's).
+   *
+   * Throws on an encoding of another `ENCODED_MODEL_VERSION` (a stale cache entry).
+   *
+   * @param e - The encoded model (structured-cloned or transferred is fine).
+   * @param opts - The scale it is drawn at ({@link ModelOptions}).
+   * @returns The id an `Instance` names in `model`.
+   *
+   * @example
+   * ```ts
+   * worker.postMessage({ id: 1, model: { size: model.size, sparse: model.sparse } });
+   * worker.onmessage = ({ data }) => {
+   *   const tree = renderer.addEncodedModel(data.encoded);
+   *   renderer.setInstances([{ model: tree, base: bark, x: 40, y: 12, z: 60 }]);
+   * };
+   * ```
+   */
+  addEncodedModel(e: EncodedModel, opts?: ModelOptions): number {
+    const pending = this.startModel("addEncodedModel", e, opts);
+    pending.step(Infinity);
+    return pending.id;
+  }
+
+  /**
+   * `addEncodedModel` spread over several frames, for a model big enough that copying and
+   * uploading it at once would stall one (a fine tree at 100 vox/m: 70-94 ms). The pool slots,
+   * index blocks, top-level entries and the id are claimed now, exactly as `addEncodedModel` would
+   * claim them here; each `step(budgetMs)` then copies and uploads slices of the payload (about
+   * 1 MB each) until its budget is spent, and the step that finishes registers the model, so the
+   * result is byte-identical to `addEncodedModel` called at this point. `addEncodedModel` is this
+   * plus `step(Infinity)`.
+   *
+   * Between steps anything else may run: other adds (pending or not), edits, `reserveBricks`,
+   * `removeModel`, `setInstances` of other models, and pool growth, which keeps the slices already
+   * uploaded (the GPU-side copy covers every claimed slot). An instance naming the id before it is
+   * done makes `setInstances` throw. `cancel()` gives everything back.
+   *
+   * Throws on an encoding of another `ENCODED_MODEL_VERSION`, claiming nothing.
+   *
+   * @param e - The encoded model; the renderer takes over its arrays, as for `addEncodedModel`
+   *   (don't change them while it is pending).
+   * @param opts - The scale it is drawn at ({@link ModelOptions}).
+   * @returns The pending model: step it, then name its `id` in instances.
+   *
+   * @example
+   * ```ts
+   * const pending = renderer.beginEncodedModel(data.encoded);
+   * const tick = () => {
+   *   if (!pending.step(4)) return void requestAnimationFrame(tick); // 4 ms a frame
+   *   renderer.setInstances([{ model: pending.id, base: bark, x: 40, y: 12, z: 60 }]);
+   *   loop.invalidate();
+   * };
+   * requestAnimationFrame(tick);
+   * ```
+   */
+  beginEncodedModel(e: EncodedModel, opts?: ModelOptions): PendingModel {
+    return this.startModel("beginEncodedModel", e, opts);
+  }
+
+  /** The claims of `beginEncodedModel` (`name` is the caller, for errors), and the pending model that fills them. */
+  private startModel(name: string, e: EncodedModel, opts: ModelOptions | undefined): PendingModel {
+    if (e.version !== ENCODED_MODEL_VERSION) throw new Error(`${name}: encoding version ${e.version}, this renderer reads ${ENCODED_MODEL_VERSION}; encode again`);
+    const size = { x: e.size.x, y: e.size.y, z: e.size.z };
+    const scale = modelScale(size, opts?.scale);
+    const pool = this.pool;
+    const grid = new BrickGrid(size, undefined, pool);
+    const partGrid = e.partTop ? new BrickGrid(size, undefined, pool) : undefined;
+    if (e.top.length !== grid.top.length || (partGrid && e.partTop!.length !== partGrid.top.length)) throw new Error(`${name}: the top level does not match the model's size`);
+    const claim = pool.claimFor(e), blocks = claim.blocks;
+    const local = (from: Uint32Array, to: Uint32Array) => { for (let i = 0; i < from.length; i++) to[i] = from[i] ? blocks[from[i] - 1] + 1 : 0; };
+    local(e.top, grid.top);
+    const topsBefore = { free: this.topFree.map(([o, n]): [number, number] => [o, n]), end: this.topEnd };
     const topOff = this.claimTops(grid.top.length);
-    // Parts: a second grid of part index + 1 in the same pool, beside the roles (both are 8-bit).
-    let partGrid: BrickGrid | undefined, partTopOff: number | undefined, boxes: Int32Array | undefined;
-    if (src.parts && src.data) {
-      const ids = new Uint8Array(src.data.length);
-      let count = 0;
-      for (let i = 0; i < ids.length; i++) if (src.data[i]) { ids[i] = src.parts[i] + 1; count = Math.max(count, src.parts[i] + 1); }
-      partGrid = new BrickGrid(src.size, undefined, this.pool);
-      const g = partGrid.rebuildAll(ids);
-      for (const k of ["slots4", "slots8", "blocks", "tops"] as const) for (const v of g[k]) edit[k].push(v);
+    let partTopOff: number | undefined;
+    if (partGrid) {
+      local(e.partTop!, partGrid.top);
       partTopOff = this.claimTops(partGrid.top.length);
-      const parts = Math.max(count, src.joints?.length ?? 0);
-      // Each brick of a posed instance keeps a 32-bit mask of the parts in it (see instance.ts).
-      if (parts > MAX_PARTS) throw new Error(`addModel: at most ${MAX_PARTS} parts can be posed on the GPU (this model has ${parts})`);
-      // Given boxes (a superset, e.g. the undamaged model's) let damaged copies share poses.
-      boxes = src.partBoxes ?? partBoxes(src.size, src.data, src.parts, parts);
     }
-    let id = this.models.indexOf(null);
-    if (id < 0) id = this.models.push(null) - 1;
-    const placement: PlacementModel = { key: nextPlacementKey++, size: { ...src.size }, subs: occupiedSubs(src) };
+    const topsAfter = JSON.stringify([this.topFree, this.topEnd]);
+    const boxes = e.partTop ? e.partBoxes : undefined;
+    const pushed = this.models.length;
+    const id = this.freeModelId();
+    const placement: PlacementModel = { key: nextPlacementKey++, size: { ...size }, subs: e.subs };
+    if (scale !== 1) placement.scale = scale;
     if (boxes) {
       let poseKey = poseKeys.get(boxes);
       if (poseKey === undefined) poseKeys.set(boxes, (poseKey = nextPlacementKey++));
       placement.partBoxes = boxes;
       placement.poseKey = poseKey;
     }
-    if (src.joints) placement.joints = src.joints;
-    this.models[id] = { grid, topOff, size: { ...src.size }, partGrid, partTopOff, partBoxes: boxes, joints: src.joints, placement };
-    this.modelsByKey.set(placement.key, this.models[id]!);
+    if (e.joints) placement.joints = e.joints;
+    const model: GpuModel = { grid, topOff, size: { ...size }, partGrid, partTopOff, partBoxes: boxes, joints: e.joints, scale, placement };
     if (this.modelData.length < (id + 1) * MODEL_WORDS) this.modelData = growU32(this.modelData, (id + 1) * MODEL_WORDS);
-    const m = id * MODEL_WORDS;
-    this.modelData.set([topOff, grid.topDim[0], grid.topDim[1], grid.topDim[2], src.size.x, src.size.y, src.size.z, partGrid ? partTopOff! + 1 : 0], m);
-    const grewPools = this.growPools();
-    if (this.ensureLayout() || grewPools) {
-      this.uploadIndexAll();
-      return id;
+    this.pendingIds.add(id);
+    // Room for every claim now, so each slice only writes: the pools and the index regions are
+    // big enough from here on (they never shrink).
+    this.growPools();
+    if (this.ensureLayout()) this.uploadIndexAll();
+
+    // The work, in slices: 4-bit slots, then 8-bit slots, then index blocks.
+    const counts = [claim.slots4.length, claim.slots8.length, blocks.length];
+    const sliceOf = [SLICE_SLOTS4, SLICE_SLOTS8, SLICE_BLOCKS];
+    const parts = ["4", "8", "blocks"] as const;
+    // Bytes copied per item, for `progress`: payload and palette, payload, index block.
+    const itemBytes = [(BRICK_WORDS_4 + PALETTE_WORDS) * 4, BRICK_WORDS_8 * 4, BLOCK_ENTRIES * 4];
+    const total = counts[0] * itemBytes[0] + counts[1] * itemBytes[1] + counts[2] * itemBytes[2];
+    let copied = 0;
+    let part = 0, at = 0, state: "pending" | "done" | "cancelled" = "pending";
+    const slice = () => {
+      while (part < 3 && at >= counts[part]) { part++; at = 0; }
+      if (part === 3) return;
+      const end = Math.min(counts[part], at + sliceOf[part]);
+      pool.copyIn(e, claim, parts[part], at, end);
+      if (part === 0) this.uploadSlots(claim.slots4.subarray(at, end), []);
+      else if (part === 1) this.uploadSlots([], claim.slots8.subarray(at, end));
+      else this.uploadBlocks(blocks.subarray(at, end));
+      copied += (end - at) * itemBytes[part];
+      at = end;
+      while (part < 3 && at >= counts[part]) { part++; at = 0; }
+    };
+    const finish = () => {
+      state = "done";
+      this.pendingIds.delete(id);
+      this.models[id] = model;
+      this.modelsByKey.set(placement.key, model);
+      const m = id * MODEL_WORDS;
+      this.modelData.set([topOff, grid.topDim[0], grid.topDim[1], grid.topDim[2], size.x, size.y, size.z, partGrid ? partTopOff! + 1 : 0], m);
+      this.writeRegion("tops", topOff, grid.top, 0, grid.top.length);
+      if (partGrid) this.writeRegion("tops", partTopOff!, partGrid.top, 0, partGrid.top.length);
+      this.writeRegion("models", m, this.modelData, m, MODEL_WORDS);
+    };
+    const cancel = () => {
+      if (state !== "pending") return;
+      state = "cancelled";
+      this.pendingIds.delete(id);
+      const { zeroed4, zeroed8 } = pool.unclaim(claim);
+      // The GPU pools past the claimed slots hold zeros, as the mirror now does again.
+      const [a4, b4] = zeroed4, [a8, b8] = zeroed8, q = this.gpu.device.queue;
+      if (b4 > a4) {
+        q.writeBuffer(this.brickVox4, a4 * BRICK_WORDS_4 * 4, pool.voxels4, a4 * BRICK_WORDS_4, (b4 - a4) * BRICK_WORDS_4);
+        q.writeBuffer(this.brickPal, a4 * PALETTE_WORDS * 4, pool.palettes, a4 * PALETTE_WORDS, (b4 - a4) * PALETTE_WORDS);
+      }
+      if (b8 > a8) q.writeBuffer(this.brickVox8, a8 * BRICK_WORDS_8 * 4, pool.voxels8, a8 * BRICK_WORDS_8, (b8 - a8) * BRICK_WORDS_8);
+      // The blocks uploaded so far, now zeroed (as freed blocks are on the CPU).
+      if (part === 2) this.uploadBlocks(blocks.subarray(0, at));
+      else if (part === 3) this.uploadBlocks(blocks);
+      // Top-level entries and the id: as before, when nothing claimed any since.
+      if (JSON.stringify([this.topFree, this.topEnd]) === topsAfter) {
+        this.topFree = topsBefore.free;
+        this.topEnd = topsBefore.end;
+      } else {
+        if (partGrid) this.topFree.push([partTopOff!, partGrid.top.length]);
+        this.topFree.push([topOff, grid.top.length]);
+      }
+      if (id === pushed && id === this.models.length - 1) this.models.pop();
+    };
+    return {
+      get id() { return id; },
+      get done() { return state === "done"; },
+      get progress() { return state === "done" ? 1 : total ? copied / total : 0; },
+      step(budgetMs: number): boolean {
+        if (state === "cancelled") throw new Error(`PendingModel.step: model ${id} was cancelled`);
+        if (state === "done") return true;
+        // Stop before a slice that would likely run past the budget (the last one's time), but do
+        // at least one, so every call progresses.
+        const t0 = performance.now();
+        let t = t0, last = 0;
+        do {
+          slice();
+          const now = performance.now();
+          last = now - t;
+          t = now;
+        } while (part < 3 && t - t0 + last <= budgetMs);
+        if (part < 3) return false;
+        finish();
+        return true;
+      },
+      cancel,
+    };
+  }
+
+  /** The lowest id no model holds and no pending model has claimed (a new one past the end otherwise). */
+  private freeModelId(): number {
+    for (let i = 0; i < this.models.length; i++) if (this.models[i] === null && !this.pendingIds.has(i)) return i;
+    return this.models.push(null) - 1;
+  }
+
+  /** The error for an instance naming model `id` while it is pending, or undefined. */
+  private pendingError(id: number, where: string): Error | undefined {
+    return this.pendingIds.has(id) ? new Error(`${where}: model ${id} is still being added (beginEncodedModel); step it until done first`) : undefined;
+  }
+
+  /**
+   * Grow the brick pools once, before the edits or adds that will fill them. Growing a pool
+   * copies it GPU-side into a bigger buffer (no re-upload, see {@link BrickReserve}), but the CPU
+   * mirror still reallocates and copies itself, and for a moment the GPU holds the old buffer and
+   * the new one; reserved up front, that happens once, while the pools are still small, instead of
+   * at every 1.5x step while the scene streams in.
+   *
+   * Two forms:
+   * - a batch of encoded models (from `encodeModel`, on a worker, say): room for all of their
+   *   bricks, ahead of their `addEncodedModel` calls; nothing of the batch is kept;
+   * - brick counts, `{ bricks4, bricks8 }`: room for that many more 4-bit and 8-bit bricks than
+   *   are claimed now, for content that is not encoded yet (the ground a streamed world will
+   *   edit in, say).
+   *
+   * Freed slots that later claims will reuse are not counted, so it may reserve a little more
+   * than they take. What differs from not reserving is only the pools' spare capacity: the GPU
+   * brick pools and their CPU mirrors are bigger, and hold the same words at every claimed slot
+   * (zeros past them). Model ids, the index buffer and everything drawn are the same. The
+   * headroom (1.5x, as the pools grow anyway) is capped at the device's storage binding and buffer
+   * size limits, so a reservation that fits exactly still succeeds; one that does not fit throws.
+   * A no-op when the pools already have room.
+   *
+   * @param want - The batch of encoded models, or the brick counts to make room for.
+   *
+   * @example
+   * ```ts
+   * const batch = await Promise.all(sources.map((src) => encodeOnWorker(src)));
+   * renderer.reserveBricks(batch);
+   * const ids = batch.map((e) => renderer.addEncodedModel(e)); // one per frame is fine too
+   *
+   * // Room for the ground a streamed world is about to edit in.
+   * renderer.reserveBricks({ bricks4: 400_000, bricks8: 20_000 });
+   * ```
+   */
+  reserveBricks(want: readonly EncodedModel[] | BrickReserve): void {
+    let n4 = 0, n8 = 0;
+    if (Array.isArray(want)) {
+      for (const e of want as readonly EncodedModel[]) {
+        n4 += e.voxels4.length / BRICK_WORDS_4;
+        n8 += e.voxels8.length / BRICK_WORDS_8;
+      }
+    } else {
+      const r = want as BrickReserve;
+      n4 = r.bricks4 ?? 0;
+      n8 = r.bricks8 ?? 0;
+      if (!(Number.isInteger(n4) && n4 >= 0 && Number.isInteger(n8) && n8 >= 0)) throw new Error(`reserveBricks: brick counts must be whole numbers >= 0 (got bricks4 ${n4}, bricks8 ${n8})`);
     }
-    this.uploadSlots(edit.slots4, edit.slots8);
-    this.uploadBlocks(edit.blocks);
-    this.writeRegion("tops", topOff, grid.top, 0, grid.top.length);
-    if (partGrid) this.writeRegion("tops", partTopOff!, partGrid.top, 0, partGrid.top.length);
-    this.writeRegion("models", m, this.modelData, m, MODEL_WORDS);
-    return id;
+    const need4 = this.pool.slots4 + n4, need8 = this.pool.slots8 + n8;
+    this.pool.reserve(need4, need8);
+    const grow4 = need4 > this.slotCap4, grow8 = need8 > this.slotCap8;
+    if (!grow4 && !grow8) return;
+    const fit = (need: number, words: number) => Math.max(need, Math.min(Math.ceil(need * 1.5), this.poolSlotLimit(words)));
+    this.resizePools(grow4 ? fit(need4, BRICK_WORDS_4) : this.slotCap4, grow8 ? fit(need8, BRICK_WORDS_8) : this.slotCap8);
   }
 
   /** Free a model's bricks. Instances still naming it must be replaced first. */
@@ -1283,7 +1591,11 @@ export class Renderer {
     const instances: PlacementInstance[] = [];
     for (const inst of list) {
       const m = this.models[inst.model];
-      if (!m) continue;
+      if (!m) {
+        const err = this.pendingError(inst.model, "setInstances");
+        if (err) throw err;
+        continue;
+      }
       models[inst.model] = m.placement.key;
       const p: PlacementInstance = { model: inst.model, x: inst.x, y: inst.y, z: inst.z, base: inst.base };
       if (inst.anchor !== undefined) p.anchor = inst.anchor;
@@ -1315,6 +1627,8 @@ export class Renderer {
       throw new Error("applyPlacement: the bake is for another grid");
     }
     bake.models.forEach((key, id) => {
+      const err = key ? this.pendingError(id, "applyPlacement") : undefined;
+      if (err) throw err;
       if (key && this.models[id]?.placement.key !== key) throw new Error(`applyPlacement: model ${id} was removed or replaced since the bake; bake again`);
     });
     // A new static set can change any surface's shading: start the history over.
@@ -1328,6 +1642,8 @@ export class Renderer {
     if (this.instBox.length < n * 6) { const nb = new Float64Array(Math.max(64, n * 12)); nb.set(this.instBox); this.instBox = nb; }
     this.instBox.set(bake.boxes.subarray(0, n * 6));
     this.staticCount = n;
+    this.staticScaled = false;
+    for (let k = 0; k < n && !this.staticScaled; k++) this.staticScaled = bake.inst[k * INST_WORDS + 14] >>> INST_SCALE_SHIFT !== 0;
     if (this.partData.length < bake.parts.length) this.partData = growU32(this.partData, bake.parts.length);
     this.partData.set(bake.parts);
     this.partLen = this.staticPartLen = bake.parts.length;
@@ -1386,10 +1702,15 @@ export class Renderer {
   /** Write moving instance `k`'s words; returns k, or -1 when its model is gone. The packing is instance.ts's, shared with the CPU sampler. */
   private writeInstance(inst: Instance, k: number): number {
     const m = this.models[inst.model];
-    if (!m) return -1;
+    if (!m) {
+      const err = this.pendingError(inst.model, "setInstances");
+      if (err) throw err;
+      return -1;
+    }
     if (this.instData.length < (k + 1) * INST_WORDS) this.instData = growU32(this.instData, (k + 1) * INST_WORDS);
+    if (inst.parts && m.partBoxes && m.scale !== 1) throw new Error(`setInstances: model ${inst.model} is drawn at scale ${m.scale}; posing (Instance.parts) needs scale 1`);
     const pose = inst.parts && m.partBoxes ? this.poseOf(inst.parts, m) : undefined;
-    const { box } = packInstance(inst, { size: m.size, partBoxes: m.partBoxes, joints: m.joints }, inst.model, this.instData, k * INST_WORDS, pose);
+    const { box } = packInstance(inst, { size: m.size, scale: m.scale, partBoxes: m.partBoxes, joints: m.joints }, inst.model, this.instData, k * INST_WORDS, pose);
     if (this.instBox.length < (k + 1) * 6) { const nb = new Float64Array(Math.max(64, (k + 1) * 12)); nb.set(this.instBox); this.instBox = nb; }
     this.instBox.set(box, k * 6);
     return k;
@@ -1413,6 +1734,22 @@ export class Renderer {
    * fresh list (its static instances, then the moving ones) after the static
    * lists; cells they left get their static entry back.
    */
+  /** Whether the static set has an instance of a model at a scale above 1. */
+  private staticScaled = false;
+  /** Whether the moving set has one. */
+  private dynamicScaled = false;
+
+  /** Whether a placed instance draws a model at a scale above 1 (grid.wesl SCALED). */
+  private scaledPlaced(): boolean {
+    return this.staticScaled || this.dynamicScaled;
+  }
+
+  /** The pipeline variant this frame needs (see vConstants). */
+  private variant(): number {
+    const b = this.instCount > 0 ? (this.partLen > 0 ? 2 : 1) : 0;
+    return b && this.scaledPlaced() ? b + 3 : b;
+  }
+
   private rebuildDynamic(): void {
     let n = this.staticCount;
     // Temporal history near the moving set, where it was and where it is now, is traced afresh.
@@ -1426,9 +1763,11 @@ export class Renderer {
     const seen = new Set<object>();
     let used = 0;
     const perCell = new Map<number, number[]>();
+    this.dynamicScaled = false;
     for (const inst of this.dynamicList) {
       const k = this.writeInstance(inst, n);
       if (k < 0) continue;
+      if (this.models[inst.model]!.scale !== 1) this.dynamicScaled = true;
       if (inst.parts && !seen.has(inst.parts as unknown as object)) {
         seen.add(inst.parts as unknown as object);
         const m = this.models[inst.model]!;
@@ -1518,9 +1857,10 @@ export class Renderer {
 
   /** Upload what an edit of the world grid changed. */
   private commit(edit: BrickEdit): void {
-    const grewPools = this.growPools();
-    if (this.ensureLayout() || grewPools) {
+    this.growPools();
+    if (this.ensureLayout()) {
       this.uploadIndexAll();
+      this.uploadSlots(edit.slots4, edit.slots8);
       return;
     }
     this.uploadSlots(edit.slots4, edit.slots8);
@@ -1551,13 +1891,23 @@ export class Renderer {
    * per frame. Catch it here, where the message can say what to do.
    */
   private checkPoolFits(cap4: number, cap8: number): void {
-    const limit = this.gpu.limits?.maxStorageBufferBindingSize ?? 134217728;
+    const err = this.poolFitError(cap4, cap8);
+    if (err) throw err;
+  }
+
+  /** The error for pools of `cap4` / `cap8` slots that the device cannot hold, or undefined. */
+  private poolFitError(cap4: number, cap8: number): Error | undefined {
+    const binding = this.gpu.limits?.maxStorageBufferBindingSize ?? 134217728;
+    const buffer = this.gpu.limits?.maxBufferSize ?? 268435456;
+    const limit = Math.min(binding, buffer);
     const biggest = Math.max(cap4 * BRICK_WORDS_4, cap8 * BRICK_WORDS_8) * 4;
-    if (biggest <= limit) return;
+    if (biggest <= limit) return undefined;
     const mb = (n: number) => `${(n / 1048576).toFixed(0)} MiB`;
-    throw new Error(
-      `Scene needs a ${mb(biggest)} brick pool but this device caps a storage binding at ` +
-        `${mb(limit)}. Raise it via initGpu({ limits: { maxStorageBufferBindingSize } }) if the ` +
+    const which = buffer < binding ? "a buffer" : "a storage binding";
+    const raise = buffer < binding ? "maxBufferSize" : "maxStorageBufferBindingSize";
+    return new Error(
+      `Scene needs a ${mb(biggest)} brick pool but this device caps ${which} at ` +
+        `${mb(limit)}. Raise it via initGpu({ limits: { ${raise} } }) if the ` +
         `adapter supports more, or use a smaller world.`,
     );
   }
@@ -1567,38 +1917,74 @@ export class Renderer {
     const size = Math.max(1, slots) * wordsPerSlot * 4;
     return this.gpu.device.createBuffer({
       size,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      // COPY_SRC so resizePools can copy it into its bigger successor.
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
   }
 
   /**
-   * Make sure the GPU pools can hold every claimed slot. Entities stamped in
-   * after construction claim more bricks, and a storage buffer cannot be
-   * resized, so this reallocates with headroom and rebinds. Returns true when
-   * it reallocated, in which case the caller must re-upload everything.
+   * Make sure the GPU pools can hold every claimed slot. Entities stamped in after construction
+   * and streamed ground claim more bricks, and a storage buffer cannot be resized, so this
+   * reallocates with headroom (`resizePools`, which keeps the contents GPU-side). The index buffer
+   * is untouched, so callers go on uploading only what their edit changed.
    */
-  private growPools(): boolean {
+  private growPools(): void {
     const need4 = this.bricks.slotCount4;
     const need8 = this.bricks.slotCount8;
-    if (need4 <= this.slotCap4 && need8 <= this.slotCap8) return false;
+    if (need4 <= this.slotCap4 && need8 <= this.slotCap8) return;
     // Geometric growth with a floor, so planting a thousand entities does not
     // reallocate a thousand times. 1.5x rather than 2x: at forest scale the
     // headroom is hundreds of megabytes of otherwise idle GPU memory, and a
-    // storage binding has a hard ceiling that doubling walks straight into.
-    const cap = (need: number, have: number, floor: number) =>
-      Math.max(floor, Math.ceil(need * 1.5), Math.ceil(have * 1.5));
-    this.slotCap4 = cap(need4, this.slotCap4, 256);
-    this.slotCap8 = cap(need8, this.slotCap8, 16);
-    this.checkPoolFits(this.slotCap4, this.slotCap8);
-    this.brickVox4.destroy();
-    this.brickPal.destroy();
-    this.brickVox8.destroy();
-    this.brickVox4 = this.makePool(BRICK_WORDS_4, this.slotCap4);
-    this.brickPal = this.makePool(PALETTE_WORDS, this.slotCap4);
-    this.brickVox8 = this.makePool(BRICK_WORDS_8, this.slotCap8);
+    // storage binding has a hard ceiling that doubling walks straight into, so
+    // the headroom is also capped there (a scene that fits still fits).
+    const cap = (need: number, have: number, floor: number, words: number) =>
+      need <= have ? have : Math.max(need, Math.min(Math.max(floor, Math.ceil(need * 1.5), Math.ceil(have * 1.5)), this.poolSlotLimit(words)));
+    this.resizePools(cap(need4, this.slotCap4, 256, BRICK_WORDS_4), cap(need8, this.slotCap8, 16, BRICK_WORDS_8));
+  }
+
+  /** The most slots one pool of `words` words per slot can have on this device. */
+  private poolSlotLimit(words: number): number {
+    const lim = this.gpu.limits;
+    const bytes = Math.min(lim?.maxStorageBufferBindingSize ?? 134217728, lim?.maxBufferSize ?? 268435456);
+    return Math.floor(bytes / (words * 4));
+  }
+
+  /**
+   * Grow the GPU brick pools to `cap4` / `cap8` slots (a pool never shrinks), keeping their
+   * contents. The bigger buffers are filled by a GPU-side `copyBufferToBuffer` of the claimed
+   * slots, submitted right here: the queue runs it after every earlier `writeBuffer` into the old
+   * buffers and before every later one into the new, so later uploads land on top of the copy.
+   * The main thread sends no brick data; a re-upload from the CPU mirror cost 150-270 ms at a few
+   * hundred MB. The old buffers are destroyed straight after the submit (WebGPU keeps them until
+   * the copy has run), so both exist in GPU memory only for that moment. Rebinds.
+   */
+  private resizePools(cap4: number, cap8: number): void {
+    const grow4 = cap4 > this.slotCap4, grow8 = cap8 > this.slotCap8;
+    if (!grow4 && !grow8) return;
+    this.checkPoolFits(Math.max(cap4, this.slotCap4), Math.max(cap8, this.slotCap8));
+    const { device } = this.gpu;
+    const enc = device.createCommandEncoder({ label: "voxolith brick pools grow" });
+    const old: GPUBuffer[] = [];
+    const move = (from: GPUBuffer, words: number, slots: number, cap: number): GPUBuffer => {
+      const to = this.makePool(words, cap);
+      const bytes = Math.min(from.size, slots * words * 4);
+      if (bytes > 0) enc.copyBufferToBuffer(from, 0, to, 0, bytes);
+      old.push(from);
+      return to;
+    };
+    if (grow4) {
+      this.brickVox4 = move(this.brickVox4, BRICK_WORDS_4, this.pool.slots4, cap4);
+      this.brickPal = move(this.brickPal, PALETTE_WORDS, this.pool.slots4, cap4);
+      this.slotCap4 = cap4;
+    }
+    if (grow8) {
+      this.brickVox8 = move(this.brickVox8, BRICK_WORDS_8, this.pool.slots8, cap8);
+      this.slotCap8 = cap8;
+    }
+    device.queue.submit([enc.finish()]);
+    for (const b of old) b.destroy();
+    this.poolGrowths++;
     this.bindGroup = this.makeBindGroup();
-    this.uploadSlots(null, null);
-    return true;
   }
 
   /** Region sizes wanted now, in words. */
@@ -1658,7 +2044,7 @@ export class Renderer {
     this.gpu.device.queue.writeBuffer(this.idxBuffer, (this.layout[r].off + at) * 4, src, from, n);
   }
 
-  private uploadBlocks(ids: number[]): void {
+  private uploadBlocks(ids: ArrayLike<number>): void {
     for (const [lo, hi] of runs(ids)) this.writeRegion("blocks", lo * BLOCK_ENTRIES, this.pool.blocks, lo * BLOCK_ENTRIES, (hi - lo + 1) * BLOCK_ENTRIES);
   }
 
@@ -1679,7 +2065,6 @@ export class Renderer {
     this.writeRegion("parts", 0, this.partData, 0, this.partLen);
     this.writeRegion("subs", 0, this.subData, 0, this.subLen);
     this.poseDirty = [];
-    this.uploadSlots(null, null);
   }
 
   /**
@@ -1688,7 +2073,7 @@ export class Renderer {
    * consecutive slots, so stamping one entity usually collapses to a handful of
    * writes rather than one per brick.
    */
-  private uploadSlots(slots4: number[] | null, slots8: number[] | null): void {
+  private uploadSlots(slots4: ArrayLike<number> | null, slots8: ArrayLike<number> | null): void {
     const { device } = this.gpu;
     if (slots4 === null) {
       // The CPU pools are sized to the slots actually claimed, which is less
@@ -1854,10 +2239,8 @@ export class Renderer {
       ],
       timestampWrites: this.timer?.passWrites("trace") as GPURenderPassTimestampWrites | undefined,
     });
-    let pipeline: GPURenderPipeline;
-    if (this.instCount > 0 && this.partLen > 0) pipeline = this.partsPipeline ??= this.makePipeline(true, true);
-    else if (this.instCount > 0) pipeline = this.instancedPipeline ??= this.makePipeline(true);
-    else pipeline = this.pipeline ??= this.makePipeline(false);
+    const v = this.variant();
+    const pipeline = (this.fragmentPipelines[v] ??= this.makePipeline(v));
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, this.bindGroup);
     pass.draw(3);
@@ -1908,8 +2291,10 @@ export class Renderer {
   prepare(needs: PrepareNeeds = {}): Promise<void> {
     const instances = needs.instances ?? this.instCount > 0;
     const parts = needs.parts ?? (this.instCount > 0 && this.partLen > 0);
+    const scaled = needs.scaled ?? (this.instCount > 0 && this.scaledPlaced());
     const temporal = this.useCompute && (needs.temporal ?? this.quality.temporal);
-    const variants = [0, ...(instances ? [1] : []), ...(parts ? [2] : [])];
+    const s = scaled ? 3 : 0;
+    const variants = [0, ...(instances ? [1 + s] : []), ...(parts ? [2 + s] : [])];
     // Kernels writing the canvas directly when it allows it; with `target`, the frame-texture ones too.
     const canvases = [...new Set([!!this.canvasLayout, ...(needs.target ? [false] : [])])];
     const jobs: Promise<void>[] = [];
@@ -1920,10 +2305,10 @@ export class Renderer {
       }
       for (const canvas of canvases) {
         // "auto" never draws posed instances with the plain compute kernel.
-        if (this.pipelineMode === "compute" || v < 2) jobs.push(this.prepareVariant("compute", v, canvas));
+        if (this.pipelineMode === "compute" || !vParts(v)) jobs.push(this.prepareVariant("compute", v, canvas));
         if (temporal) jobs.push(this.prepareVariant("temporal", v, canvas));
       }
-      if (this.pipelineMode === "auto" && v === 2) jobs.push(this.prepareVariant("fragment", 2, false));
+      if (this.pipelineMode === "auto" && vParts(v)) jobs.push(this.prepareVariant("fragment", v, false));
     }
     // The compute path's present pass, wherever a kernel writes the frame texture instead of the canvas.
     if (this.useCompute && canvases.includes(false)) jobs.push(this.preparePresent());
@@ -1949,9 +2334,9 @@ export class Renderer {
 
   /** Compile one variant asynchronously into its lazy cache, unless it is there or in flight. */
   private prepareVariant(path: "fragment" | "compute" | "temporal", v: number, canvas: boolean): Promise<void> {
-    const slot = v + (canvas ? 3 : 0);
+    const slot = v + (canvas ? 6 : 0);
     const cached = (): boolean =>
-      path === "fragment" ? !!(v === 0 ? this.pipeline : v === 1 ? this.instancedPipeline : this.partsPipeline)
+      path === "fragment" ? !!this.fragmentPipelines[v]
       : path === "compute" ? !!this.computePipelines[slot]
       : !!this.temporalPipelines[slot];
     if (cached()) return Promise.resolve();
@@ -1959,19 +2344,15 @@ export class Renderer {
     const inFlight = this.preparing.get(id);
     if (inFlight) return inFlight;
     const { device } = this.gpu;
-    const label = variantLabel(path, v > 0, v === 2, canvas);
+    const label = variantLabel(path, v, canvas);
     const onLoad = this.onLoad;
     if (onLoad) reportLoad(onLoad, "pipelines", "start", label);
     const made: Promise<void> = path === "fragment"
-      ? device.createRenderPipelineAsync(this.fragmentDesc(v > 0, v === 2)).then((p) => {
+      ? device.createRenderPipelineAsync(this.fragmentDesc(v)).then((p) => {
           // A frame that needed it meanwhile made it synchronously: keep that one.
-          if (!cached()) {
-            if (v === 0) this.pipeline = p;
-            else if (v === 1) this.instancedPipeline = p;
-            else this.partsPipeline = p;
-          }
+          if (!cached()) this.fragmentPipelines[v] = p;
         })
-      : device.createComputePipelineAsync(path === "compute" ? this.computeDesc(v > 0, v === 2, canvas) : this.temporalDesc(v, canvas)).then((p) => {
+      : device.createComputePipelineAsync(path === "compute" ? this.computeDesc(v, canvas) : this.temporalDesc(v, canvas)).then((p) => {
           if (cached()) return;
           if (path === "compute") this.computePipelines[slot] = p;
           else this.temporalPipelines[slot] = p;
@@ -1987,11 +2368,11 @@ export class Renderer {
   /** The compute path: shade into the frame texture, then present it into `view`. */
   private renderCompute(encoder: GPUCommandEncoder, view: GPUTextureView, width: number, height: number, toCanvas: boolean, temporal?: GPUBindGroup): void {
     const { device } = this.gpu;
-    const variant = this.instCount > 0 ? (this.partLen > 0 ? 2 : 1) : 0;
+    const variant = this.variant();
     const direct = toCanvas && !!this.canvasLayout;
     const pipe = temporal
-      ? (this.temporalPipelines[variant + (direct ? 3 : 0)] ??= this.makeTemporalPipeline(variant, direct))
-      : (this.computePipelines[variant + (direct ? 3 : 0)] ??= this.makeComputePipeline(variant > 0, variant === 2, direct));
+      ? (this.temporalPipelines[variant + (direct ? 6 : 0)] ??= this.makeTemporalPipeline(variant, direct))
+      : (this.computePipelines[variant + (direct ? 6 : 0)] ??= this.makeComputePipeline(variant, direct));
     if (direct) {
       // Shade straight into the canvas: one pass.
       const cp = encoder.beginComputePass({ timestampWrites: this.timer?.passWrites("trace") as GPUComputePassTimestampWrites | undefined });
@@ -2113,9 +2494,12 @@ function occupiedBounds(
 }
 
 /** Sort and coalesce slot indices into inclusive contiguous [lo, hi] runs. */
-function runs(slots: number[], gap = 1): [number, number][] {
+function runs(slots: ArrayLike<number>, gap = 1): [number, number][] {
   if (slots.length === 0) return [];
-  const sorted = [...new Set(slots)].sort((a, b) => a - b);
+  // Already ascending (a model's fresh slots): no set and no sort, the same runs.
+  let ascending = true;
+  for (let i = 1; i < slots.length && ascending; i++) ascending = slots[i] > slots[i - 1];
+  const sorted = ascending ? slots : [...new Set(Array.from(slots))].sort((a, b) => a - b);
   const out: [number, number][] = [];
   let lo = sorted[0];
   let prev = lo;
@@ -2129,37 +2513,6 @@ function runs(slots: number[], gap = 1): [number, number][] {
   }
   out.push([lo, prev]);
   return out;
-}
-
-/** The occupied 2³ sub-cells of a model, as x, y, z triples. */
-function occupiedSubs(src: ModelSource): Int32Array {
-  const out: number[] = [];
-  const { x: sx, y: sy, z: sz } = src.size;
-  if (src.sparse) {
-    // A brick is exactly 4³ sub-cells, so each brick's own are distinct.
-    const [dx, dy] = sparseDims(src.size);
-    const here = new Uint8Array(64);
-    for (const [key, cells] of src.sparse.bricks) {
-      const X = (key % dx) * 4, Y = (Math.floor(key / dx) % dy) * 4, Z = Math.floor(key / (dx * dy)) * 4;
-      here.fill(0);
-      for (let i = 0; i < cells.length; i++) if (cells[i]) here[((i & 7) >> 1) + (((i >> 3) & 7) >> 1) * 4 + ((i >> 6) >> 1) * 16] = 1;
-      for (let j = 0; j < 64; j++) if (here[j]) out.push(X + (j & 3), Y + ((j >> 2) & 3), Z + (j >> 4));
-    }
-    return Int32Array.from(out);
-  }
-  // Brick by brick, so that neighbours in the list are neighbours in space (the bake caches by brick).
-  const d = src.data;
-  if (!d) return new Int32Array(0);
-  const at = (x: number, y: number, z: number) => x < sx && y < sy && z < sz && d[x + y * sx + z * sx * sy] !== 0;
-  for (let z0 = 0; z0 < sz; z0 += 8)
-    for (let y0 = 0; y0 < sy; y0 += 8)
-      for (let x0 = 0; x0 < sx; x0 += 8)
-        for (let z = z0; z < z0 + 8 && z < sz; z += 2)
-          for (let y = y0; y < y0 + 8 && y < sy; y += 2)
-            for (let x = x0; x < x0 + 8 && x < sx; x += 2)
-              if (at(x, y, z) || at(x + 1, y, z) || at(x, y + 1, z) || at(x + 1, y + 1, z) || at(x, y, z + 1) || at(x + 1, y, z + 1) || at(x, y + 1, z + 1) || at(x + 1, y + 1, z + 1))
-                out.push(x >> 1, y >> 1, z >> 1);
-  return Int32Array.from(out);
 }
 
 function growU32(a: Uint32Array, need: number): Uint32Array<ArrayBuffer> {

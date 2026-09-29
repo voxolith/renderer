@@ -24,14 +24,29 @@
 // "Voxel Deformation-Aware Neural Intersection Function" (EG 2026 Short Papers,
 // doi:10.2312/egs.20261026), which maps rays in deformed space back to rest space per voxel.
 // Here the deformation is rigid per part, over the renderer's brick index.
+//
+// A model can also be drawn enlarged by an integer factor k (its scale, set when it is added): an
+// instance of it draws exactly what the model upsampled k times by nearest neighbour would draw at
+// k = 1. The instance's space is the enlarged model's (k × the model's size, at world resolution),
+// so placement, anchor, mirroring and the world box are the enlarged model's; a world cell centre
+// is taken into that space and floored to a cell q, and the model is read at floor(q / k). Taking
+// the integer quotient of the floored cell, rather than folding 1/k into the affine, is what makes
+// it exact: the f32 arithmetic is the upsampled model's, cell for cell.
 
 /**
  * Words per instance record: world→model affine (0-11; for a posed instance, world→posed model),
- * model (12), palette base (13), flags (14), pose offset in the pose store (15), part count (16),
+ * model (12), palette base (13), flags (14: INST_MIRROR, INST_PARTS, and scale - 1 from
+ * INST_SCALE_SHIFT up), pose offset in the pose store (15), part count (16),
  * the world cells it can touch (17-22: lo x, y, z, hi x, y, z, exclusive, as i32; the first test a
  * sample meets), pad (23).
  */
 export const INST_WORDS = 24;
+/**
+ * The word of an instance record that holds its model id (`packInstance`'s `modelId`): the only
+ * word of a placement bake that depends on model ids (`normalizePlacement` and `bindPlacement`
+ * rewrite it). Not in the public entry points.
+ */
+export const INST_MODEL = 12;
 /** Words of a pose record's header: mask grid origin (0-2, i32 cells of the posed model), its dims in bricks (3-5), part count (6), pad (7). */
 export const POSE_HEADER = 8;
 /**
@@ -44,6 +59,11 @@ export const PART_WORDS = 24;
 export const INST_MIRROR = 1;
 /** Instance flag: drawn in a pose (per-part transforms). */
 export const INST_PARTS = 2;
+/**
+ * The instance flags word keeps the model's scale - 1 from this bit up (`ModelOptions.scale`; 0,
+ * so scale 1, for every record packed before scales), where the shader already reads the flags.
+ */
+export const INST_SCALE_SHIFT = 8;
 /** A part record's `parent` when it has none. */
 export const NO_PARENT = 0xffffffff;
 /** Bricks of a pose's part mask grid, in voxels. */
@@ -58,7 +78,13 @@ export type Affine = ArrayLike<number>;
 
 /** What packing needs to know about an instance's model. */
 export interface PackModel {
+  /** The model's extent in its own voxels. */
   size: { x: number; y: number; z: number };
+  /**
+   * The integer factor the model is drawn enlarged by (default 1): its voxels are `scale` world
+   * voxels on a side, and the instance's space is `scale × size`. Posing (`parts`) needs 1.
+   */
+  scale?: number;
   /** Per part: min x, y, z, max x, y, z of its voxels (inclusive), min > max when empty. */
   partBoxes?: Int32Array;
   /** Per part: its parent part (-1 for none) and the joint where it meets it, in model voxels. */
@@ -67,17 +93,44 @@ export interface PackModel {
 
 /** The placement fields of an instance (the renderer's `Instance`). */
 export interface PackInstance {
+  /** World position of the anchor voxel's low corner (voxels, fractional allowed). */
   x: number;
+  /** See `x`. */
   y: number;
+  /** See `x`. */
   z: number;
+  /**
+   * The anchor voxel, in the instance's voxels: the model's own at scale 1, the enlarged model's
+   * (world resolution) at scale k, so model voxel a's low corner is `k · a`. Default the base
+   * centre of the (enlarged) model.
+   */
   anchor?: readonly [number, number, number];
+  /** Radians about +y. */
   yaw?: number;
   /** A 3x3 rotation, row-major (world = R · model), instead of `yaw`. */
   rotation?: ArrayLike<number>;
+  /** Mirror the model along its x, after flooring. */
   mirror?: boolean;
+  /** Palette slot of role 1. */
   base: number;
   /** Per-part model-space transforms (12 floats each), applied before the placement. */
   parts?: ArrayLike<number>;
+}
+
+/**
+ * A model's scale factor, checked: an integer from 1, with the enlarged size within the range f32
+ * coordinates hold exactly (2^20 voxels a side). Throws otherwise.
+ */
+export function modelScale(size: { x: number; y: number; z: number }, scale: number | undefined): number {
+  const k = scale ?? 1;
+  if (!Number.isInteger(k) || k < 1) throw new Error(`model scale must be an integer >= 1 (got ${k})`);
+  if (Math.max(size.x, size.y, size.z) * k > 1 << 20) throw new Error(`model scale ${k}: the enlarged model would be over 2^20 voxels a side`);
+  return k;
+}
+
+/** The extent of a model enlarged by its scale: the instance's space, in world voxels. */
+export function scaledSize(size: { x: number; y: number; z: number }, scale = 1): { x: number; y: number; z: number } {
+  return scale === 1 ? size : { x: size.x * scale, y: size.y * scale, z: size.z * scale };
 }
 
 /** out = a · b (apply b, then a), each at its offset. `out` must not alias `a` or `b`. */
@@ -114,7 +167,9 @@ export function invertAffine(m: Affine, out: Float64Array | Float32Array = new F
  * The model→world affine of an instance's placement. The model turns about its anchor voxel's
  * centre, so a quarter turn maps voxel centres onto voxel centres exactly (as a stamped
  * orientation does), and the anchor voxel's low corner lands on (x, y, z). For a mirrored instance
- * the anchor is the mirrored model's; the mirror itself is applied after flooring.
+ * the anchor is the mirrored model's; the mirror itself is applied after flooring. For a model
+ * drawn at a scale, `size` is the enlarged size ({@link scaledSize}): "model" here is the
+ * instance's space.
  */
 export function placement(inst: PackInstance, size: { x: number; y: number; z: number }, fwd = new Float64Array(12)): { fwd: Float64Array; anchor: Vec3 } {
   const a0 = inst.anchor ?? [size.x / 2, 0, size.z / 2];
@@ -266,19 +321,22 @@ export function packInstance(
   const f = new Float32Array(words.buffer, words.byteOffset, words.length);
   const wi = new Int32Array(words.buffer, words.byteOffset, words.length);
   const n = pose && model.partBoxes ? model.partBoxes.length / 6 : 0;
+  const k = model.scale ?? 1;
+  if (n && k !== 1) throw new Error(`packInstance: a model drawn at scale ${k} cannot be posed (Instance.parts needs scale 1)`);
+  const size = scaledSize(model.size, k);
   // A pose carries the part transforms; mirroring applies only to plain instances.
-  const { fwd } = placement(n ? { ...inst, mirror: false } : inst, model.size, scratchFwd);
+  const { fwd } = placement(n ? { ...inst, mirror: false } : inst, size, scratchFwd);
   invertAffine(fwd, scratchInv);
   for (let k = 0; k < 12; k++) f[o + k] = scratchInv[k];
-  words[o + 12] = modelId;
+  words[o + INST_MODEL] = modelId;
   words[o + 13] = inst.base;
-  words[o + 14] = (inst.mirror && !n ? INST_MIRROR : 0) | (n ? INST_PARTS : 0);
+  words[o + 14] = ((inst.mirror && !n ? INST_MIRROR : 0) | (n ? INST_PARTS : 0) | ((k - 1) << INST_SCALE_SHIFT)) >>> 0;
   words[o + 15] = n ? pose!.off : 0;
   words[o + 16] = n;
   words[o + 23] = 0;
   const b = [0, 0, 0, 0, 0, 0];
   if (n) boxInto(fwd, 0, pose!.box[0], pose!.box[1], pose!.box[2], pose!.box[3], pose!.box[4], pose!.box[5], b, 0);
-  else boxInto(fwd, 0, 0, 0, 0, model.size.x, model.size.y, model.size.z, b, 0);
+  else boxInto(fwd, 0, 0, 0, 0, size.x, size.y, size.z, b, 0);
   wi[o + 17] = Math.floor(b[0]); wi[o + 18] = Math.floor(b[1]); wi[o + 19] = Math.floor(b[2]);
   wi[o + 20] = Math.ceil(b[3]); wi[o + 21] = Math.ceil(b[4]); wi[o + 22] = Math.ceil(b[5]);
   return { box: b };
@@ -309,15 +367,19 @@ export function partBoxes(size: { x: number; y: number; z: number }, data: Uint8
 
 /** Lookups the CPU sampler needs: the model's voxel and part (+1, 0 = none) at a model cell. */
 export interface SampleModel {
+  /** The model's extent in its own voxels. */
   size: { x: number; y: number; z: number };
+  /** Role value at a model cell (in range). */
   voxel(x: number, y: number, z: number): number;
+  /** Part index + 1 at a model cell (in range), 0 for none. */
   part(x: number, y: number, z: number): number;
 }
 
 /**
  * The value an instance draws at world cell (x, y, z), or 0: the CPU twin of grid.wesl's
  * instance sampling, reading the same packed words (as f32, like the GPU). `poses` is the pose
- * store a posed instance's record points into.
+ * store a posed instance's record points into. A model drawn at a scale is read at the quotient
+ * of the enlarged model's cell (the scale is in the record's flags, as the shader reads it).
  */
 export function sampleInstance(words: Uint32Array, o: number, poses: Uint32Array | undefined, model: SampleModel, x: number, y: number, z: number): number {
   const wi = new Int32Array(words.buffer, words.byteOffset, words.length);
@@ -336,7 +398,12 @@ export function sampleInstance(words: Uint32Array, o: number, poses: Uint32Array
   const u = apply32(f, o, x + 0.5, y + 0.5, z + 0.5);
   const flags = words[o + 14];
   if (!(flags & INST_PARTS)) {
+    // A cell of the model enlarged k times, then the model's own, floor(q / k), before the mirror
+    // and the bounds test (as the shader orders it; both are exact either way round). A negative
+    // cell goes to -1.
+    const k = (flags >>> INST_SCALE_SHIFT) + 1;
     const q = cell(u);
+    if (k > 1) for (let a = 0; a < 3; a++) q[a] = q[a] < 0 ? -1 : Math.floor(q[a] / k);
     if (flags & INST_MIRROR) q[0] = size.x - 1 - q[0];
     if (!inside(q)) return 0;
     return model.voxel(q[0], q[1], q[2]);
@@ -379,3 +446,4 @@ export function sampleInstance(words: Uint32Array, o: number, poses: Uint32Array
   }
   return 0;
 }
+

@@ -27,7 +27,7 @@ export { OccupancyGrid, COARSE_B } from "./occupancy";
 export { BrickGrid, BrickPool, BRICK_B, TOP_B, PALETTE_ENTRIES, UNIFORM_BIT, NEAR_BIT } from "./brick";
 export { SPARSE_B, makeSparse, sparseGet, sparseSet, sparseDims, sparseFromDense, sparseToDense, sparseCount } from "./sparse";
 export type { SparseVoxels } from "./sparse";
-export type { BrickStats, BrickEdit } from "./brick";
+export type { BrickStats, BrickEdit, PoolClaim } from "./brick";
 export type { DirtyBox } from "./box";
 
 export { makeCamera, firstPersonFrame, chaseFrame } from "./camera";
@@ -46,12 +46,16 @@ export type { Vec3, VoxelHit } from "./ray";
 
 export { seededRandom, hashSeed } from "./random";
 
-export { INST_WORDS, PART_WORDS, POSE_HEADER, INST_MIRROR, INST_PARTS, NO_PARENT, MASK_B, MAX_PARTS, placement, packInstance, packPose, maxPoseWords, partBoxes, sampleInstance, mulAffine, invertAffine } from "./instance";
+export { INST_WORDS, PART_WORDS, POSE_HEADER, INST_MIRROR, INST_PARTS, INST_SCALE_SHIFT, NO_PARENT, MASK_B, MAX_PARTS, placement, packInstance, packPose, maxPoseWords, partBoxes, sampleInstance, mulAffine, invertAffine } from "./instance";
 export type { Affine, PackModel, PackInstance, SampleModel } from "./instance";
 
 // The static placement bake, worker-safe: Renderer.placementInput → bakePlacement → Renderer.applyPlacement.
-export { bakePlacement, placementTransferables, PlacementBaker } from "./placement";
+export { bakePlacement, placementTransferables, normalizePlacement, bindPlacement, PlacementBaker, PLACEMENT_BAKE_VERSION } from "./placement";
 export type { PlacementModel, PlacementGrid, PlacementInstance, PlacementInput, PlacementBake, PlacementBakeOptions } from "./placement";
+
+// Model encoding, worker-safe: encodeModel → Renderer.addEncodedModel (what Renderer.addModel does in one step).
+export { encodeModel, encodedTransferables, placementModelOf, ENCODED_MODEL_VERSION } from "./encode";
+export type { ModelSource, EncodedModel, EncodeOptions, PlacementKeys } from "./encode";
 
 export { GridStamper } from "./stamper";
 export type { StampVoxel } from "./stamper";

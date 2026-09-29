@@ -89,6 +89,22 @@ export interface BrickEdit {
   tops: number[];
 }
 
+/** What `BrickPool.claimFor` claimed for a payload, to fill with `copyIn` or give back with `unclaim`. */
+export interface PoolClaim {
+  /** The pool slot of each local 4-bit slot. */
+  slots4: Uint32Array;
+  /** The pool slot of each local 8-bit slot. */
+  slots8: Uint32Array;
+  /** The pool block of each local index block. */
+  blocks: Uint32Array;
+  /** How many of `slots4` came off the free list (the first ones; the rest are new, consecutive). */
+  reused4: number;
+  /** How many of `slots8` came off the free list. */
+  reused8: number;
+  /** How many of `blocks` came off the free list. */
+  reusedBlocks: number;
+}
+
 /** A `BrickEdit` with nothing in it, to accumulate several edits into. */
 export const emptyEdit = (): BrickEdit => ({ slots4: [], slots8: [], blocks: [], tops: [] });
 
@@ -111,6 +127,45 @@ export class BrickPool {
   private freeBlocks: number[] = [];
   private readonly lut = new Uint8Array(256);
   private readonly used = new Uint8Array(256);
+  private max4 = Infinity;
+  private max8 = Infinity;
+  private overflow?: (slots4: number, slots8: number) => Error;
+
+  /**
+   * Cap the slots of each tier, for a pool whose payloads are mirrored into GPU buffers of a
+   * bounded size (the renderer passes its device's buffer limits). The CPU arrays then never grow
+   * past what the GPU could hold, and a claim or reservation past the cap throws `overflow`'s
+   * error before anything is claimed or allocated. Default: no cap.
+   *
+   * @param max4 - Most 4-bit slots (and palettes).
+   * @param max8 - Most 8-bit slots.
+   * @param overflow - Makes the error for slot counts that do not fit.
+   */
+  setSlotLimits(max4: number, max8: number, overflow: (slots4: number, slots8: number) => Error): void {
+    this.max4 = max4;
+    this.max8 = max8;
+    this.overflow = overflow;
+  }
+
+  /** Make the 4-bit arrays hold `slots` slots (1.5x steps, capped at the limit); throws past it. */
+  private fit4(slots: number): void {
+    if (slots * BRICK_WORDS_4 <= this.voxels4.length) return;
+    if (slots > this.max4) throw this.overflowError(slots, this.slots8);
+    const n = grownSlots(this.voxels4.length / BRICK_WORDS_4, slots, this.max4);
+    this.voxels4 = resized(this.voxels4, n * BRICK_WORDS_4);
+    this.palettes = resized(this.palettes, n * PALETTE_WORDS);
+  }
+
+  /** Make the 8-bit array hold `slots` slots (1.5x steps, capped at the limit); throws past it. */
+  private fit8(slots: number): void {
+    if (slots * BRICK_WORDS_8 <= this.voxels8.length) return;
+    if (slots > this.max8) throw this.overflowError(this.slots4, slots);
+    this.voxels8 = resized(this.voxels8, grownSlots(this.voxels8.length / BRICK_WORDS_8, slots, this.max8) * BRICK_WORDS_8);
+  }
+
+  private overflowError(slots4: number, slots8: number): Error {
+    return this.overflow?.(slots4, slots8) ?? new Error(`brick pool: ${slots4} 4-bit / ${slots8} 8-bit slots exceed the limit (${this.max4} / ${this.max8})`);
+  }
 
   /** Take a zeroed index block (reused or new); returns its id. */
   claimBlock(): number {
@@ -270,22 +325,175 @@ export class BrickPool {
   private claim4(): number {
     const reused = this.free4.pop();
     if (reused !== undefined) return reused;
-    const slot = this.slots4++;
-    if ((slot + 1) * BRICK_WORDS_4 > this.voxels4.length) {
-      this.voxels4 = grow(this.voxels4, (slot + 1) * BRICK_WORDS_4);
-      this.palettes = grow(this.palettes, (slot + 1) * PALETTE_WORDS);
-    }
-    return slot;
+    this.fit4(this.slots4 + 1);
+    return this.slots4++;
   }
 
   private claim8(): number {
     const reused = this.free8.pop();
     if (reused !== undefined) return reused;
-    const slot = this.slots8++;
-    if ((slot + 1) * BRICK_WORDS_8 > this.voxels8.length) {
-      this.voxels8 = grow(this.voxels8, (slot + 1) * BRICK_WORDS_8);
+    this.fit8(this.slots8 + 1);
+    return this.slots8++;
+  }
+
+  /**
+   * Copy in bricks and index blocks encoded against a pool of their own (numbered from 0 in claim
+   * order, as `encodeModel` writes them): claims one slot or block here per local one, in that
+   * order, so the claims are the ones encoding straight into this pool would have made, and
+   * rewrites the index entries to name the claimed slots.
+   *
+   * @param src - Local payloads (`voxels4` and `palettes` 64 and 8 words per slot, `voxels8` 128)
+   *   and index blocks (512 entries each).
+   * @returns The pool slot of each local slot of either tier, and the pool block of each local
+   *   block: what was written, for the upload.
+   */
+  adopt(src: { blocks: Uint32Array; voxels4: Uint32Array; palettes: Uint32Array; voxels8: Uint32Array }): { slots4: Uint32Array; slots8: Uint32Array; blocks: Uint32Array } {
+    const claim = this.claimFor(src);
+    this.copyIn(src, claim, "4", 0, claim.slots4.length);
+    this.copyIn(src, claim, "8", 0, claim.slots8.length);
+    this.copyIn(src, claim, "blocks", 0, claim.blocks.length);
+    return { slots4: claim.slots4, slots8: claim.slots8, blocks: claim.blocks };
+  }
+
+  /**
+   * The first half of `adopt`, for a copy spread over several calls: claims the slots and (zeroed)
+   * index blocks `adopt(src)` would claim, in the same order, and copies nothing. Fill them with
+   * `copyIn`, in slices and in any order; give them back with `unclaim`. Other claims, edits and
+   * growth may come in between: the claimed slots stay this claim's, and the arrays keep what was
+   * copied in when they grow.
+   *
+   * @param src - Local payload and block counts, as for `adopt`.
+   * @returns The claim: the pool slot of each local slot, the pool block of each local block, and
+   *   what `unclaim` needs to undo it.
+   */
+  claimFor(src: { blocks: Uint32Array; voxels4: Uint32Array; voxels8: Uint32Array }): PoolClaim {
+    const n4 = src.voxels4.length / BRICK_WORDS_4, n8 = src.voxels8.length / BRICK_WORDS_8, nb = src.blocks.length / BLOCK_ENTRIES;
+    const reused4 = Math.min(n4, this.free4.length), reused8 = Math.min(n8, this.free8.length);
+    const slots4 = this.claimMany(n4, false), slots8 = this.claimMany(n8, true), blocks = new Uint32Array(nb);
+    const reusedBlocks = Math.min(nb, this.freeBlocks.length);
+    for (let i = 0; i < nb; i++) blocks[i] = this.claimBlock();
+    return { slots4, slots8, blocks, reused4, reused8, reusedBlocks };
+  }
+
+  /**
+   * Copy local items `[from, to)` of one part of `src` into what `claimFor(src)` claimed: 4-bit
+   * slots (payload and palette), 8-bit slots, or index blocks (entries rewritten to name the
+   * claimed slots). Every item copied once, in any slices, leaves the pool as `adopt(src)` would.
+   *
+   * @param src - The payload `claimFor` was given.
+   * @param claim - Its claim.
+   * @param part - `"4"`, `"8"` or `"blocks"`.
+   * @param from - First local item.
+   * @param to - One past the last.
+   */
+  copyIn(src: { blocks: Uint32Array; voxels4: Uint32Array; palettes: Uint32Array; voxels8: Uint32Array }, claim: PoolClaim, part: "4" | "8" | "blocks", from: number, to: number): void {
+    if (part === "4") {
+      // Copy in runs of consecutive slots: slots claimed past the end are one run.
+      copyRuns(claim.slots4, src.voxels4, this.voxels4, BRICK_WORDS_4, from, to);
+      copyRuns(claim.slots4, src.palettes, this.palettes, PALETTE_WORDS, from, to);
+      return;
     }
-    return slot;
+    if (part === "8") {
+      copyRuns(claim.slots8, src.voxels8, this.voxels8, BRICK_WORDS_8, from, to);
+      return;
+    }
+    const map4 = claim.slots4, map8 = claim.slots8, blocks = this.blocks;
+    for (let i = from; i < to; i++) {
+      const b = claim.blocks[i];
+      let used = 0;
+      for (let j = 0, s = i * BLOCK_ENTRIES, d = b * BLOCK_ENTRIES; j < BLOCK_ENTRIES; j++) {
+        let e = src.blocks[s + j];
+        if (!e) continue;
+        used++;
+        if (!(e & UNIFORM_BIT) && e & SLOT_MASK) {
+          const local = (e & SLOT_MASK) - 1;
+          e = (e & ~SLOT_MASK) | ((e & TIER_BIT ? map8[local] : map4[local]) + 1);
+        }
+        blocks[d + j] = e;
+      }
+      this.blockUsed[b] = used;
+    }
+  }
+
+  /**
+   * Give back what `claimFor` claimed, copied in or not. Its blocks are zeroed (as freed blocks
+   * are) and its slots past the pool's end, when nothing was claimed after them, are zeroed and
+   * unclaimed, so with nothing claimed or freed in between the pool is as it was before
+   * `claimFor`: the same counts and free lists, the same words at every slot in use and every
+   * block, zeros past the end. Otherwise the slots and blocks go onto the free lists. Either way
+   * the free slots it had reused keep what was copied into them (a free slot's words are never
+   * read).
+   *
+   * @param claim - A claim of this pool, not given back yet.
+   * @returns The pool slot ranges that were zeroed, `[lo, hi)` per tier, for a caller mirroring
+   *   the pool elsewhere.
+   */
+  unclaim(claim: PoolClaim): { zeroed4: [number, number]; zeroed8: [number, number] } {
+    // Blocks first, last claimed first, so the free list gets its old order back.
+    for (let i = claim.blocks.length - 1; i >= 0; i--) {
+      const b = claim.blocks[i];
+      this.blocks.fill(0, b * BLOCK_ENTRIES, (b + 1) * BLOCK_ENTRIES);
+      this.blockUsed[b] = 0;
+      if (i >= claim.reusedBlocks && b === this.blockCount - 1) this.blockCount--;
+      else this.freeBlocks.push(b);
+    }
+    const back = (map: Uint32Array, reused: number, wide: boolean): [number, number] => {
+      const free = wide ? this.free8 : this.free4;
+      let zeroed: [number, number] = [0, 0];
+      const rest = map.length - reused;
+      if (rest > 0) {
+        const first = map[reused], end = wide ? this.slots8 : this.slots4;
+        if (first + rest === end) {
+          if (wide) {
+            this.slots8 = first;
+            this.voxels8.fill(0, first * BRICK_WORDS_8, end * BRICK_WORDS_8);
+          } else {
+            this.slots4 = first;
+            this.voxels4.fill(0, first * BRICK_WORDS_4, end * BRICK_WORDS_4);
+            this.palettes.fill(0, first * PALETTE_WORDS, end * PALETTE_WORDS);
+          }
+          zeroed = [first, end];
+        } else for (let i = map.length - 1; i >= reused; i--) free.push(map[i]);
+      }
+      // Popped from the top of the free list in order, so pushed back in reverse.
+      for (let i = reused - 1; i >= 0; i--) free.push(map[i]);
+      return zeroed;
+    };
+    const zeroed8 = back(claim.slots8, claim.reused8, true);
+    const zeroed4 = back(claim.slots4, claim.reused4, false);
+    return { zeroed4, zeroed8 };
+  }
+
+  /**
+   * Make room in the CPU payload arrays for `slots4` and `slots8` slots in all (grown as claims
+   * grow them, so only the spare capacity past the claimed slots differs). Claims nothing. Throws,
+   * changing nothing, past the limits of `setSlotLimits`.
+   *
+   * @param slots4 - 4-bit slots to have room for, claimed ones included.
+   * @param slots8 - 8-bit slots to have room for, claimed ones included.
+   */
+  reserve(slots4: number, slots8: number): void {
+    if (slots4 > this.max4 || slots8 > this.max8) throw this.overflowError(slots4, slots8);
+    this.fit4(slots4);
+    this.fit8(slots8);
+  }
+
+  /** `n` slots of one tier, as `n` calls of claim4 / claim8 would give them (freed ones first, last freed first). */
+  private claimMany(n: number, wide: boolean): Uint32Array {
+    const map = new Uint32Array(n);
+    const free = wide ? this.free8 : this.free4;
+    let i = 0;
+    for (; i < n && free.length; i++) map[i] = free.pop()!;
+    if (i === n) return map;
+    // The rest past the end: one growth, to the size the one-at-a-time claims would have grown to.
+    // Grown (or refused) before anything is claimed, so a throw leaves the pool as it was.
+    const first = wide ? this.slots8 : this.slots4, rest = n - i;
+    if (wide) this.fit8(first + rest);
+    else this.fit4(first + rest);
+    for (let k = 0; k < rest; k++) map[i + k] = first + k;
+    if (wide) this.slots8 += rest;
+    else this.slots4 += rest;
+    return map;
   }
 
   /** Bytes of payload claimed so far. */
@@ -517,31 +725,56 @@ export class BrickGrid {
   /**
    * Mark empty bricks next to occupied ones with NEAR_BIT (model grids).
    * Changes only index entries, never payloads.
+   *
+   * @param edit - Receives the blocks and top entries changed.
+   * @param tick - Called after each z slab of bricks with the bricks it covered (progress).
    */
-  markNear(edit: BrickEdit): void {
+  markNear(edit: BrickEdit, tick?: (bricks: number) => void): void {
     const [dx, dy, dz] = this.dim;
-    const occ = new Uint8Array(dx * dy * dz);
+    const [tx, ty] = this.topDim;
+    const sx = dx, sxy = dx * dy;
+    // Each brick's state from the blocks themselves: 1 occupied, 2 marked near already, 0 empty.
+    const state = new Uint8Array(dx * dy * dz);
+    for (let ti = 0; ti < this.top.length; ti++) {
+      const t = this.top[ti];
+      if (!t) continue;
+      const X = (ti % tx) * 8, Y = (Math.floor(ti / tx) % ty) * 8, Z = Math.floor(ti / (tx * ty)) * 8;
+      for (let li = 0, at = (t - 1) * BLOCK_ENTRIES; li < BLOCK_ENTRIES; li++) {
+        const e = this.pool.blocks[at + li];
+        if (!e) continue;
+        const x = X + (li & 7), y = Y + ((li >> 3) & 7), z = Z + (li >> 6);
+        if (x >= dx || y >= dy || z >= dz) continue;
+        state[x + y * sx + z * sxy] = e & (SLOT_MASK | UNIFORM_BIT) ? 1 : e === NEAR_BIT ? 2 : 3;
+      }
+    }
+    // Near = within the 3³ neighbourhood of an occupied brick: a box dilation, one axis at a time.
+    const a = new Uint8Array(state.length), b = new Uint8Array(state.length);
+    for (let i = 0; i < state.length; i++) a[i] = state[i] === 1 ? 1 : 0;
+    for (let r = 0; r < dy * dz; r++) {
+      const o = r * sx;
+      for (let x = 0; x < dx; x++) b[o + x] = a[o + x] | (x > 0 ? a[o + x - 1] : 0) | (x < dx - 1 ? a[o + x + 1] : 0);
+    }
     for (let z = 0; z < dz; z++)
+      for (let y = 0; y < dy; y++) {
+        const o = y * sx + z * sxy, lo = y > 0 ? o - sx : -1, hi = y < dy - 1 ? o + sx : -1;
+        for (let x = 0; x < dx; x++) a[o + x] = b[o + x] | (lo >= 0 ? b[lo + x] : 0) | (hi >= 0 ? b[hi + x] : 0);
+      }
+    for (let z = 0; z < dz; z++) {
+      const o = z * sxy, lo = z > 0 ? o - sxy : -1, hi = z < dz - 1 ? o + sxy : -1;
+      for (let i = 0; i < sxy; i++) b[o + i] = a[o + i] | (lo >= 0 ? a[lo + i] : 0) | (hi >= 0 ? a[hi + i] : 0);
+    }
+    for (let z = 0; z < dz; z++) {
       for (let y = 0; y < dy; y++)
         for (let x = 0; x < dx; x++) {
-          const e = this.entry(x, y, z);
-          if (e & (SLOT_MASK | UNIFORM_BIT)) occ[x + y * dx + z * dx * dy] = 1;
-        }
-    for (let z = 0; z < dz; z++)
-      for (let y = 0; y < dy; y++)
-        for (let x = 0; x < dx; x++) {
-          if (occ[x + y * dx + z * dx * dy]) continue;
-          let near = false;
-          for (let k = -1; k <= 1 && !near; k++)
-            for (let j = -1; j <= 1 && !near; j++)
-              for (let i = -1; i <= 1 && !near; i++) {
-                const a = x + i, b = y + j, c = z + k;
-                if (a >= 0 && b >= 0 && c >= 0 && a < dx && b < dy && c < dz && occ[a + b * dx + c * dx * dy]) near = true;
-              }
-          const e = this.entry(x, y, z);
-          const want = near ? NEAR_BIT : 0;
+          const i = x + y * sx + z * sxy, st = state[i];
+          if (st === 1) continue;
+          const want = b[i] ? NEAR_BIT : 0;
+          // Same writes, in the same order, as comparing every entry: only what differs is set.
+          const e = st === 0 ? 0 : st === 2 ? NEAR_BIT : this.entry(x, y, z);
           if (e !== want) this.setEntry(x, y, z, want, edit);
         }
+      tick?.(sxy);
+    }
   }
 
   /** Read back a voxel from the sparse form. For verification and CPU picking. */
@@ -593,6 +826,35 @@ export class BrickGrid {
     const e = this.pool.encode(prev, cells, edit);
     if (e !== prev) this.setEntry(bxi, byi, bzi, e, edit);
   }
+}
+
+/** Copy local slot i's `words` words of `from` to slot `map[i]` of `to`, a run of consecutive slots at a time. */
+function copyRuns(map: Uint32Array, from: Uint32Array, to: Uint32Array, words: number, lo = 0, hi = map.length): void {
+  for (let i = lo; i < hi; ) {
+    let j = i + 1;
+    while (j < hi && map[j] === map[j - 1] + 1) j++;
+    to.set(from.subarray(i * words, j * words), map[i] * words);
+    i = j;
+  }
+}
+
+/**
+ * Slot capacity for payload arrays that must hold `need` slots, from `have`: 1.5x steps (at least
+ * 64 slots), so at a few hundred MB the spare room and the copy stay a third of the array rather
+ * than all of it, and never past `max`, since a mirror bigger than the GPU pool it feeds is
+ * useless (at 1 GiB its doubling to 2 GiB failed to allocate in Chrome).
+ */
+function grownSlots(have: number, need: number, max: number): number {
+  let n = Math.max(have, 64);
+  while (n < need) n = Math.ceil(n * 1.5);
+  return Math.min(n, max);
+}
+
+/** A copy of `a` with `len` words (zeros past its end). */
+function resized(a: Uint32Array, len: number): Uint32Array<ArrayBuffer> {
+  const next = new Uint32Array(len);
+  next.set(a);
+  return next;
 }
 
 function grow(a: Uint32Array, need: number): Uint32Array<ArrayBuffer> {
