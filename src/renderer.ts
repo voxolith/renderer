@@ -527,7 +527,7 @@ export interface RenderQuality {
    * Unlike the other knobs this is a pipeline constant, not a uniform: the code for these rays is
    * compiled out, which makes every pixel cheaper whether the scene has such materials or not
    * (they are whole copies of the ray walk, and what the largest of them holds live sets how many
-   * pixels the GPU runs at once: nightwood, which has none on screen, drew 17-22% faster without).
+   * pixels the GPU runs at once: nightwood, which has none on screen, drew 18-19% faster without).
    * So the first frame after a change compiles a pipeline, unless `prepare()` was awaited after
    * `setQuality`.
    */
@@ -539,10 +539,11 @@ export interface RenderQuality {
    * output, which stays the size the app gave the canvas or target. It takes effect only where
    * `temporal` does (the compute pipeline, with `temporal` on); otherwise it is ignored.
    *
-   * Work in progress: for now the scaled picture is a plain nearest-neighbour enlargement of the
-   * jittered frame (it shimmers by up to a pixel); the pass that accumulates the frames into a
-   * sharp picture is not there yet. The sampling follows Brian Karis, "High Quality Temporal
-   * Supersampling" (SIGGRAPH 2014, Advances in Real-Time Rendering course).
+   * A resolve pass then accumulates the frames into a sharp picture at the output size: history
+   * reprojected by the stored hit distance, clamped to the 3x3 neighbourhood of the new frame, and
+   * held as a running average where nothing moves. Precipitation smears under it. After Brian
+   * Karis, "High Quality Temporal Supersampling" (SIGGRAPH 2014, Advances in Real-Time Rendering
+   * course).
    */
   upscale: number;
 }
