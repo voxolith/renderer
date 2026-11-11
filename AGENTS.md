@@ -48,7 +48,9 @@ exercises it (examples: orbit, world, instances, rigged, nightwood) in a WebGPU 
   pools back.
 - `src/sublists.ts`: the sub-cell tables of static instance cells (headless, so verify checks
   them against `sampleInstance`): which instances can draw in each 16³ sub-cell and brick, from
-  each model's occupied 2³ sub-cells and the world voxel centres that sample them.
+  each model's occupied 2³ sub-cells and the world voxel centres that sample them. `movingTable`
+  gives each cell the moving set is in a table of its own every frame (the static one plus the
+  moving instances, marked by their cell boxes), so those cells do not fall back to whole lists.
 - `src/brick.ts`: `BrickGrid` / `BrickPool` (8³ bricks, 64³ top cells, 4- and 8-bit payloads,
   `NEAR_BIT` on model grids). `src/sparse.ts` holds sparse models (`modelAt`).
 - `src/instance.ts`: instance and pose packing (`INST_WORDS`, `PART_WORDS`, `MASK_B`,
@@ -98,7 +100,8 @@ exercises it (examples: orbit, world, instances, rigged, nightwood) in a WebGPU 
 - **Keep the shader small.** SwiftShader's compile time explodes with inlined copies of large
   functions. Keep one call site per big lookup (AO is one loop with one `isSolid`; instance
   sampling is one function). Optional features sit behind pipeline override constants
-  (`INSTANCES`, `PARTS`), so scenes without them compile them away. Temporal accumulation has
+  (`INSTANCES`, `PARTS`, `SCALED`, and `SELFTEST` for the self-test bands of debug modes 7-9),
+  so scenes without them compile them away. Temporal accumulation has
   entry points of its own (`trace_temporal*`), so no other pipeline references its code or bindings.
 - **Temporal is opt-in and exact when off.** With `temporal: false` the plain kernels run the
   same arithmetic as before it existed. Anything that changes voxels or instances must reach

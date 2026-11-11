@@ -2,7 +2,7 @@
 // the light. Skips provably-empty coarse blocks but stays fine-exact.
 
 import package::uniforms::U;
-import package::grid::{skipSize, brickOf, queryBrick, voxelIn, BrickQuery};
+import package::grid::{skipOf, brickOf, queryBrick, voxelIn, BrickQuery};
 import package::dda::{stepMask, seedSideDist, skipBlock};
 
 // Hard ceiling; the effective cap is U.shadowSteps (0 disables shadows upstream).
@@ -33,7 +33,7 @@ fn inShadow(origin : vec3<f32>, rd : vec3<f32>) -> bool {
       break;
     }
     if ((U.debug < 0.5 || U.debug > 9.5) && !q.solid) {
-      let seed = skipBlock(origin, rd, cell, deltaDist, skipSize(cell));
+      let seed = skipBlock(origin, rd, cell, deltaDist, skipOf(q));
       cell = seed.cell;
       sideDist = seed.sideDist;
       continue;
@@ -76,7 +76,7 @@ fn occludedTo(origin : vec3<f32>, rd : vec3<f32>, maxT : f32) -> bool {
       break;
     }
     if ((U.debug < 0.5 || U.debug > 9.5) && !q.solid) {
-      let seed = skipBlock(origin, rd, cell, deltaDist, skipSize(cell));
+      let seed = skipBlock(origin, rd, cell, deltaDist, skipOf(q));
       cell = seed.cell;
       sideDist = seed.sideDist;
       continue;

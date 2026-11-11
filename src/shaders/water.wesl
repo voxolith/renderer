@@ -10,7 +10,7 @@
 // point lights leave glints on the ripples.
 
 import package::uniforms::U;
-import package::trace::traverseUnderWater;
+import package::trace::{traverseUnderWater, Hit};
 import package::lights::pointLighting;
 
 // Surface height offset of the ripples at a point: three travelling waves at
@@ -52,9 +52,10 @@ fn lightDiffuse(p : vec3<f32>, n : vec3<f32>) -> vec3<f32> {
  * Shade a water voxel hit by the primary ray. `cell`/`n` are the hit cell and
  * face normal, `waterColor` the palette colour (the colour of deep water),
  * `att` how fast the bed fades with depth. The reflection itself is traced by
- * the caller, which owns the one-bounce tracer; this returns its direction.
+ * the caller, which owns the one-bounce tracer; this returns its direction. `bedWalk` false leaves
+ * out the walk to the bed.
  */
-fn shadeWater(ro : vec3<f32>, rd : vec3<f32>, cell : vec3<i32>, n : vec3<f32>, waterColor : vec3<f32>, att : f32) -> WaterShade {
+fn shadeWater(ro : vec3<f32>, rd : vec3<f32>, cell : vec3<i32>, n : vec3<f32>, waterColor : vec3<f32>, att : f32, bedWalk : bool) -> WaterShade {
   var out : WaterShade;
   // Exact point on the face that was hit.
   let c = vec3<f32>(cell);
@@ -71,7 +72,12 @@ fn shadeWater(ro : vec3<f32>, rd : vec3<f32>, cell : vec3<i32>, n : vec3<f32>, w
   // Down through the surface to whatever is under it.
   let tdir = refract(rd, wn, 0.75);
   let tr = select(rd, normalize(tdir), dot(tdir, tdir) > 1e-4);
-  let bed = traverseUnderWater(hp - wn * 0.02, tr, 0.0);
+  // Without the walk (RenderQuality.reflections off) the water shows its own colour only.
+  var bed : Hit;
+  bed.hit = false;
+  if (bedWalk) {
+    bed = traverseUnderWater(hp - wn * 0.02, tr, 0.0);
+  }
   let body = waterColor * lightDiffuse(hp, vec3<f32>(0.0, 1.0, 0.0));
   var under = body;
   if (bed.hit) {

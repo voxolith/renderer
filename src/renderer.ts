@@ -31,6 +31,7 @@ export type { DirtyBox, ModelSource };
 import { BrickGrid, BrickPool, BLOCK_ENTRIES, BRICK_WORDS_4, BRICK_WORDS_8, PALETTE_WORDS, TOP_B, emptyEdit, type BrickEdit } from "./brick";
 import { ENCODED_MODEL_VERSION, encodeModel, type EncodedModel, type ModelSource } from "./encode";
 import { MAX_CELL_INSTANCES, bakePlacement, type PlacementBake, type PlacementInput, type PlacementInstance, type PlacementModel } from "./placement";
+import { MOVING_TABLE_WORDS, movingTable } from "./sublists";
 import { LIGHT_FLOATS, MAX_LIGHTS, packLights, type PointLight } from "./lights";
 import type { AtmosphereParams } from "./atmosphere";
 import { BACKGROUND_FLOATS, GRADIENT_BACKGROUND_DEFAULTS, GRADIENT_BACKGROUND_WESL, gradientBackgroundParams, type BackgroundOptions } from "./background";
@@ -101,7 +102,8 @@ const UNIFORM_FLOATS = 108;
 // limit of 8 storage buffers per stage. Instance and part records are laid out
 // in instance.ts (INST_WORDS, PART_WORDS), shared with the CPU sampler. The
 // last region, "subs", holds the per-sub-cell instance lists of static
-// cells (see buildSubLists).
+// cells (see buildSubLists), then those of the cells the moving set is in
+// (movingTable).
 type RegionName = "tops" | "blocks" | "cells" | "list" | "inst" | "models" | "parts" | "subs";
 const REGIONS: RegionName[] = ["tops", "blocks", "cells", "list", "inst", "models", "parts", "subs"];
 /** u32 words per model: top offset, top dims, size, part grid top offset + 1 (0 = no parts). */
@@ -335,6 +337,8 @@ export interface PrepareNeeds {
   temporal?: boolean;
   /** Frames will be rendered into an offscreen `RenderTarget`, not only the canvas (default false). */
   target?: boolean;
+  /** The materials' secondary rays will be on (default: `RenderQuality.reflections` now). */
+  reflections?: boolean;
   /**
    * Instances of models added with a `scale` above 1 will be drawn (default: a placed one is now).
    * Their sampling is a variant of its own, so a scene without them does not pay for it.
@@ -377,21 +381,26 @@ function timedLoad<T>(hook: RendererLoadHook | undefined, phase: RendererLoadPha
   }
 }
 
-// Pipeline variants by number: 0 plain, 1 instances, 2 instances with parts, and + 3 with scaled
-// models compiled in (grid.wesl SCALED; 4 and 5, never 3). Compute and temporal kernels that write
-// the canvas directly are at + 6 in their caches.
+// Pipeline variants by number: 0 plain, 1 instances, 2 instances with parts, + 3 with scaled
+// models compiled in (grid.wesl SCALED; 4 and 5, never 3), + 12 with the self-test bands
+// (raymarch.wesl SELFTEST), and + 24 without the materials' secondary rays (REFLECTIONS). Compute and temporal kernels that write the canvas directly are at + 6
+// in their caches.
 /** Whether variant `v` samples instances (grid.wesl INSTANCES). */
 const vInstances = (v: number) => v % 3 > 0;
 /** Whether variant `v` samples posed instances (PARTS). */
 const vParts = (v: number) => v % 3 === 2;
 /** Whether variant `v` samples scaled models (SCALED). */
-const vScaled = (v: number) => v >= 3;
-/** The pipeline constants of variant `v` (the ids of grid.wesl's overrides). */
-const vConstants = (v: number): Record<number, number> => ({ 0: vInstances(v) ? 1 : 0, 1: vParts(v) ? 1 : 0, 4: vScaled(v) ? 1 : 0 });
+const vScaled = (v: number) => v % 12 >= 3;
+/** Whether variant `v` has the self-test bands of debug modes 7 to 9 (raymarch.wesl SELFTEST). */
+const vSelfTest = (v: number) => v % 24 >= 12;
+/** Whether variant `v` leaves out the materials' secondary rays (raymarch.wesl REFLECTIONS false; RenderQuality.reflections off). */
+const vNoReflections = (v: number) => v >= 24;
+/** The pipeline constants of variant `v` (the ids of the shader's overrides). */
+const vConstants = (v: number): Record<number, number> => ({ 0: vInstances(v) ? 1 : 0, 1: vParts(v) ? 1 : 0, 4: vScaled(v) ? 1 : 0, 5: vSelfTest(v) ? 1 : 0, 6: vNoReflections(v) ? 0 : 1 });
 
 /** A pipeline variant's label for RendererOptions.onLoad. */
 function variantLabel(base: string, v: number, canvas = false): string {
-  return base + (vParts(v) ? "+parts" : vInstances(v) ? "+instances" : "") + (vScaled(v) ? "+scaled" : "") + (canvas ? "+canvas" : "");
+  return base + (vParts(v) ? "+parts" : vInstances(v) ? "+instances" : "") + (vScaled(v) ? "+scaled" : "") + (vSelfTest(v) ? "+selftest" : "") + (vNoReflections(v) ? "-reflections" : "") + (canvas ? "+canvas" : "");
 }
 
 /** The pipeline a renderer uses when RendererOptions.pipeline is not given. */
@@ -507,6 +516,20 @@ export interface RenderQuality {
    * 32 bytes per pixel of history. With the `"fragment"` pipeline it has no effect.
    */
   temporal: boolean;
+  /**
+   * The secondary rays of materials (on in every preset): the bed seen through water and the
+   * water's reflection of the scene, a metal's reflection, and what shows through and on a glass.
+   * Off, water shows its own colour and reflects the background only, and metal and glass keep
+   * their diffuse colour; emissive materials are unchanged.
+   *
+   * Unlike the other knobs this is a pipeline constant, not a uniform: the code for these rays is
+   * compiled out, which makes every pixel cheaper whether the scene has such materials or not
+   * (they are whole copies of the ray walk, and what the largest of them holds live sets how many
+   * pixels the GPU runs at once: nightwood, which has none on screen, drew 17-22% faster without).
+   * So the first frame after a change compiles a pipeline, unless `prepare()` was awaited after
+   * `setQuality`.
+   */
+  reflections: boolean;
 }
 
 /** Names of the `QUALITY_PRESETS`; "low" has no shadows or AO. */
@@ -514,9 +537,9 @@ export type QualityPreset = "low" | "medium" | "high";
 
 /** Presets consumers can offer in a UI; `high` matches the engine's original look. */
 export const QUALITY_PRESETS: Record<QualityPreset, RenderQuality> = {
-  low: { maxSteps: 256, shadowSteps: 0, ao: false, temporal: false },
-  medium: { maxSteps: 512, shadowSteps: 48, ao: true, temporal: false },
-  high: { maxSteps: 768, shadowSteps: 90, ao: true, temporal: false },
+  low: { maxSteps: 256, shadowSteps: 0, ao: false, temporal: false, reflections: true },
+  medium: { maxSteps: 512, shadowSteps: 48, ao: true, temporal: false, reflections: true },
+  high: { maxSteps: 768, shadowSteps: 90, ao: true, temporal: false, reflections: true },
 };
 
 /** Optional infinite ground-plane drawn on ray-miss below `y` (off by default). */
@@ -638,11 +661,19 @@ export class Renderer {
   private poseDirty: [number, number][] = [];
   private cellData: Uint32Array;
   private cellTouched: number[] = [];
-  /** The "subs" region: a pointer per top cell (table offset + 1, 0 = use the cell list), then tables and lists. */
+  /** The "subs" region's static part: a pointer per top cell (table offset + 1, 0 = use the cell list), then tables and lists. */
   private subData: Uint32Array;
   private subLen: number;
   /** The static sub-table pointers, restored when moving instances leave a cell. */
   private staticSubs: Uint32Array;
+  /**
+   * The tables of the cells the moving set is in (sublists.ts movingTable), rebuilt with it; in the
+   * "subs" region they follow the static ones, at `subLen`.
+   */
+  private movingSubs = new Uint32Array(0);
+  private movingSubLen = 0;
+  /** Words of the region kept for them: it only grows, so a moving set changing size does not re-lay the index out. */
+  private movingSubCap = 0;
   private listData = new Uint32Array(1024);
   private listLen = 0;
   /** Brick-space dims, also the bounds test for the empty-space skip. */
@@ -1117,9 +1148,10 @@ export class Renderer {
       shadowSteps: Math.max(0, Math.min(512, Math.round(src.shadowSteps ?? this.quality.shadowSteps))),
       ao: src.ao ?? this.quality.ao,
       temporal: src.temporal ?? this.quality.temporal,
+      reflections: src.reflections ?? this.quality.reflections,
     };
     const q0 = this.quality;
-    if (next.maxSteps !== q0.maxSteps || next.shadowSteps !== q0.shadowSteps || next.ao !== q0.ao || next.temporal !== q0.temporal) this.resetHistory();
+    if (next.maxSteps !== q0.maxSteps || next.shadowSteps !== q0.shadowSteps || next.ao !== q0.ao || next.temporal !== q0.temporal || next.reflections !== q0.reflections) this.resetHistory();
     this.quality = next;
   }
 
@@ -1163,6 +1195,10 @@ export class Renderer {
    * and 9 replace the picture with self-test bands of the voxel lookup, green
    * where a stage works (see shaders/selftest.wesl); 10 shows how many steps
    * each primary ray took, blue (few) to red (the `maxSteps` cap).
+   *
+   * Modes 1 and 10 switch at no cost (a uniform). The self-test bands are a pipeline variant of
+   * their own (labelled `+selftest` in `RendererOptions.onLoad`), compiled by the first frame
+   * drawn in mode 7, 8 or 9, so no other pipeline carries them.
    */
   setDebug(v: number): void {
     if (v !== this.debugMode) this.resetHistory();
@@ -1816,7 +1852,9 @@ export class Renderer {
   /** The pipeline variant this frame needs (see vConstants). */
   private variant(): number {
     const b = this.instCount > 0 ? (this.partLen > 0 ? 2 : 1) : 0;
-    return b && this.scaledPlaced() ? b + 3 : b;
+    // The self-test bands are compiled only into the pipelines their debug modes draw with.
+    const t = this.debugMode >= 7 && this.debugMode <= 9 ? 12 : 0;
+    return (b && this.scaledPlaced() ? b + 3 : b) + t + (this.quality.reflections ? 0 : 24);
   }
 
   private rebuildDynamic(): void {
@@ -1853,6 +1891,9 @@ export class Renderer {
     if (this.temporal) this.markBoxes(this.instBox, this.staticCount, n);
     this.movingPoseWords = used;
     let at = this.staticListLen;
+    let subAt = 0;
+    const [tx, ty] = this.bricks.topDim;
+    const instI = new Int32Array(this.instData.buffer, this.instData.byteOffset, this.instData.length);
     const touched: number[] = [];
     for (const ci of this.cellTouched) {
       this.cellData[ci] = this.staticCells[ci];
@@ -1864,8 +1905,16 @@ export class Renderer {
       const count = Math.min(MAX_CELL_INSTANCES, sn + l.length);
       if (this.listData.length < at + count) this.listData = growU32(this.listData, at + count);
       this.cellData[ci] = (at << 8) | count;
-      // Its sub-lists do not know the moving instances: the whole list, while they are there.
-      this.subData[ci] = 0;
+      // Its static sub-lists do not know the moving instances: a table of its own while they are
+      // there, the static one plus them. (A static list too long for a table stays a whole list.)
+      const stat = this.staticSubs[ci];
+      if (sn === 0 || stat !== 0) {
+        if (this.movingSubs.length < subAt + MOVING_TABLE_WORDS) this.movingSubs = growU32(this.movingSubs, subAt + MOVING_TABLE_WORDS);
+        this.subData[ci] = this.subLen + subAt + 1;
+        subAt += movingTable(this.movingSubs, subAt, ci % tx, Math.floor(ci / tx) % ty, Math.floor(ci / (tx * ty)), this.subData, stat - 1, l, count - sn, instI);
+      } else {
+        this.subData[ci] = 0;
+      }
       for (let i = 0; i < sn && i < count; i++) this.listData[at + i] = this.listData[ss + i];
       for (let i = sn; i < count; i++) this.listData[at + i] = l[i - sn];
       at += count;
@@ -1875,6 +1924,8 @@ export class Renderer {
     this.cellTouched = touched;
     this.instCount = n;
     this.listLen = at;
+    this.movingSubLen = subAt;
+    if (subAt > this.movingSubCap) this.movingSubCap = subAt * 2;
     if (this.ensureLayout()) {
       this.staticDirty = false;
       this.uploadIndexAll();
@@ -1887,6 +1938,7 @@ export class Renderer {
       this.writeRegion("list", 0, this.listData, 0, this.listLen);
       this.writeRegion("cells", 0, this.cellData, 0, this.cellData.length);
       this.writeRegion("subs", 0, this.subData, 0, this.subLen);
+      this.writeRegion("subs", this.subLen, this.movingSubs, 0, this.movingSubLen);
       this.staticDirty = false;
       return;
     }
@@ -1895,6 +1947,7 @@ export class Renderer {
     for (const [lo, hi] of this.poseDirty) this.writeRegion("parts", lo, this.partData, lo, hi - lo);
     this.poseDirty = [];
     this.writeRegion("list", this.staticListLen, this.listData, this.staticListLen, this.listLen - this.staticListLen);
+    this.writeRegion("subs", this.subLen, this.movingSubs, 0, this.movingSubLen);
     for (const [lo, hi] of runs(dirty, 64)) {
       this.writeRegion("cells", lo, this.cellData, lo, hi - lo + 1);
       this.writeRegion("subs", lo, this.subData, lo, hi - lo + 1);
@@ -1938,18 +1991,33 @@ export class Renderer {
     this.uploadTopTexture(edit.tops);
   }
 
-  /** Mirror world top-level entries into the texture: the changed ones, or all. */
+  /**
+   * Mirror world top-level entries into the texture: the box around the changed ones, or all. One
+   * write either way (the texture is small, a texel per 64³ cell, and the box is read straight out
+   * of the top level, whose other texels in it are already what the texture holds).
+   */
   private uploadTopTexture(changed?: number[]): void {
     const [tx, ty, tz] = this.bricks.topDim;
     const top = this.bricks.top;
-    if (!changed || changed.length > 2048) {
-      this.gpu.device.queue.writeTexture({ texture: this.topTexture }, top, { bytesPerRow: tx * 4, rowsPerImage: ty }, { width: tx, height: ty, depthOrArrayLayers: tz });
-      return;
+    let x0 = 0, y0 = 0, z0 = 0, x1 = tx - 1, y1 = ty - 1, z1 = tz - 1;
+    if (changed) {
+      if (!changed.length) return;
+      x0 = tx; y0 = ty; z0 = tz; x1 = y1 = z1 = -1;
+      for (const i of changed) {
+        const x = i % tx, y = Math.floor(i / tx) % ty, z = Math.floor(i / (tx * ty));
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+        if (z < z0) z0 = z;
+        if (z > z1) z1 = z;
+      }
     }
-    for (const i of new Set(changed)) {
-      const x = i % tx, y = Math.floor(i / tx) % ty, z = Math.floor(i / (tx * ty));
-      this.gpu.device.queue.writeTexture({ texture: this.topTexture, origin: { x, y, z } }, top, { offset: i * 4, bytesPerRow: 4, rowsPerImage: 1 }, { width: 1, height: 1, depthOrArrayLayers: 1 });
-    }
+    this.gpu.device.queue.writeTexture(
+      { texture: this.topTexture, origin: { x: x0, y: y0, z: z0 } }, top,
+      { offset: (x0 + (y0 + z0 * ty) * tx) * 4, bytesPerRow: tx * 4, rowsPerImage: ty },
+      { width: x1 - x0 + 1, height: y1 - y0 + 1, depthOrArrayLayers: z1 - z0 + 1 },
+    );
   }
 
   // --- brick pool plumbing ---------------------------------------------------
@@ -2066,7 +2134,7 @@ export class Renderer {
       inst: this.instCount * INST_WORDS,
       models: this.models.length * MODEL_WORDS,
       parts: this.partLen,
-      subs: this.subLen,
+      subs: this.subLen + this.movingSubCap,
     };
   }
 
@@ -2133,6 +2201,7 @@ export class Renderer {
     this.writeRegion("models", 0, this.modelData, 0, this.models.length * MODEL_WORDS);
     this.writeRegion("parts", 0, this.partData, 0, this.partLen);
     this.writeRegion("subs", 0, this.subData, 0, this.subLen);
+    this.writeRegion("subs", this.subLen, this.movingSubs, 0, this.movingSubLen);
     this.poseDirty = [];
   }
 
@@ -2366,8 +2435,9 @@ export class Renderer {
     const parts = needs.parts ?? (this.instCount > 0 && this.partLen > 0);
     const scaled = needs.scaled ?? (this.instCount > 0 && this.scaledPlaced());
     const temporal = this.useCompute && (needs.temporal ?? this.quality.temporal);
-    const s = scaled ? 3 : 0;
-    const variants = [0, ...(instances ? [1 + s] : []), ...(parts ? [2 + s] : [])];
+    // Scaled models and reflections off are variants of their own, added to each.
+    const s = (scaled ? 3 : 0) + ((needs.reflections ?? this.quality.reflections) ? 0 : 24);
+    const variants = [s >= 24 ? 24 : 0, ...(instances ? [1 + s] : []), ...(parts ? [2 + s] : [])];
     // Kernels writing the canvas directly when it allows it; with `target`, the frame-texture ones too.
     const canvases = [...new Set([!!this.canvasLayout, ...(needs.target ? [false] : [])])];
     const jobs: Promise<void>[] = [];
@@ -2497,6 +2567,19 @@ export class Renderer {
    */
   gpuTimings(): Record<string, number> | null {
     return this.timer ? this.timer.timings() : null;
+  }
+
+  /**
+   * The unaveraged GPU milliseconds per pass of every frame measured since the last call (at most
+   * 1024 frames), and start collecting afresh; null without the `timestamp-query` feature. For
+   * benchmarks: call it once to discard what came before, draw the frames to measure, wait for
+   * `queue.onSubmittedWorkDone()`, then call it again and take a median. A frame is not measured
+   * when the timer's readback buffers are all still in flight, so expect fewer samples than frames.
+   *
+   * @returns Milliseconds per measured frame by pass name (e.g. `{ trace: [4.1, 4.3] }`), or null.
+   */
+  takeGpuSamples(): Record<string, number[]> | null {
+    return this.timer ? this.timer.takeSamples() : null;
   }
 }
 

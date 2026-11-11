@@ -85,15 +85,23 @@ fn gridEntry(topOff : u32, td : vec3<u32>, v : vec3<i32>) -> u32 {
   return idx[U.blocksOff + (blk - 1u) * 512u + l.x + l.y * 8u + l.z * 64u];
 }
 
-/** World brick entry of the brick containing voxel `v` (in range), through the top-level texture. */
-fn worldEntry(v : vec3<i32>) -> u32 {
-  let b = toU(v) / 8u;
-  let blk = textureLoad(topTex, b / 8u, 0).r;
+/** The world's top-level texel (its index block + 1, or 0) of the top cell containing voxel `v` (in range). */
+fn worldBlock(v : vec3<i32>) -> u32 {
+  return textureLoad(topTex, toU(v) / u32(TOP_B), 0).r;
+}
+
+/** Brick entry of the brick containing voxel `v` under the index block of top-level texel `blk`. */
+fn blockEntry(blk : u32, v : vec3<i32>) -> u32 {
   if (blk == 0u) {
     return 0u;
   }
-  let l = b % 8u;
+  let l = (toU(v) / 8u) % 8u;
   return idx[U.blocksOff + (blk - 1u) * 512u + l.x + l.y * 8u + l.z * 64u];
+}
+
+/** World brick entry of the brick containing voxel `v` (in range), through the top-level texture. */
+fn worldEntry(v : vec3<i32>) -> u32 {
+  return blockEntry(worldBlock(v), v);
 }
 
 /** Voxel at local cell `l` (0..7) of a brick with entry `e`. */
@@ -130,16 +138,18 @@ fn cellList(p : vec3<i32>) -> u32 {
 
 /**
  * The instances that may have voxels in the brick containing `p` (in range): (first word in idx,
- * count, flags). A static cell keeps a table with, per 16^3 sub-cell, a short list of just
+ * count, flags). A cell keeps a table with, per 16^3 sub-cell, a short list of just
  * the instances that can draw in it (in the cell list's order) and a mask of which
- * of its 8 bricks they reach; other cells give their whole list. Flags: bit 0 = the answer is exact
- * per brick (a count of 0 means nothing there), bit 1 = the whole sub-cell is empty. See
- * buildSubLists in renderer.ts (each table is followed by its lists).
+ * of its 8 bricks they reach (static instances by their occupied sub-cells, moving ones by their
+ * cell boxes); a cell whose list was too long for one gives its whole list. Flags: bit 0 = the
+ * answer is exact per brick (a count of 0 means nothing there), bit 1 = the whole sub-cell is
+ * empty, bit 2 = the whole top cell lists no instance. See buildSubLists and movingTable in
+ * sublists.ts (each table is followed by its lists).
  */
 fn instRange(p : vec3<i32>) -> vec3<u32> {
   let cl = cellList(p);
   if ((cl & 0xffu) == 0u) {
-    return vec3<u32>(0u, 0u, 3u);
+    return vec3<u32>(0u, 0u, 7u);
   }
   let u = toU(p);
   let t = u / u32(TOP_B);
@@ -463,20 +473,6 @@ fn coarseSolid(p : vec3<i32>) -> bool {
   return r.y != 0u && ((r.z & 1u) != 0u || instanceNear(c, r.xy));
 }
 
-// How far an empty brick at `p` lets a ray skip: its whole 64^3 top cell when
-// that holds nothing at all (no world block, no instances), its 16^3 sub-cell
-// when only instances are there and none reaches that sub-cell, else the brick.
-// Call only where coarseSolid(p) is false, so `p` is in range.
-fn skipSize(p : vec3<i32>) -> i32 {
-  if (textureLoad(topTex, toU(p) / u32(TOP_B), 0).r != 0u) {
-    return COARSE_B;
-  }
-  if ((INSTANCES && U.instanceCount != 0u) && (cellList(p) & 0xffu) != 0u) {
-    return select(COARSE_B, 16, (instRange(p).z & 2u) != 0u);
-  }
-  return TOP_B;
-}
-
 // --- per-brick queries for ray walks --------------------------------------------
 //
 // A ray takes several fine steps inside each brick. Looking the brick up
@@ -493,7 +489,11 @@ struct BrickQuery {
   near  : bool,
   /** The brick lies inside the grid. */
   inGrid : bool,
-  /** The instances that may be in the brick (instRange), looked up once for all its steps. */
+  /**
+   * The instances that may be in the brick (instRange), looked up once for all its steps. In a
+   * brick that is not solid, where no instance is sampled, `range.x` is instead how far a ray may
+   * skip from here, in voxels (skipOf): a field of its own for it made every bench view slower.
+   */
   range : vec2<u32>,
 };
 
@@ -520,18 +520,35 @@ fn queryBrick(p : vec3<i32>) -> BrickQuery {
     q.range = vec2<u32>(0u);
     return q;
   }
-  q.entry = worldEntry(p);
+  // The top-level texel and the instance range answer both what is in the brick and how far an
+  // empty one lets a ray skip, so they are read once here.
+  let blk = worldBlock(p);
+  q.entry = blockEntry(blk, p);
   q.range = vec2<u32>(0u);
+  var skip = select(TOP_B, COARSE_B, blk != 0u);
   var exact = true;
   if (INSTANCES && U.instanceCount != 0u) {
     let r = instRange(p);
     q.range = r.xy;
     exact = (r.z & 1u) != 0u;
+    if (blk == 0u && (r.z & 4u) == 0u) {
+      skip = select(COARSE_B, 16, (r.z & 2u) != 0u);
+    }
   }
   // A sub-table's brick mask answers "may an instance be here" outright; a whole list asks each.
   q.near = q.entry == 0u && q.range.y != 0u && (exact || instanceNear(c, q.range));
   q.solid = q.entry != 0u || q.near;
+  if (!q.solid) {
+    q.range = vec2<u32>(u32(skip), 0u);
+  }
   return q;
+}
+
+// How far the empty brick `q` describes lets a ray skip: its whole 64^3 top cell when that holds
+// nothing at all (no world block, no instances), its 16^3 sub-cell when only instances are there
+// and none reaches that sub-cell, else the brick. Only where q.solid is false.
+fn skipOf(q : BrickQuery) -> i32 {
+  return i32(q.range.x);
 }
 
 /** The voxel at fine cell `p`, which lies in the brick `q` describes. */

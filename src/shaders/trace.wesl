@@ -3,7 +3,7 @@
 // face normal, palette colour, and material index.
 
 import package::uniforms::{U, palette};
-import package::grid::{skipSize, brickOf, queryBrick, voxelIn, BrickQuery};
+import package::grid::{skipOf, brickOf, queryBrick, voxelIn, BrickQuery};
 import package::dda::{stepMask, seedSideDist, skipBlock};
 import package::materials::matOf;
 
@@ -85,7 +85,7 @@ fn walk(ro : vec3<f32>, rd : vec3<f32>, tStart : f32, skipWater : bool) -> Hit {
     // Empty-space skip: if the brick (or its whole 64^3 block) is empty,
     // jump the ray to that block's far plane in one hop.
     if ((U.debug < 0.5 || U.debug > 9.5) && !q.solid) {
-      let seed = skipBlock(ro, rd, cell, deltaDist, skipSize(cell));
+      let seed = skipBlock(ro, rd, cell, deltaDist, skipOf(q));
       cell = seed.cell;
       sideDist = seed.sideDist;
       normal = seed.axis * -sign(rd);

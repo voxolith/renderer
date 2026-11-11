@@ -6,6 +6,9 @@
 // so timing never stalls rendering. Browsers quantise timestamps (to about 100 µs unless
 // cross-origin isolated), which the averaging smooths out.
 
+/** Frames of raw samples kept between two {@link GpuTimer.takeSamples} calls. */
+const SAMPLE_CAP = 1024;
+
 /** Measures named GPU passes; see {@link GpuTimer.passWrites} and {@link GpuTimer.timings}. */
 export class GpuTimer {
   private readonly set: GPUQuerySet;
@@ -13,6 +16,8 @@ export class GpuTimer {
   private readonly readBufs: { buf: GPUBuffer; busy: boolean; names: string[] }[] = [];
   private names: string[] = [];
   private readonly avg = new Map<string, number>();
+  /** Raw milliseconds per pass since the last {@link GpuTimer.takeSamples}, capped at {@link SAMPLE_CAP}. */
+  private readonly raw = new Map<string, number[]>();
 
   /**
    * @param device - A device created with the `timestamp-query` feature.
@@ -63,6 +68,9 @@ export class GpuTimer {
             const name = slot.names[k];
             const prev = this.avg.get(name);
             this.avg.set(name, prev === undefined ? ms : prev * 0.9 + ms * 0.1);
+            let list = this.raw.get(name);
+            if (!list) this.raw.set(name, (list = []));
+            if (list.length < SAMPLE_CAP) list.push(ms);
           }
         },
         () => { slot.busy = false; },
@@ -73,5 +81,16 @@ export class GpuTimer {
   /** Average GPU milliseconds per pass, by name (empty until the first readback lands). */
   timings(): Record<string, number> {
     return Object.fromEntries(this.avg);
+  }
+
+  /**
+   * The unaveraged GPU milliseconds of every frame measured since the last call, by pass name,
+   * and start collecting afresh. For benchmarks, which want a median over a known set of frames
+   * rather than the running average (at most {@link SAMPLE_CAP} frames are kept between calls).
+   */
+  takeSamples(): Record<string, number[]> {
+    const out = Object.fromEntries(this.raw);
+    this.raw.clear();
+    return out;
   }
 }

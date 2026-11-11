@@ -194,17 +194,28 @@ export class TemporalHistory {
     }
     this.keyDir = L;
     // Shadowed point lights: moving one retraces point shadows (colour and brightness need nothing).
-    const sh: number[] = [];
+    // Compared in place against last frame's (position and range, four floats a light); a new
+    // list is made only when one changed.
+    const prev = this.shadowed;
+    let ns = 0, same = true;
     for (let i = 0; i < lightCount; i++) {
       const o = i * LIGHT_FLOATS;
-      if (lights[o + 8] > 0.5) sh.push(lights[o], lights[o + 1], lights[o + 2], lights[o + 3]);
+      if (lights[o + 8] <= 0.5) continue;
+      for (let j = 0; j < 4 && same; j++) same = ns + j < prev.length && prev[ns + j] === lights[o + j];
+      ns += 4;
     }
-    if (sh.length !== this.shadowed.length || sh.some((v, i) => v !== this.shadowed[i])) {
+    if (!same || ns !== prev.length) {
       flags |= FLAG_FORCE_POINT;
-      this.shadowed = Float32Array.from(sh);
+      const next = new Float32Array(ns);
+      for (let i = 0, at = 0; i < lightCount; i++) {
+        const o = i * LIGHT_FLOATS;
+        if (lights[o + 8] <= 0.5) continue;
+        for (let j = 0; j < 4; j++) next[at++] = lights[o + j];
+      }
+      this.shadowed = next;
       this.settle = this.settleFrames();
     }
-    if (sh.length) flags |= FLAG_POINT_SHADOWS;
+    if (ns) flags |= FLAG_POINT_SHADOWS;
     // A camera that moved leaves pixels to converge; while it moves, tiles take turns to sample.
     let moved = u[15] !== this.prevCam[15];
     for (let i = 0; i < 15 && !moved; i++) moved = i % 4 !== 3 && u[i] !== this.prevCam[i];

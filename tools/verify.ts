@@ -7,7 +7,7 @@ import { makeSparse, sparseCount, sparseFromDense, sparseGet, sparseSet, sparseT
 import { OccupancyGrid } from "../src/occupancy";
 import { seededRandom } from "../src/random";
 import { makePerf } from "../src/perf";
-import { buildSubLists, readSubLists, type SubListInstance } from "../src/sublists";
+import { MOVING_TABLE_WORDS, buildSubLists, movingTable, readSubLists, type SubListInstance } from "../src/sublists";
 import { INST_SCALE_SHIFT, INST_WORDS, packInstance, sampleInstance } from "../src/instance";
 import { PLACEMENT_BAKE_VERSION, PlacementBaker, bakePlacement, bindPlacement, normalizePlacement, placementTransferables, type PlacementBake, type PlacementInput, type PlacementInstance, type PlacementModel } from "../src/placement";
 import { ENCODED_MODEL_VERSION, encodeModel, encodedTransferables, placementModelOf, type EncodedModel, type ModelSource } from "../src/encode";
@@ -327,6 +327,47 @@ console.log("\nsub-cell instance tables:");
   const shifted = check((d, t, pc, pl, m, g) => buildSubLists(d, t, pc, pl.map((p) => ({ ...p, inst: { ...p.inst, x: p.inst.x + 0.3 } })), m, g));
   const unflipped = check((d, t, pc, pl, m, g) => buildSubLists(d, t, pc, pl.map((p) => ({ ...p, inst: { ...p.inst, mirror: false } })), m, g));
   ok(shifted.unlisted > 0 && unflipped.unlisted > 0, `  and a build that misplaces them is caught (${shifted.unlisted} and ${unflipped.unlisted} cells unlisted)`);
+
+  // A moving set on top: the first 40 instances static, the rest moving. Each cell the moving ones
+  // are in gets a table of its own (movingTable: the static table plus them, by their cell boxes),
+  // and every cell any of the 60 draws must still be listed for its brick, static entries first.
+  const nStatic = 40;
+  const staticCells = new Map<number, number[]>(), movingCells = new Map<number, number[]>();
+  for (const [ci, l] of perCell) {
+    const st = l.filter((k) => k < nStatic), mv = l.filter((k) => k >= nStatic);
+    if (st.length) staticCells.set(ci, st);
+    if (mv.length) movingCells.set(ci, mv);
+  }
+  const stat = buildSubLists(brickDim, topDim, staticCells, placed.slice(0, nStatic), 255, 192);
+  const data = new Uint32Array(stat.data.length + movingCells.size * MOVING_TABLE_WORDS);
+  data.set(stat.data);
+  let end = stat.data.length;
+  const instI = new Int32Array(words.buffer);
+  for (const [ci, mv] of movingCells) {
+    const used = movingTable(data, end, ci % topDim[0], Math.floor(ci / topDim[0]) % topDim[1], Math.floor(ci / (topDim[0] * topDim[1])), stat.data, stat.data[ci] - 1, mv, mv.length, instI);
+    data[ci] = end + 1;
+    end += used;
+  }
+  const merged = { data, cellWords: data.slice(0, stat.cellWords.length), stats: stat.stats };
+  let drawn = 0, unlisted = 0, unordered = 0, lost = 0, first = "";
+  placed.forEach((_, k) => {
+    const b = boxes[k], sm = sampleModel(k % models.length);
+    for (let z = Math.max(0, Math.floor(b[2]) - 1); z <= Math.min(world.z - 1, Math.ceil(b[5]) + 1); z++)
+      for (let y = Math.max(0, Math.floor(b[1]) - 1); y <= Math.min(world.y - 1, Math.ceil(b[4]) + 1); y++)
+        for (let x = Math.max(0, Math.floor(b[0]) - 1); x <= Math.min(world.x - 1, Math.ceil(b[3]) + 1); x++) {
+          if (!sampleInstance(words, k * INST_WORDS, undefined, sm, x, y, z)) continue;
+          drawn++;
+          const l = readSubLists(merged, topDim, x, y, z);
+          if (!l || !l.includes(k)) { unlisted++; first ||= `instance ${k} at ${x},${y},${z}`; continue; }
+          if (l.some((v, i) => i > 0 && l[i - 1] >= v)) unordered++;
+          // What the static table lists there stays listed.
+          const sl = readSubLists(stat, topDim, x, y, z);
+          if (sl && sl.some((v) => !l.includes(v))) lost++;
+        }
+  });
+  ok(movingCells.size > 0 && drawn > 5000 && unlisted === 0 && unordered === 0 && lost === 0,
+    `a moving set's cells keep sub-cell tables: every drawn cell of the static and the moving instances is listed for its brick, static first (${movingCells.size} cells)`,
+    `${unlisted} unlisted, ${unordered} out of order, ${lost} static entries lost, first ${first}`);
 }
 
 console.log("\nplacement bake (the renderer against a mock device):");
@@ -1351,6 +1392,7 @@ console.log("\npipeline warm-up (prepare):");
     for (const canvasStorage of [false, true])
       for (const temporal of [false, true])
       for (const deferPipelines of [false, true])
+      for (const reflections of [true, false])
       for (const scaled of [false, true]) {
         cases++;
         const mock = mockGpu({ canvasStorage });
@@ -1366,7 +1408,7 @@ console.log("\npipeline warm-up (prepare):");
         r.setInstances(staticSet);
         console.warn = warn0;
         r.setInstances(moving, { dynamic: true });
-        r.setQuality({ temporal });
+        r.setQuality({ temporal, reflections });
         const p = r.prepare({ target: true });
         await mock.flush();
         await p;
@@ -1387,13 +1429,16 @@ console.log("\npipeline warm-up (prepare):");
         r.setInstances([]);
         r.render(frame);
         r.render(frame, target);
+        // RenderQuality.reflections picks the REFLECTIONS constant of every pass drawn.
+        const wrongRefl = mock.drawn.filter((q) => q.constants && 6 in q.constants && q.constants[6] !== (reflections ? 1 : 0)).length;
+        if (wrongRefl && !bad) bad = `${mode}, reflections ${reflections}: ${wrongRefl} passes drawn with the other REFLECTIONS`;
         const sync = mock.pipelines.slice(made);
-        if (sync.length && !bad) bad = `${mode}, canvasStorage ${canvasStorage}, temporal ${temporal}, defer ${deferPipelines}, scaled ${scaled}: render made ${sync.map((q) => `${q.entry}${JSON.stringify(q.constants)}`).join(", ")}`;
+        if (sync.length && !bad) bad = `${mode}, canvasStorage ${canvasStorage}, temporal ${temporal}, defer ${deferPipelines}, reflections ${reflections}, scaled ${scaled}: render made ${sync.map((q) => `${q.entry}${JSON.stringify(q.constants)}`).join(", ")}`;
         const again = mock.pipelines.length;
         await r.prepare({ target: true });
         if (mock.pipelines.length !== again && !bad) bad = `${mode}: a second prepare compiled again`;
       }
-  ok(!bad, `after prepare, render makes no pipeline in ${cases} mode, canvas, temporal, deferPipelines and scaled combinations, and only scaled scenes draw with SCALED`, bad);
+  ok(!bad, `after prepare, render makes no pipeline in ${cases} mode, canvas, temporal, deferPipelines, reflections and scaled combinations; only scaled scenes draw with SCALED, and RenderQuality.reflections sets REFLECTIONS`, bad);
 
   // deferPipelines with a frame before prepare: the base pipelines are made synchronously, as today.
   {

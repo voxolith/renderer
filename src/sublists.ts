@@ -1,5 +1,6 @@
 // The sub-cell tables of static instance cells: built on the CPU at setInstances, read by
-// grid.wesl's instRange. Headless (no GPU), so the renderer's verify can check a build against
+// grid.wesl's instRange. (movingTable, below, adds a moving set's instances to the tables of the
+// cells they are in, every frame.) Headless (no GPU), so the renderer's verify can check a build against
 // brute-force sampling (sampleInstance).
 //
 // Layout, in the "subs" region: one word per world top cell (0 = no table, else the table's offset
@@ -18,7 +19,7 @@
 // made the world page 4-12% slower.
 
 import { BRICK_B, TOP_B } from "./brick";
-import { placement, scaledSize, type PackInstance } from "./instance";
+import { INST_WORDS, placement, scaledSize, type PackInstance } from "./instance";
 
 /** One placed instance, as the build needs it. */
 export interface SubListInstance {
@@ -212,6 +213,75 @@ export function readSubLists(lists: SubLists, topDim: readonly [number, number, 
   if (!((e >> (8 + bi)) & 1)) return [];
   const first = tbl + (e >>> 16);
   return Array.from(d.subarray(first, first + (e & 0xff)));
+}
+
+/** The most words {@link movingTable} writes: 64 entries and 64 lists of at most 255. */
+export const MOVING_TABLE_WORDS = 64 + 64 * 255;
+
+const mtCount = new Uint16Array(64), mtMask = new Uint8Array(64), mtAt = new Uint32Array(64), mtLast = new Int32Array(64);
+
+/**
+ * The sub-cell table of top cell (cx, cy, cz) while moving instances are in it: its static table
+ * (when it has one) with the moving instances added to the sub-cells and bricks their boxes reach,
+ * so a sample there still tests a short list, not the cell's whole one. Written to `out` at `at`
+ * in the tables' layout (see the top of this file), lists in the cell list's order: static first.
+ *
+ * A moving instance is marked by its world cell box, the one in its record (words 17-22) that the
+ * shader tests before it samples the instance, so nothing it draws is outside what is marked. That
+ * is looser than the static marking (every brick of the box counts as occupied), and costs nothing
+ * to build, which matters every frame.
+ *
+ * @param out - Where the table goes; needs {@link MOVING_TABLE_WORDS} words from `at`.
+ * @param at - Its first word in `out`.
+ * @param stat - The words holding the cell's static table, at `statOff`; `statOff` < 0 without one
+ *   (a cell with no static instances).
+ * @param moving - The moving instances' indices, of which the first `n` are in the cell's list
+ *   (the static sub-lists and `n` together stay within 255 a list, as the cell's list does).
+ * @param inst - The instance records, as i32.
+ * @returns The words written.
+ */
+export function movingTable(
+  out: Uint32Array, at: number, cx: number, cy: number, cz: number,
+  stat: Uint32Array, statOff: number, moving: ArrayLike<number>, n: number, inst: Int32Array,
+): number {
+  const x0 = cx * TOP_B, y0 = cy * TOP_B, z0 = cz * TOP_B;
+  for (let sc = 0; sc < 64; sc++) {
+    const e = statOff < 0 ? 0 : stat[statOff + sc];
+    mtCount[sc] = e & 0xff;
+    mtMask[sc] = (e >>> 8) & 0xff;
+    mtLast[sc] = -1;
+  }
+  // Two passes over the moving instances' bricks in this cell (local brick coordinates 0..7): count
+  // and mask, then fill.
+  const each = (visit: (sc: number, bit: number, i: number) => void) => {
+    for (let i = 0; i < n; i++) {
+      const o = moving[i] * INST_WORDS;
+      const bx0 = Math.max(0, (inst[o + 17] - x0) >> 3), bx1 = Math.min(7, (inst[o + 20] - 1 - x0) >> 3);
+      const by0 = Math.max(0, (inst[o + 18] - y0) >> 3), by1 = Math.min(7, (inst[o + 21] - 1 - y0) >> 3);
+      const bz0 = Math.max(0, (inst[o + 19] - z0) >> 3), bz1 = Math.min(7, (inst[o + 22] - 1 - z0) >> 3);
+      for (let gz = bz0; gz <= bz1; gz++)
+        for (let gy = by0; gy <= by1; gy++)
+          for (let gx = bx0; gx <= bx1; gx++) visit((gx >> 1) + (gy >> 1) * 4 + (gz >> 1) * 16, (gx & 1) + (gy & 1) * 2 + (gz & 1) * 4, i);
+    }
+  };
+  each((sc, bit, i) => {
+    mtMask[sc] |= 1 << bit;
+    if (mtLast[sc] !== i) { mtLast[sc] = i; mtCount[sc]++; }
+  });
+  let to = at + 64;
+  for (let sc = 0; sc < 64; sc++) {
+    const e = statOff < 0 ? 0 : stat[statOff + sc], sn = e & 0xff;
+    out[at + sc] = (((to - at) << 16) | (mtMask[sc] << 8) | mtCount[sc]) >>> 0;
+    const from = statOff + (e >>> 16);
+    for (let j = 0; j < sn; j++) out[to + j] = stat[from + j];
+    mtAt[sc] = to + sn;
+    to += mtCount[sc];
+    mtLast[sc] = -1;
+  }
+  each((sc, _bit, i) => {
+    if (mtLast[sc] !== i) { mtLast[sc] = i; out[mtAt[sc]++] = moving[i]; }
+  });
+  return to - at;
 }
 
 function grow(a: Uint32Array, need: number): Uint32Array<ArrayBuffer> {

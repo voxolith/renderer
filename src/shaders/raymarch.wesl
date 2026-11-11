@@ -311,16 +311,31 @@ fn trace_temporal_rgba(@builtin(global_invocation_id) id : vec3<u32>, @builtin(w
   }
 }
 
+// Pipeline constant: whether the self-test bands (setDebug 7, 8 and 9; selftest.wesl) are compiled
+// in. Each walks a ray of its own, three more call sites of the primary walk, so they get a variant
+// that only those modes use and every other pipeline leaves them out.
+@id(5) override SELFTEST : bool = false;
+
+// Pipeline constant: whether the secondary rays of materials are compiled in (RenderQuality.reflections):
+// the walk to the bed under water and the water's reflection, a metal's reflection, and what shows
+// through and on a glass. Each is a whole inlined copy of the walk and of instance sampling, and
+// the registers live at the costliest of them set how many pixels the GPU runs at once, for every
+// pixel, whether the scene has such materials or not. Without them water shows its own colour and
+// reflects the background, and metal and glass keep their diffuse colour; emission is unchanged.
+@id(6) override REFLECTIONS : bool = true;
+
 /** The colour of the pixel whose centre is `fragCoord.xy` (in pixels, as @builtin(position) gives it). */
 fn shadePixel(fragCoord : vec4<f32>) -> vec4<f32> {
-  if (U.debug > 6.5 && U.debug < 7.5) {
-    return vec4<f32>(selfTest(fragCoord.xy), 1.0);
-  }
-  if (U.debug > 7.5 && U.debug < 8.5) {
-    return vec4<f32>(selfTest2(fragCoord.xy), 1.0);
-  }
-  if (U.debug > 8.5 && U.debug < 9.5) {
-    return vec4<f32>(selfTest3(fragCoord.xy), 1.0);
+  if (SELFTEST) {
+    if (U.debug > 6.5 && U.debug < 7.5) {
+      return vec4<f32>(selfTest(fragCoord.xy), 1.0);
+    }
+    if (U.debug > 7.5 && U.debug < 8.5) {
+      return vec4<f32>(selfTest2(fragCoord.xy), 1.0);
+    }
+    if (U.debug > 8.5 && U.debug < 9.5) {
+      return vec4<f32>(selfTest3(fragCoord.xy), 1.0);
+    }
   }
   let r = primaryRay(fragCoord.xy);
   let uv = r.uv;
@@ -429,17 +444,17 @@ fn shadeHit(r : Primary, h : Hit, shadow : f32, ao : f32, point : vec3<f32>) -> 
     let m = matOf(h.mat);
     // Water: its own shading replaces the diffuse one entirely.
     if (abs(m.kind - 4.0) < 0.5) {
-      let w = shadeWater(ro, dir, h.cell, n, h.color, m.att);
+      let w = shadeWater(ro, dir, h.cell, n, h.color, m.att, REFLECTIONS);
       // The reflection is the one bounce this pass allows; skip it when it
       // would barely show, which is most of a surface seen from above.
       var reflCol = missBackground(w.point, w.reflectDir, 2.0 * pixelFootprint());
-      if (w.fresnel > 0.06) { reflCol = traceLit(w.point + w.normal * 0.6, w.reflectDir); }
+      if (REFLECTIONS && w.fresnel > 0.06) { reflCol = traceLit(w.point + w.normal * 0.6, w.reflectDir); }
       color = mix(w.under, reflCol, clamp(w.fresnel, 0.0, 1.0)) + w.glint * shadow;
     }
     // Emissive self-glow.
     color += h.color * m.emit;
     // Metal: a single (optionally roughened) reflection bounce.
-    if (m.metal > 0.01) {
+    if (REFLECTIONS && m.metal > 0.01) {
       var rdir = reflect(dir, n);
       if (m.rough > 0.01) {
         let j = m.rough * 0.5;
@@ -453,7 +468,7 @@ fn shadeHit(r : Primary, h : Hit, shadow : f32, ao : f32, point : vec3<f32>) -> 
       color = mix(color, rc * mix(vec3<f32>(1.0), h.color, 0.7), clamp(m.metal, 0.0, 1.0));
     }
     // Glass: transmit past the voxel (refracted), tinted, with a Fresnel reflection.
-    if (m.kind > 1.5 && m.kind < 2.5) {
+    if (REFLECTIONS && m.kind > 1.5 && m.kind < 2.5) {
       let eta = 1.0 / max(1.0 + m.ior, 1.0);
       var tdir = refract(dir, n, eta);
       if (dot(tdir, tdir) < 1e-4) { tdir = dir; } // total internal reflection → straight
