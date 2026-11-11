@@ -1440,6 +1440,19 @@ console.log("\npipeline warm-up (prepare):");
       }
   ok(!bad, `after prepare, render makes no pipeline in ${cases} mode, canvas, temporal, deferPipelines, reflections and scaled combinations; only scaled scenes draw with SCALED, and RenderQuality.reflections sets REFLECTIONS`, bad);
 
+  // RenderQuality.upscale: off (1) in every preset, clamped to 0.25..1, kept by a preset-less patch.
+  {
+    const r = new Renderer(mockGpu().gpu, placementScene.world(), "", { pipeline: "compute" });
+    const presets = (["low", "medium", "high"] as const).every((n) => { r.setQuality(n); return r.getQuality().upscale === 1; });
+    r.setQuality({ upscale: 0.1 });
+    const low = r.getQuality().upscale;
+    r.setQuality({ upscale: 3 });
+    const high = r.getQuality().upscale;
+    r.setQuality({ upscale: 0.5 });
+    r.setQuality({ ao: false });
+    ok(presets && low === 0.25 && high === 1 && r.getQuality().upscale === 0.5, "RenderQuality.upscale is 1 in every preset, clamps to 0.25..1 and survives other patches", `${presets} ${low} ${high} ${r.getQuality().upscale}`);
+  }
+
   // deferPipelines with a frame before prepare: the base pipelines are made synchronously, as today.
   {
     let fallback = "";

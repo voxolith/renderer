@@ -18,7 +18,7 @@ import package::fog::{applyFog, applySkyFog};
 import package::precip::precipitation;
 import package::shadow::occludedTo;
 import package::selftest::{selfTest, selfTest2, selfTest3};
-import package::temporal::{T, History, histOut, faceHash, sideOf, packHistory, unpackHistory, lookupHistory, changedAt, faceSample, coneDir, FLAG_HOLD, FLAG_FORCE_KEY, FLAG_FORCE_POINT, FLAG_POINT_SHADOWS};
+import package::temporal::{pixelJitter, T, History, histOut, faceHash, sideOf, packHistory, unpackHistory, lookupHistory, changedAt, faceSample, coneDir, FLAG_HOLD, FLAG_FORCE_KEY, FLAG_FORCE_POINT, FLAG_POINT_SHADOWS};
 
 struct VsOut {
   @builtin(position) pos : vec4<f32>,
@@ -52,7 +52,9 @@ fn traceLit(ro : vec3<f32>, rd : vec3<f32>) -> vec3<f32> {
 fn missColor(ro : vec3<f32>, rd : vec3<f32>, uv : vec2<f32>) -> vec3<f32> {
   // With a view distance, lights past it are behind the fog wall.
   let far = select(1e6, U.viewDistance, U.viewDistance > 0.0);
-  let c = applySkyFog(missBackground(ro, rd, pixelFootprint()), ro, rd) + lightGlow(ro, rd, far);
+  var c = applySkyFog(missBackground(ro, rd, pixelFootprint()), ro, rd);
+  // (Under temporal upscaling the glow is added to the resolved picture instead: finish.wesl.)
+  if (U.glowLater < 0.5) { c += lightGlow(ro, rd, far); }
   let pr = precipitation(ro, rd, 1e6);
   return mix(c, pr.rgb, pr.a);
 }
@@ -160,7 +162,7 @@ fn temporalPixel(px : vec2<u32>, tile : vec2<u32>) -> vec4<f32> {
   var terms = 0u;
   var fresh = false;
   if (inside) {
-    let r = primaryRay(vec2<f32>(px) + vec2<f32>(0.5));
+    let r = primaryRay(vec2<f32>(px) + pixelJitter());
     let box = intersectBox(r.ro, r.dir);
     let tNear = max(box.x, 0.0);
     if (box.y >= tNear) {
@@ -194,7 +196,7 @@ fn temporalPixel(px : vec2<u32>, tile : vec2<u32>) -> vec4<f32> {
   }
   if (!hit) {
     textureStore(histOut, px, vec4<u32>(0u));
-    let r = primaryRay(vec2<f32>(px) + vec2<f32>(0.5));
+    let r = primaryRay(vec2<f32>(px) + pixelJitter());
     return vec4<f32>(missColor(r.ro, r.dir, vec2<f32>(r.uv.x, -r.uv.y)), 1.0);
   }
 
@@ -269,7 +271,7 @@ fn temporalPixel(px : vec2<u32>, tile : vec2<u32>) -> vec4<f32> {
   h.mat = mat;
   h.color = palette[mat].rgb;
   h.t = t;
-  let c = shadeHit(primaryRay(vec2<f32>(px) + vec2<f32>(0.5)), h, mix(0.6, 1.0, next.key), next.ao, ps.free + ps.open * next.ratio);
+  let c = shadeHit(primaryRay(vec2<f32>(px) + pixelJitter()), h, mix(0.6, 1.0, next.key), next.ao, ps.free + ps.open * next.ratio);
   if (T.show > 1.5) {
     // Development view 2: samples averaged (black none .. white converged); red where no history
     // was found, blue where a change stamp forced a restart.
@@ -497,7 +499,7 @@ fn shadeHit(r : Primary, h : Hit, shadow : f32, ao : f32, point : vec3<f32>) -> 
   // share of it, then falling rain or snow.
   let tHit = length(hitCenter - ro);
   color = applyFog(color, ro, dir, tHit);
-  if (U.lightCount > 0.5) {
+  if (U.lightCount > 0.5 && U.glowLater < 0.5) {
     color += lightGlow(ro, dir, tHit);
   }
   let pr = precipitation(ro, dir, tHit);

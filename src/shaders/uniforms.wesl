@@ -48,7 +48,8 @@ struct Uniforms {
   waterWind    : vec2<f32>,                       // 90,91
   effectScale  : f32,                             // 92  voxels per unit of the effects' own sizes (1 = native)
   viewDistance : f32,                             // 93  fog.distance: rays stop there (0 = off)
-  _a0          : vec2<f32>,                       // 94,95  pad
+  glowLater    : f32,                             // 94  1 = leave the lights' glow out: temporal upscaling adds it after its resolve (finish.wesl)
+  _a0          : f32,                             // 95  pad
   // --- index regions (u32 word offsets into idx; see renderer.ts) ---
   topDim       : vec3<u32>, instanceCount : u32,  // 96-99  world top-level dims
   blocksOff    : u32, cellOff : u32, listOff : u32, instOff : u32, // 100-103

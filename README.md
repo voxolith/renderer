@@ -126,6 +126,12 @@ from one shared rest model, following the rest-space animation of:
   Intersection Function.* Eurographics 2026 Short Papers.
   [doi:10.2312/egs.20261026](https://doi.org/10.2312/egs.20261026)
 
+Temporal upscaling (`RenderQuality.upscale`: jittered primary rays, a reprojected colour history,
+neighbourhood clamping) follows:
+
+- Brian Karis. *High Quality Temporal Supersampling.* Advances in Real-Time Rendering in Games,
+  SIGGRAPH 2014 course.
+
 What was taken and what is Voxolith's own: [Research and credits](https://voxolith.github.io/docs/credits/).
 
 ## License

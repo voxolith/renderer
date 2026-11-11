@@ -25,7 +25,7 @@ struct Temporal {
   prevUp    : vec3<f32>, prevTan : f32,     // 8-11
   prevFwd   : vec3<f32>, prevAspect : f32,  // 12-15
   prevRes   : vec2<f32>, cap : f32, rate : u32, // 16-19  samples a pixel averages; tiles take turns 1 in `rate` frames
-  spread    : f32, lampRadius : f32, show : f32, _b : f32, // 20-23  key light cone half-angle (rad); point light radius (voxels); development view
+  spread    : f32, lampRadius : f32, show : f32, jitter : f32, // 20-23  key light cone half-angle (rad); point light radius (voxels); development view; primary-ray jitter index (0 = pixel centre)
 };
 
 // The previous frame's history is there to reuse (off after a reset).
@@ -40,6 +40,34 @@ const FLAG_FORCE_POINT : u32 = 8u;
 const FLAG_POINT_SHADOWS : u32 = 16u;
 
 @group(2) @binding(0) var<uniform> T : Temporal;
+
+// Halton radical inverse of `i` in base `b`.
+fn halton(i : u32, b : u32) -> f32 {
+  var f = 1.0;
+  var r = 0.0;
+  var n = i;
+  while (n > 0u) {
+    f = f / f32(b);
+    r = r + f * f32(n % b);
+    n = n / b;
+  }
+  return r;
+}
+
+/**
+ * Where in its pixel this frame's primary ray goes, as an offset from the pixel's corner: the
+ * centre without jitter (T.jitter 0), else a point of the Halton (2, 3) sequence, a different one
+ * each frame, so frames accumulated over time sample the whole pixel (temporal upscaling,
+ * RenderQuality.upscale). After Brian Karis, "High Quality Temporal Supersampling", SIGGRAPH 2014
+ * Advances in Real-Time Rendering course.
+ */
+fn pixelJitter() -> vec2<f32> {
+  if (T.jitter < 0.5) {
+    return vec2<f32>(0.5);
+  }
+  let i = u32(T.jitter);
+  return vec2<f32>(halton(i, 2u), halton(i, 3u));
+}
 // Last frame's history, and this frame's: per pixel (face hash, distance bits, key|ao|count,
 // point ratio rgb), packed by packHistory.
 @group(2) @binding(1) var histIn : texture_2d<u32>;
@@ -145,11 +173,16 @@ fn lookupHistory(p : vec3<f32>, hash : u32, n : vec3<f32>) -> vec4<u32> {
       best = v;
     }
   }
-  // Cut the count (bits 26..31) of an estimate.
+  // Cut the count (bits 26..31) of an estimate. Not under jitter (temporal upscaling): there a
+  // pixel's ray lands on another face of its footprint every frame, so an estimate is all a pixel
+  // ever finds; cut, no pixel would converge and every term would be traced every frame. Kept, the
+  // pixel's terms become the average over the faces it covers, and hold once converged; the price
+  // is at silhouettes, where a pixel can carry the shadow and AO of the surface next to it.
+  let keep = T.jitter > 0.5;
   if (best.x != 0u) {
-    return vec4<u32>(best.x, best.y, (best.z & 0x03ffffffu) | (min(best.z >> 26u, 2u) << 26u), best.w);
+    return vec4<u32>(best.x, best.y, select((best.z & 0x03ffffffu) | (min(best.z >> 26u, 2u) << 26u), best.z, keep), best.w);
   }
-  return vec4<u32>(other.x, other.y, other.z & 0x03ffffffu, other.w);
+  return vec4<u32>(other.x, other.y, select(other.z & 0x03ffffffu, other.z, keep), other.w);
 }
 
 // Whether something changed this frame in the brick column holding `cell`.

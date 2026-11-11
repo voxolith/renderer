@@ -21,6 +21,8 @@ import precipWesl from "./shaders/precip.wesl?raw";
 import selftestWesl from "./shaders/selftest.wesl?raw";
 import temporalWesl from "./shaders/temporal.wesl?raw";
 import raymarchWesl from "./shaders/raymarch.wesl?raw";
+import resolveWgsl from "./shaders/resolve.wesl?raw";
+import finishWgsl from "./shaders/finish.wesl?raw";
 import type { GpuContext } from "./device";
 import type { DirtyBox } from "./box";
 import { INST_SCALE_SHIFT, INST_WORDS, maxPoseWords, modelScale, packInstance, packPose } from "./instance";
@@ -530,6 +532,19 @@ export interface RenderQuality {
    * `setQuality`.
    */
   reflections: boolean;
+  /**
+   * Temporal upscaling (1, off, in every preset): the scale the scene is traced at relative to the
+   * output, 0.25 to 1. Below 1 the renderer traces `ceil(size × upscale)` pixels, each frame
+   * through a different point of the pixel (a Halton sequence), and scales the result up to the
+   * output, which stays the size the app gave the canvas or target. It takes effect only where
+   * `temporal` does (the compute pipeline, with `temporal` on); otherwise it is ignored.
+   *
+   * Work in progress: for now the scaled picture is a plain nearest-neighbour enlargement of the
+   * jittered frame (it shimmers by up to a pixel); the pass that accumulates the frames into a
+   * sharp picture is not there yet. The sampling follows Brian Karis, "High Quality Temporal
+   * Supersampling" (SIGGRAPH 2014, Advances in Real-Time Rendering course).
+   */
+  upscale: number;
 }
 
 /** Names of the `QUALITY_PRESETS`; "low" has no shadows or AO. */
@@ -537,9 +552,9 @@ export type QualityPreset = "low" | "medium" | "high";
 
 /** Presets consumers can offer in a UI; `high` matches the engine's original look. */
 export const QUALITY_PRESETS: Record<QualityPreset, RenderQuality> = {
-  low: { maxSteps: 256, shadowSteps: 0, ao: false, temporal: false, reflections: true },
-  medium: { maxSteps: 512, shadowSteps: 48, ao: true, temporal: false, reflections: true },
-  high: { maxSteps: 768, shadowSteps: 90, ao: true, temporal: false, reflections: true },
+  low: { maxSteps: 256, shadowSteps: 0, ao: false, temporal: false, reflections: true, upscale: 1 },
+  medium: { maxSteps: 512, shadowSteps: 48, ao: true, temporal: false, reflections: true, upscale: 1 },
+  high: { maxSteps: 768, shadowSteps: 90, ao: true, temporal: false, reflections: true, upscale: 1 },
 };
 
 /** Optional infinite ground-plane drawn on ray-miss below `y` (off by default). */
@@ -593,6 +608,26 @@ export class Renderer {
   private readonly frameLayout: GPUBindGroupLayout;
   private presentLayout: GPUBindGroupLayout | null = null;
   private presentPipeline: GPURenderPipeline | null = null;
+  /**
+   * Temporal upscaling's resolve pass (shaders/resolve.wesl; RenderQuality.upscale below 1), made
+   * when first needed: its pipeline, its uniform block (the frame's camera, the output's aspect,
+   * whether the accumulated picture can be reused), the two accumulated pictures at the output's
+   * size it writes in turn, and the bind groups by which of them is written.
+   */
+  private resolvePipeline: GPUComputePipeline | null = null;
+  /** The present pass for the resolved picture (opaque: its alpha is the resolve's weights). */
+  private presentResolvedPipeline: GPURenderPipeline | null = null;
+  private resolveLayout: GPUBindGroupLayout | null = null;
+  private resolveUniform: GPUBuffer | null = null;
+  private readonly resolveData = new Float32Array(20 + 64 * 4);
+  /** The lights as the last resolved frame saw them, to tell the resolve which changed. */
+  private resolveLights = new Float32Array(0);
+  private resolveLightCount = 0;
+  private resolveSampler: GPUSampler | null = null;
+  /** Group 1 of the present pass for the resolved picture (shaders/finish.wesl): that picture and the frame's history. */
+  private finishLayout: GPUBindGroupLayout | null = null;
+  private acc: { tex: [GPUTexture, GPUTexture]; views: [GPUTextureView, GPUTextureView]; present: [GPUBindGroup, GPUBindGroup]; w: number; h: number; at: number; valid: boolean } | null = null;
+  private resolveGroup: { frame: GPUTexture; hist: GPUTextureView; out: number; group: GPUBindGroup } | null = null;
   /** The present pass's descriptor (its module made on first use), and its synchronous maker. */
   private presentDesc: (() => GPURenderPipelineDescriptor) | null = null;
   private makePresent: (() => GPURenderPipeline) | null = null;
@@ -1149,9 +1184,10 @@ export class Renderer {
       ao: src.ao ?? this.quality.ao,
       temporal: src.temporal ?? this.quality.temporal,
       reflections: src.reflections ?? this.quality.reflections,
+      upscale: Math.max(0.25, Math.min(1, src.upscale ?? this.quality.upscale)),
     };
     const q0 = this.quality;
-    if (next.maxSteps !== q0.maxSteps || next.shadowSteps !== q0.shadowSteps || next.ao !== q0.ao || next.temporal !== q0.temporal || next.reflections !== q0.reflections) this.resetHistory();
+    if (next.maxSteps !== q0.maxSteps || next.shadowSteps !== q0.shadowSteps || next.ao !== q0.ao || next.temporal !== q0.temporal || next.reflections !== q0.reflections || next.upscale !== q0.upscale) this.resetHistory();
     this.quality = next;
   }
 
@@ -1226,6 +1262,11 @@ export class Renderer {
     this.bgDummy?.destroy();
     this.temporal?.destroy();
     this.temporal = null;
+    this.acc?.tex.forEach((t) => t.destroy());
+    this.acc = null;
+    this.resolveUniform?.destroy();
+    this.resolveUniform = null;
+    this.resolveGroup = null;
   }
 
   /**
@@ -2277,6 +2318,13 @@ export class Renderer {
     const width = target?.width ?? this.gpu.width;
     const height = target?.height ?? this.gpu.height;
 
+    // Temporal upscaling: the scene is traced smaller than the output (RenderQuality.upscale),
+    // wherever temporal accumulation runs. The aspect stays the output's, so the view is the same.
+    const q = this.quality;
+    const upscale = q.temporal && q.upscale < 1 && this.useCompute && this.debugMode === 0 && (q.shadowSteps > 0 || q.ao) ? q.upscale : 1;
+    const traceW = upscale < 1 ? Math.ceil(width * upscale) : width;
+    const traceH = upscale < 1 ? Math.ceil(height * upscale) : height;
+
     const u = this.uniformData;
     u[0] = p.camPos[0]; u[1] = p.camPos[1]; u[2] = p.camPos[2];
     u[4] = p.camRight[0]; u[5] = p.camRight[1]; u[6] = p.camRight[2];
@@ -2287,7 +2335,7 @@ export class Renderer {
     u[19] = p.time ?? 0;
     u[20] = p.lightDir[0]; u[21] = p.lightDir[1]; u[22] = p.lightDir[2];
     u[23] = width / height;
-    u[24] = width; u[25] = height;
+    u[24] = traceW; u[25] = traceH;
     u[26] = this.highlight.mode;
     u[27] = this.highlight.slotMin;
     u[28] = this.highlight.slotMax;
@@ -2318,6 +2366,8 @@ export class Renderer {
     u[90] = p.waterWind?.[0] ?? 0; u[91] = p.waterWind?.[1] ?? 0;
     u[92] = p.effectScale ?? 1;
     u[93] = fog?.distance && fog.distance > 0 ? fog.distance : 0;
+    // Under temporal upscaling the lights' glow is added after the resolve (shaders/finish.wesl).
+    u[94] = upscale < 1 ? 1 : 0;
     // Index regions (96..107), as u32.
     const w = this.uniformWords;
     const [tx, ty, tz] = this.bricks.topDim;
@@ -2348,9 +2398,10 @@ export class Renderer {
     // "auto" keeps frames with GPU-posed instances on the fragment path (faster for that kernel),
     // unless temporal accumulation is on: it lives in the compute path, and saves more than that.
     const posed = this.instCount > 0 && this.partLen > 0;
-    const q = this.quality;
     let temporal = q.temporal && this.useCompute && this.debugMode === 0 && (q.shadowSteps > 0 || q.ao);
-    if (temporal && this.temporal?.crowded()) {
+    // (While upscaling, a crowded frame still goes through the temporal kernel: the plain one would
+    // draw at another size.)
+    if (temporal && upscale === 1 && this.temporal?.crowded()) {
       // Most of the world changed for this frame: accumulating would trace everything anyway.
       this.temporal.skip();
       temporal = false;
@@ -2361,9 +2412,9 @@ export class Renderer {
       let group: GPUBindGroup | undefined;
       if (temporal) {
         this.temporal ??= new TemporalHistory(device, this.gridSize);
-        group = this.temporal.prepare(u, p.lightDir, p.lightAngle ?? 0.02, p.effectScale ?? 1, this.lightData, this.lightCount, width, height);
+        group = this.temporal.prepare(u, p.lightDir, p.lightAngle ?? 0.02, p.effectScale ?? 1, this.lightData, this.lightCount, traceW, traceH, upscale < 1);
       }
-      this.renderCompute(encoder, view, width, height, !target, group);
+      this.renderCompute(encoder, view, traceW, traceH, !target, group, upscale < 1 ? { width, height } : undefined);
       const readC = this.timer?.resolve(encoder);
       device.queue.submit([encoder.finish()]);
       readC?.();
@@ -2439,7 +2490,9 @@ export class Renderer {
     const s = (scaled ? 3 : 0) + ((needs.reflections ?? this.quality.reflections) ? 0 : 24);
     const variants = [s >= 24 ? 24 : 0, ...(instances ? [1 + s] : []), ...(parts ? [2 + s] : [])];
     // Kernels writing the canvas directly when it allows it; with `target`, the frame-texture ones too.
-    const canvases = [...new Set([!!this.canvasLayout, ...(needs.target ? [false] : [])])];
+    // Upscaled frames never write the canvas directly.
+    const upscaling = temporal && this.quality.upscale < 1;
+    const canvases = [...new Set([...(upscaling ? [] : [!!this.canvasLayout]), ...(needs.target || upscaling ? [false] : [])])];
     const jobs: Promise<void>[] = [];
     for (const v of variants) {
       if (!this.useCompute) {
@@ -2455,6 +2508,7 @@ export class Renderer {
     }
     // The compute path's present pass, wherever a kernel writes the frame texture instead of the canvas.
     if (this.useCompute && canvases.includes(false)) jobs.push(this.preparePresent());
+    if (upscaling) jobs.push(this.prepareResolve());
     return Promise.all(jobs).then(() => undefined);
   }
 
@@ -2508,11 +2562,145 @@ export class Renderer {
     return done;
   }
 
+  /** The resolve pass's pipeline descriptor (and its layout, made once). */
+  private resolveDesc(): GPUComputePipelineDescriptor {
+    const { device } = this.gpu;
+    const C = GPUShaderStage.COMPUTE;
+    this.resolveLayout ??= device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: C, buffer: { type: "uniform" } },
+        { binding: 1, visibility: C, buffer: { type: "uniform" } },
+        { binding: 2, visibility: C, texture: { sampleType: "float" } },
+        { binding: 3, visibility: C, texture: { sampleType: "uint" } },
+        { binding: 4, visibility: C, texture: { sampleType: "float" } },
+        { binding: 5, visibility: C, sampler: { type: "filtering" } },
+        { binding: 6, visibility: C, storageTexture: { access: "write-only", format: "rgba16float" } },
+      ],
+    });
+    return {
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.resolveLayout] }),
+      compute: { module: device.createShaderModule({ code: resolveWgsl }), entryPoint: "resolve" },
+    };
+  }
+
+  /** The descriptor of the present pass for the resolved picture. */
+  private presentResolvedDesc(): GPURenderPipelineDescriptor {
+    const { device } = this.gpu;
+    // finish.wesl after uniforms.wesl's text: it reads U and the lights through the main bind group.
+    const module = device.createShaderModule({ code: `${uniformsWesl}\n${finishWgsl}` });
+    this.finishLayout ??= device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "unfilterable-float" } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "uint" } },
+      ],
+    });
+    return {
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.bindLayout, this.finishLayout] }),
+      vertex: { module, entryPoint: "vs" },
+      fragment: { module, entryPoint: "fs", targets: [{ format: this.gpu.format }] },
+      primitive: { topology: "triangle-list" },
+    };
+  }
+
+  /** prepareVariant for the resolve pass and the present pass of its picture. */
+  private prepareResolve(): Promise<void> {
+    if (this.resolvePipeline && this.presentResolvedPipeline) return Promise.resolve();
+    const inFlight = this.preparing.get("resolve");
+    if (inFlight) return inFlight;
+    const onLoad = this.onLoad;
+    if (onLoad) reportLoad(onLoad, "pipelines", "start", "resolve");
+    const done = Promise.all([
+      this.gpu.device.createComputePipelineAsync(this.resolveDesc()).then((p) => { this.resolvePipeline ??= p; }),
+      this.gpu.device.createRenderPipelineAsync(this.presentResolvedDesc()).then((p) => { this.presentResolvedPipeline ??= p; }),
+    ]).then(() => undefined).finally(() => {
+      this.preparing.delete("resolve");
+      if (onLoad) reportLoad(onLoad, "pipelines", "end", "resolve");
+    });
+    this.preparing.set("resolve", done);
+    return done;
+  }
+
+  /**
+   * Temporal upscaling's resolve pass: this frame (in `this.frame`, traced small by the temporal
+   * kernel) into the accumulated picture of `width` × `height`. Returns the present pass's bind
+   * group for that picture.
+   */
+  private resolve(encoder: GPUCommandEncoder, width: number, height: number): GPUBindGroup {
+    const { device } = this.gpu;
+    const temporal = this.temporal!;
+    this.resolvePipeline ??= timedLoad(this.onLoad, "pipelines", "resolve", () => device.createComputePipeline(this.resolveDesc()));
+    this.resolveUniform ??= device.createBuffer({ size: this.resolveData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    if (!this.acc || this.acc.w !== width || this.acc.h !== height) {
+      this.acc?.tex.forEach((t) => t.destroy());
+      const make = () => device.createTexture({ size: { width, height }, format: "rgba16float", usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING });
+      const tex: [GPUTexture, GPUTexture] = [make(), make()];
+      const views: [GPUTextureView, GPUTextureView] = [tex[0].createView(), tex[1].createView()];
+      const present = (i: number) => device.createBindGroup({ layout: this.presentLayout!, entries: [{ binding: 0, resource: views[i] }] });
+      this.acc = { tex, views, present: [present(0), present(1)], w: width, h: height, at: 0, valid: false };
+      this.resolveGroup = null;
+    }
+    const acc = this.acc;
+    // The accumulated picture carries over only where the temporal history does (it resets with it).
+    const valid = acc.valid && temporal.reusing();
+    const out = 1 - acc.at;
+    const r = this.resolveData;
+    r.set(this.uniformData.subarray(0, 16));
+    r[16] = this.uniformData[23];
+    r[17] = valid ? 1 : 0;
+    r[18] = (globalThis as { __voxolithTemporal?: { raw?: number } }).__voxolithTemporal?.raw ?? 0;
+    // The lights that changed since the last resolved frame, as they are and as they were
+    // (position and range): the resolve keeps surfaces in their reach from holding.
+    const L = this.lightData, was = this.resolveLights, n = Math.max(this.lightCount, this.resolveLightCount);
+    let changed = 0;
+    for (let i = 0; i < n && changed < 63; i++) {
+      const o = i * LIGHT_FLOATS, now = i < this.lightCount, before = i < this.resolveLightCount;
+      let same = now && before;
+      for (let j = 0; j < LIGHT_FLOATS && same; j++) same = L[o + j] === was[o + j];
+      if (same) continue;
+      if (now) r.set(L.subarray(o, o + 4), 20 + 4 * changed++);
+      if (before) r.set(was.subarray(o, o + 4), 20 + 4 * changed++);
+    }
+    r[19] = changed;
+    if (this.resolveLights.length !== L.length) this.resolveLights = new Float32Array(L.length);
+    this.resolveLights.set(L);
+    this.resolveLightCount = this.lightCount;
+    device.queue.writeBuffer(this.resolveUniform, 0, r);
+    const frame = this.frame!.tex, hist = temporal.written();
+    if (!this.resolveGroup || this.resolveGroup.frame !== frame || this.resolveGroup.hist !== hist || this.resolveGroup.out !== out) {
+      this.resolveGroup = {
+        frame, hist, out,
+        group: device.createBindGroup({
+          layout: this.resolveLayout!,
+          entries: [
+            { binding: 0, resource: { buffer: this.resolveUniform } },
+            { binding: 1, resource: { buffer: temporal.uniform } },
+            { binding: 2, resource: frame.createView() },
+            { binding: 3, resource: hist },
+            { binding: 4, resource: acc.views[acc.at] },
+            { binding: 5, resource: (this.resolveSampler ??= device.createSampler({ magFilter: "linear", minFilter: "linear" })) },
+            { binding: 6, resource: acc.views[out] },
+          ],
+        }),
+      };
+    }
+    const cp = encoder.beginComputePass({ timestampWrites: this.timer?.passWrites("resolve") as GPUComputePassTimestampWrites | undefined });
+    cp.setPipeline(this.resolvePipeline);
+    cp.setBindGroup(0, this.resolveGroup.group);
+    cp.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8));
+    cp.end();
+    acc.at = out;
+    acc.valid = true;
+    this.presentResolvedPipeline ??= device.createRenderPipeline(this.presentResolvedDesc());
+    return device.createBindGroup({ layout: this.finishLayout!, entries: [{ binding: 0, resource: acc.views[out] }, { binding: 1, resource: hist }] });
+  }
+
   /** The compute path: shade into the frame texture, then present it into `view`. */
-  private renderCompute(encoder: GPUCommandEncoder, view: GPUTextureView, width: number, height: number, toCanvas: boolean, temporal?: GPUBindGroup): void {
+  private renderCompute(encoder: GPUCommandEncoder, view: GPUTextureView, width: number, height: number, toCanvas: boolean, temporal?: GPUBindGroup, scaled?: { width: number; height: number }): void {
     const { device } = this.gpu;
     const variant = this.variant();
-    const direct = toCanvas && !!this.canvasLayout;
+    // `scaled`: the frame is smaller than `view`, whose size this is (temporal upscaling), so it goes
+    // through the frame texture and the resolve pass, never straight into the canvas.
+    const direct = toCanvas && !!this.canvasLayout && !scaled;
     const pipe = temporal
       ? (this.temporalPipelines[variant + (direct ? 6 : 0)] ??= this.makeTemporalPipeline(variant, direct))
       : (this.computePipelines[variant + (direct ? 6 : 0)] ??= this.makeComputePipeline(variant, direct));
@@ -2548,12 +2736,20 @@ export class Renderer {
     if (temporal) cp.setBindGroup(2, temporal);
     cp.dispatchWorkgroups(Math.ceil(width / this.tile[0]), Math.ceil(height / this.tile[1]));
     cp.end();
+    // Temporal upscaling: resolve the small frame into the accumulated picture, and present that.
+    const resolved = scaled ? this.resolve(encoder, scaled.width, scaled.height) : undefined;
     const pp = encoder.beginRenderPass({
       colorAttachments: [{ view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" }],
       timestampWrites: this.timer?.passWrites("present") as GPURenderPassTimestampWrites | undefined,
     });
-    pp.setPipeline((this.presentPipeline ??= this.makePresent!()));
-    pp.setBindGroup(0, this.frame.present);
+    if (resolved) {
+      pp.setPipeline((this.presentResolvedPipeline ??= device.createRenderPipeline(this.presentResolvedDesc())));
+      pp.setBindGroup(0, this.bindGroup);
+      pp.setBindGroup(1, resolved);
+    } else {
+      pp.setPipeline((this.presentPipeline ??= this.makePresent!()));
+      pp.setBindGroup(0, this.frame.present);
+    }
     pp.draw(3);
     pp.end();
   }

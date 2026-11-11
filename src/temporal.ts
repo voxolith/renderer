@@ -36,12 +36,13 @@ const KEY_JUMP = 0.035;
  * Samples a pixel averages (`cap`); 1 in how many frames a tile with unconverged pixels samples
  * them while the view is still (`rate`) and while it moves (`moving`); and the development views
  * (`show`: 1 what each tile traced, 2 samples per pixel); `nohold` keeps converged pixels sampling
- * (to measure the cost of tracing everything). Tuning hook: globalThis.__voxolithTemporal.
+ * (to measure the cost of tracing everything); `nojitter` keeps upscaled frames' rays at the pixel
+ * centre. Tuning hook: globalThis.__voxolithTemporal.
  */
-function settings(): { cap: number; rate: number; moving: number; show: number; nohold: boolean } {
-  const g = (globalThis as { __voxolithTemporal?: { cap?: number; rate?: number; moving?: number; show?: number; nohold?: boolean } }).__voxolithTemporal;
+function settings(): { cap: number; rate: number; moving: number; show: number; nohold: boolean; nojitter: boolean } {
+  const g = (globalThis as { __voxolithTemporal?: { cap?: number; rate?: number; moving?: number; show?: number; nohold?: boolean; nojitter?: boolean } }).__voxolithTemporal;
   const r = (v: number | undefined, d: number) => Math.max(1, Math.min(8, Math.round(v ?? d)));
-  return { cap: Math.max(1, Math.min(63, Math.round(g?.cap ?? 32))), rate: r(g?.rate, 1), moving: r(g?.moving, 4), show: g?.show ?? 0, nohold: !!g?.nohold };
+  return { cap: Math.max(1, Math.min(63, Math.round(g?.cap ?? 32))), rate: r(g?.rate, 1), moving: r(g?.moving, 4), show: g?.show ?? 0, nohold: !!g?.nohold, nojitter: !!g?.nojitter };
 }
 
 /** The history and change stamps behind `RenderQuality.temporal`; owned by a Renderer. */
@@ -49,14 +50,17 @@ export class TemporalHistory {
   /** Bind group layout of group 2 (temporal.wesl). */
   readonly layout: GPUBindGroupLayout;
   private readonly device: GPUDevice;
-  private readonly uniform: GPUBuffer;
+  /** The uniform block (temporal.wesl Temporal), which the upscaling resolve pass reads too. */
+  readonly uniform: GPUBuffer;
   private readonly data = new Float32Array(TEMPORAL_FLOATS);
   private readonly changed: GPUTexture;
   private readonly stamps: Uint32Array;
   private readonly cols: [number, number];
   /** Rows of `stamps` changed since the last upload: [first, last], or first > last for none. */
   private dirty: [number, number] = [1, 0];
-  private hist: { tex: [GPUTexture, GPUTexture]; groups: [GPUBindGroup, GPUBindGroup]; w: number; h: number } | null = null;
+  private hist: { tex: [GPUTexture, GPUTexture]; views: [GPUTextureView, GPUTextureView]; groups: [GPUBindGroup, GPUBindGroup]; w: number; h: number } | null = null;
+  /** Whether the frame being drawn reuses the previous one's history (set by `prepare`). */
+  private reused = false;
   /** Number of the next frame to render (stamps of changes before it equal it). */
   private frame = 1;
   /** Whether the last frame's history may be reused. */
@@ -98,6 +102,16 @@ export class TemporalHistory {
   reset(): void {
     this.valid = false;
     this.settle = this.settleFrames();
+  }
+
+  /** After `prepare`: the history texture this frame's kernel writes (hit hash and distance per pixel). */
+  written(): GPUTextureView {
+    return this.hist!.views[this.frame & 1];
+  }
+
+  /** After `prepare`: whether this frame reuses the previous one's history (false after a reset). */
+  reusing(): boolean {
+    return this.reused;
   }
 
   /** Whether the image is still converging (the caller should render another frame). */
@@ -160,7 +174,7 @@ export class TemporalHistory {
    * uniform block. `u` is the frame's main uniform block (camera in words 0..15). Returns the
    * bind group (group 2) to dispatch with.
    */
-  prepare(u: Float32Array, lightDir: Vec3, lightAngle: number, effectScale: number, lights: Float32Array, lightCount: number, width: number, height: number): GPUBindGroup {
+  prepare(u: Float32Array, lightDir: Vec3, lightAngle: number, effectScale: number, lights: Float32Array, lightCount: number, width: number, height: number, jitter = false): GPUBindGroup {
     const { device } = this;
     if (!this.hist || this.hist.w !== width || this.hist.h !== height) {
       this.hist?.tex.forEach((t) => t.destroy());
@@ -175,11 +189,12 @@ export class TemporalHistory {
           { binding: 3, resource: this.changed.createView() },
         ],
       });
-      this.hist = { tex, groups: [group(0), group(1)], w: width, h: height };
+      this.hist = { tex, views: [tex[0].createView(), tex[1].createView()], groups: [group(0), group(1)], w: width, h: height };
       this.reset();
     }
-    const { cap, rate: still, moving, show, nohold } = settings();
+    const { cap, rate: still, moving, show, nohold, nojitter } = settings();
     let flags = this.valid ? FLAG_HISTORY | (nohold ? 0 : FLAG_HOLD) : 0;
+    this.reused = this.valid;
     let capNow = cap;
     // The key light: a jump retraces its shadow at once; a slow turn keeps sampling.
     const ll = Math.hypot(lightDir[0], lightDir[1], lightDir[2]) || 1;
@@ -234,6 +249,9 @@ export class TemporalHistory {
     t.set(this.prevCam.subarray(12, 15), 12); t[15] = this.prevRes[0] / Math.max(1, this.prevRes[1]);
     t[16] = this.prevRes[0]; t[17] = this.prevRes[1]; t[18] = capNow; w[19] = rate;
     t[20] = Math.max(0, lightAngle); t[21] = Math.max(0, effectScale); t[22] = show;
+    // The sub-pixel sample of this frame's primary rays: an index into a 16-point Halton sequence
+    // (temporal.wesl pixelJitter), 0 for the pixel centre.
+    t[23] = jitter && !nojitter ? 1 + (this.frame % 16) : 0;
     device.queue.writeBuffer(this.uniform, 0, t);
     if (this.dirty[0] <= this.dirty[1]) {
       const [cw] = this.cols;
