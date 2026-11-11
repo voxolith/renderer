@@ -12,7 +12,8 @@ A WebGPU voxel raymarcher for the browser, formerly `voxray`, the engine behind
 linked at runtime by [`wesl`](https://wesl-lang.dev)) walks a world stored as sparse 8³ bricks
 under a two-level index, draws instanced models at any yaw with palettes of their own, and shades
 them with soft shadows, ambient occlusion, up to 32 point lights, emissive, glass, metal and
-animated water materials, fog, clouds, rain and snow. It reads and writes MagicaVoxel `.vox` and
+animated water materials, fog, rain and snow, against a background (the sky) that is a WESL
+module of the host's. It reads and writes MagicaVoxel `.vox` and
 reads Minecraft `.mca` regions. It is **WebGPU only**: it needs `navigator.gpu` and a secure
 context (HTTPS or `localhost`), and there is no WebGL fallback.
 
@@ -79,7 +80,7 @@ The long-form material lives on the documentation site, in the
 - [Entry points](https://voxolith.github.io/docs/renderer/entry-points/): bundler setup, starting the GPU, a first frame, cameras, picking, effects
 - [Storage](https://voxolith.github.io/docs/renderer/storage/): bricks, per-brick palettes, the two-level index, editing a brick at a time
 - [Instances](https://voxolith.github.io/docs/renderer/instances/): `addModel` / `setInstances`, static and dynamic sets, instance palettes
-- [Lighting and materials](https://voxolith.github.io/docs/renderer/lighting/) and [Atmosphere](https://voxolith.github.io/docs/renderer/atmosphere/): point lights, water, fog, clouds, precipitation
+- [Lighting and materials](https://voxolith.github.io/docs/renderer/lighting/) and [Atmosphere](https://voxolith.github.io/docs/renderer/atmosphere/): point lights, water, fog, precipitation, backgrounds
 - [Quality and performance](https://voxolith.github.io/docs/renderer/quality-and-performance/): presets, render scale, the frame loop, software adapters
 - [Formats](https://voxolith.github.io/docs/renderer/formats/): `.vox` and `.mca`
 - [API reference](https://voxolith.github.io/docs/renderer/api/): every export, generated from the source

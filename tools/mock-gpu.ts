@@ -94,6 +94,7 @@ export function mockGpu(opts: { canvasStorage?: boolean; format?: GPUTextureForm
       return b;
     },
     createTexture: texture,
+    createSampler: () => ({}),
     createBindGroupLayout: () => ({}),
     createPipelineLayout: () => ({}),
     createBindGroup: () => ({}),

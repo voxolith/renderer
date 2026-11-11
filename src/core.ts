@@ -36,7 +36,10 @@ export type { CameraFrame, CameraConfig, ChaseOptions } from "./camera";
 export { MAX_LIGHTS, packLights } from "./lights";
 export type { PointLight } from "./lights";
 
-export type { AtmosphereParams, CloudParams, FogParams, PrecipitationParams, SurfaceParams } from "./atmosphere";
+export type { AtmosphereParams, FogParams, PrecipitationParams, SurfaceParams } from "./atmosphere";
+
+export { BACKGROUND_FLOATS, GRADIENT_BACKGROUND_DEFAULTS, GRADIENT_BACKGROUND_WESL, gradientBackgroundParams } from "./background";
+export type { BackgroundOptions } from "./background";
 
 export { makePerf } from "./perf";
 export type { Perf, PerfOptions } from "./perf";

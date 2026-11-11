@@ -1,10 +1,11 @@
 // Atmospheric capabilities: the raw settings the renderer can draw.
 //
-// These say nothing about weather. Fog, a cloud layer, falling particles, wet
-// or covered ground and wind on the water are independent effects, each off
+// These say nothing about weather. Fog, falling particles, wet or covered
+// ground and wind on the water are independent effects, each off
 // until its amount is above zero, so a scene that sets none of them renders
 // exactly as before. What they *mean* — rain, a blizzard, a foggy morning — is
-// decided above the renderer (see @voxolith/engine/atmosphere).
+// decided above the renderer (see @voxolith/engine/atmosphere). The sky itself,
+// clouds included, is the background module's business (RendererOptions.background).
 
 type Vec3 = [number, number, number];
 
@@ -23,16 +24,6 @@ export interface FogParams {
    * close-up scene at a fine scale. 0 or absent = unbounded.
    */
   distance?: number;
-}
-
-/** A cloud layer drawn in the sky. */
-export interface CloudParams {
-  /** 0 clear .. 1 fully overcast. */
-  cover: number;
-  /** Linear RGB of the clouds, already lit for the time of day. */
-  color: Vec3;
-  /** Drift of the cloud layer, sky units per second on x and z. */
-  drift: [number, number];
 }
 
 /** Falling rain or snow: analytic particles fixed in the world, hidden by geometry, never stored. */
@@ -59,9 +50,11 @@ export interface SurfaceParams {
 
 /** The optional atmosphere half of FrameParams. */
 export interface AtmosphereParams {
+  /** Distance fog (off when absent). */
   fog?: FogParams;
-  clouds?: CloudParams;
+  /** Falling rain or snow (off when absent). */
   precipitation?: PrecipitationParams;
+  /** Wet or snow-covered ground (off when absent). */
   surface?: SurfaceParams;
   /** Wind on water: ripple drift (x, z); its length also raises the ripples. */
   waterWind?: [number, number];

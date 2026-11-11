@@ -8,7 +8,7 @@ import gridWesl from "./shaders/grid.wesl?raw";
 import ddaWesl from "./shaders/dda.wesl?raw";
 import highlightWesl from "./shaders/highlight.wesl?raw";
 import intersectWesl from "./shaders/intersect.wesl?raw";
-import skyWesl from "./shaders/sky.wesl?raw";
+import bgWesl from "./shaders/bg.wesl?raw";
 import traceWesl from "./shaders/trace.wesl?raw";
 import shadowWesl from "./shaders/shadow.wesl?raw";
 import aoWesl from "./shaders/ao.wesl?raw";
@@ -33,16 +33,18 @@ import { ENCODED_MODEL_VERSION, encodeModel, type EncodedModel, type ModelSource
 import { MAX_CELL_INSTANCES, bakePlacement, type PlacementBake, type PlacementInput, type PlacementInstance, type PlacementModel } from "./placement";
 import { LIGHT_FLOATS, MAX_LIGHTS, packLights, type PointLight } from "./lights";
 import type { AtmosphereParams } from "./atmosphere";
+import { BACKGROUND_FLOATS, GRADIENT_BACKGROUND_DEFAULTS, GRADIENT_BACKGROUND_WESL, gradientBackgroundParams, type BackgroundOptions } from "./background";
 
-// WESL modules of the raymarch pass, linked once into the final WGSL. Keys are
-// the modules' relative paths (./foo.wesl → import path `package::foo`).
+// WESL modules of the raymarch pass, linked once per background into the final WGSL. Keys are
+// the modules' relative paths (./foo.wesl → import path `package::foo`); the background module
+// (RendererOptions.background) joins them as ./userbg.wesl.
 const WESL_SRC: Record<string, string> = {
   "./uniforms.wesl": uniformsWesl,
   "./grid.wesl": gridWesl,
   "./dda.wesl": ddaWesl,
   "./highlight.wesl": highlightWesl,
   "./intersect.wesl": intersectWesl,
-  "./sky.wesl": skyWesl,
+  "./bg.wesl": bgWesl,
   "./trace.wesl": traceWesl,
   "./shadow.wesl": shadowWesl,
   "./ao.wesl": aoWesl,
@@ -66,21 +68,31 @@ export const WORLD_SLOTS = 256;
 /** f32 per material slot: 2 vec4. See materials.wesl. */
 const MATERIAL_WORDS = 8;
 
-let shaderCodePromise: Promise<string> | null = null;
-/** Link the WESL modules into WGSL (once; cached for all renderers). */
-export function raymarchShaderCode(): Promise<string> {
-  if (!shaderCodePromise) {
-    shaderCodePromise = link({ weslSrc: WESL_SRC, rootModuleName: "./raymarch.wesl" })
+/** Linked WGSL by background module source: every renderer with the same background shares one. */
+const shaderCode = new Map<string, Promise<string>>();
+/**
+ * Link the WESL modules into WGSL, with `background` (a module's source, see
+ * {@link BackgroundOptions.source}; default {@link GRADIENT_BACKGROUND_WESL}) as the background. Linked
+ * once per background source and cached for every renderer on the page.
+ */
+export function raymarchShaderCode(background: string = GRADIENT_BACKGROUND_WESL): Promise<string> {
+  let code = shaderCode.get(background);
+  if (!code) {
+    code = link({ weslSrc: { ...WESL_SRC, "./userbg.wesl": background }, rootModuleName: "./raymarch.wesl" })
       .then((linked) => linked.dest);
+    // A module that fails to link is not cached, so a corrected one can be retried.
+    const linking = code;
+    linking.catch(() => { if (shaderCode.get(background) === linking) shaderCode.delete(background); });
+    shaderCode.set(background, code);
   }
-  return shaderCodePromise;
+  return code;
 }
 
-// Uniform buffer layout: 144 words (576 bytes). See struct Uniforms in the shader
-// for the exact map (camera 0..31, environment/sky 32..71, occ/coarse 76..91,
-// optional ground-plane floor 92..103, atmosphere 104..131, index regions
-// 132..143 as u32).
-const UNIFORM_FLOATS = 144;
+// Uniform buffer layout: 108 words (432 bytes). See struct Uniforms in the shader
+// for the exact map (camera 0..31, key light and ambient 32..43, occ/coarse and
+// quality 44..59, optional ground-plane floor 60..71, atmosphere 72..95, index
+// regions 96..107 as u32). The sky is not in it: see bg.wesl.
+const UNIFORM_FLOATS = 108;
 
 // The index buffer (binding 1) holds every u32 table the traversal reads, in
 // regions: top levels of the world and of each model, index blocks, the
@@ -300,6 +312,14 @@ export interface RendererOptions {
    * created in the constructor (every pipeline needs it, and creating it does not compile them).
    */
   deferPipelines?: boolean;
+  /**
+   * What rays that leave the world show: a WESL module and its textures (see
+   * {@link BackgroundOptions}). Chosen at creation, since it is linked into the shader; its
+   * parameters change per frame through `FrameParams.background`. Default: {@link GRADIENT_BACKGROUND_WESL},
+   * a plain two-colour sky (see {@link gradientBackgroundParams}). Skies with a sun, moon, stars
+   * and clouds are modules of the engine's (`@voxolith/engine/atmosphere`).
+   */
+  background?: BackgroundOptions;
 }
 
 /**
@@ -423,7 +443,7 @@ type Vec3 = [number, number, number];
 /**
  * Everything one `Renderer.render` call draws with: a camera (spread a
  * `CameraFrame` from `makeCamera`, `firstPersonFrame` or `chaseFrame`), the
- * key light and sky, and the optional atmosphere. Colours are linear RGB;
+ * key light, the background's parameters and the optional atmosphere. Colours are linear RGB;
  * directions are unit vectors in grid space. The renderer knows nothing about
  * time of day: `@voxolith/engine/atmosphere` computes these from a clock, or
  * pass constants.
@@ -440,7 +460,7 @@ export interface FrameParams extends AtmosphereParams {
   camFwd: Vec3;
   /** tan of half the vertical field of view. */
   tanHalfFov: number;
-  // Environment lighting + sky. Generic: the caller supplies the values (a game
+  // Environment lighting. Generic: the caller supplies the values (a game
   // may drive them from a day/night clock, or pass static constants).
   /** Towards the key light (sun or moon); it lights and casts the shadows. */
   lightDir: Vec3;
@@ -456,26 +476,15 @@ export interface FrameParams extends AtmosphereParams {
   ambientSky: Vec3;
   /** Ambient light from below (hemisphere, ground side). */
   ambientGround: Vec3;
-  /** Where the sun disc is drawn in the sky. */
-  sunDir: Vec3;
-  /** Where the moon disc is drawn. The moon lights nothing; `lightDir` does. */
-  moonDir: Vec3;
-  /** Colour of the sun disc and its glow. */
-  sunColor: Vec3;
-  /** Colour of the moon disc. */
-  moonColor: Vec3;
-  /** Sky colour at the zenith. */
-  skyTop: Vec3;
-  /** Sky colour at the horizon. */
-  skyHorizon: Vec3;
-  /** 0 day .. 1 night: blends in the night sky (stars). */
-  nightFactor: number;
-  /** Sun disc brightness; 0 hides it. */
-  sunIntensity: number;
-  /** Moon disc brightness; 0 hides it. */
-  moonIntensity: number;
   /** Seconds, for animated materials (water ripples). Leave it constant and nothing moves. */
   time?: number;
+  /**
+   * The background module's parameters (`BG.params` in the shader, see
+   * {@link RendererOptions.background}): up to 64 floats, zero past what is given. When absent, the
+   * default background draws {@link GRADIENT_BACKGROUND_DEFAULTS} (a neutral daylight blue) and a
+   * host's background module gets zeros.
+   */
+  background?: Float32Array | number[];
 }
 
 /** Per-frame cost knobs. All are runtime uniforms; changing them is free. */
@@ -571,6 +580,18 @@ export class Renderer {
   private readonly makePipeline: (variant: number) => GPURenderPipeline;
   private readonly uniformBuffer: GPUBuffer;
   private readonly uniformData = new Float32Array(UNIFORM_FLOATS);
+  /** The same words as u32, for the index regions' offsets. */
+  private readonly uniformWords = new Uint32Array(this.uniformData.buffer);
+  /** The background's uniform (bg.wesl `BG`): 64 params, then time and padding. */
+  private readonly bgBuffer: GPUBuffer;
+  private readonly bgData = new Float32Array(BACKGROUND_FLOATS + 4);
+  /** The background's two texture views (1x1 black stand-ins when not given) and its sampler. */
+  private readonly bgViews: [GPUTextureView, GPUTextureView];
+  private readonly bgSampler: GPUSampler;
+  /** The 1x1 stand-in texture, when a background texture was not given (destroyed with the renderer). */
+  private readonly bgDummy: GPUTexture | null;
+  /** The background is the default gradient, which draws its default colours without `FrameParams.background`. */
+  private readonly defaultBackground: boolean;
   private bindGroup: GPUBindGroup;
   private readonly gridSize: [number, number, number];
   private paletteBuffer: GPUBuffer;
@@ -660,7 +681,7 @@ export class Renderer {
 
   /**
    * Prefer `createRenderer`, which links the shader for you. `shaderCode` is
-   * the WGSL from `raymarchShaderCode()`. Building scans a dense `scene.data`
+   * the WGSL from `raymarchShaderCode(opts.background?.source)`. Building scans a dense `scene.data`
    * once for its occupied bounds and uploads it as bricks.
    */
   constructor(gpu: GpuContext, scene: RenderScene, shaderCode: string, opts: RendererOptions = {}) {
@@ -734,6 +755,28 @@ export class Renderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
+    // The background's resources (bg.wesl, bindings 9-12).
+    this.bgBuffer = device.createBuffer({
+      size: this.bgData.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const [tex0, tex1] = opts.background?.textures ?? [];
+    this.defaultBackground = (opts.background?.source ?? GRADIENT_BACKGROUND_WESL) === GRADIENT_BACKGROUND_WESL;
+    this.bgDummy = tex0 && tex1 ? null : device.createTexture({
+      size: [1, 1],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    if (this.bgDummy) device.queue.writeTexture({ texture: this.bgDummy }, new Uint8Array([0, 0, 0, 255]), { bytesPerRow: 4 }, [1, 1]);
+    const dummyView = this.bgDummy?.createView();
+    this.bgViews = [tex0 ?? dummyView!, tex1 ?? dummyView!];
+    this.bgSampler = device.createSampler({
+      magFilter: "linear",
+      minFilter: "linear",
+      addressModeU: "repeat",
+      addressModeV: "clamp-to-edge",
+    });
+
     const layout = device.createBindGroupLayout({
       entries: [
         {
@@ -780,6 +823,26 @@ export class Renderer {
           binding: 8,
           visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
           texture: { sampleType: "uint", viewDimension: "3d" },
+        },
+        {
+          binding: 9,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
+          buffer: { type: "uniform" },
+        },
+        {
+          binding: 10,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
+          texture: { sampleType: "float", viewDimension: "2d" },
+        },
+        {
+          binding: 11,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
+          texture: { sampleType: "float", viewDimension: "2d" },
+        },
+        {
+          binding: 12,
+          visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
+          sampler: { type: "filtering" },
         },
       ],
     });
@@ -907,6 +970,10 @@ export class Renderer {
         { binding: 6, resource: { buffer: this.brickVox8 } },
         { binding: 7, resource: { buffer: this.lightBuffer } },
         { binding: 8, resource: this.topTexture.createView() },
+        { binding: 9, resource: { buffer: this.bgBuffer } },
+        { binding: 10, resource: this.bgViews[0] },
+        { binding: 11, resource: this.bgViews[1] },
+        { binding: 12, resource: this.bgSampler },
       ],
     });
   }
@@ -1119,6 +1186,8 @@ export class Renderer {
     this.materialBuffer.destroy();
     this.lightBuffer.destroy();
     this.uniformBuffer.destroy();
+    this.bgBuffer.destroy();
+    this.bgDummy?.destroy();
     this.temporal?.destroy();
     this.temporal = null;
   }
@@ -2117,7 +2186,7 @@ export class Renderer {
    * `gpu.width` × `gpu.height`, so call `resizeToDisplay(gpu)` first when the
    * canvas may have changed size.
    *
-   * @param p - Camera, lighting, sky and atmosphere for this frame.
+   * @param p - Camera, lighting, background parameters and atmosphere for this frame.
    * @param target - Draw here instead of the canvas.
    *
    * @example
@@ -2129,9 +2198,8 @@ export class Renderer {
    *   ...camera(35),
    *   lightDir: sun, lightColor: [1, 0.98, 0.94],
    *   ambientSky: [0.5, 0.53, 0.6], ambientGround: [0.3, 0.29, 0.27],
-   *   sunDir: sun, moonDir: [0, -1, 0], sunColor: [1, 0.96, 0.85], moonColor: [0, 0, 0],
-   *   skyTop: [0.35, 0.55, 0.9], skyHorizon: [0.75, 0.82, 0.92],
-   *   nightFactor: 0, sunIntensity: 1, moonIntensity: 0,
+   *   // The default background's colours (horizon, zenith); leave it out for its defaults.
+   *   background: gradientBackgroundParams([0.75, 0.82, 0.92], [0.35, 0.55, 0.9]),
    *   time: performance.now() / 1000,
    * });
    * ```
@@ -2156,49 +2224,54 @@ export class Renderer {
     u[28] = this.highlight.slotMax;
     u[29] = this.materialsEnabled;
     u[30] = this.lightCount;
-    // Environment/sky block (each vec3 on a 16-byte boundary; mirrors WGSL).
-    const w3 = (o: number, v: Vec3) => { u[o] = v[0]; u[o + 1] = v[1]; u[o + 2] = v[2]; };
-    w3(32, p.sunDir); w3(36, p.moonDir);
-    w3(40, p.sunColor); w3(44, p.moonColor);
-    w3(48, p.skyTop); w3(52, p.skyHorizon);
-    w3(56, p.lightColor); w3(60, p.ambientSky); w3(64, p.ambientGround);
-    u[68] = p.nightFactor;
-    u[69] = p.sunIntensity;
-    u[70] = p.moonIntensity;
-    // 72..75 reserved/padding (was screen-space sun/moon, now unused).
-    w3(76, this.occMin); w3(80, this.occMax);
-    w3(84, this.coarseDim);
-    u[88] = this.debugMode;
-    u[89] = this.quality.maxSteps;
-    u[90] = this.quality.shadowSteps;
-    u[91] = this.quality.ao ? 1 : 0;
-    // Optional ground-plane floor (92..103).
-    u[92] = this.floor.enabled ? 1 : 0;
-    u[93] = this.floor.y;
-    w3(96, this.floor.colorA);
-    w3(100, this.floor.colorB);
-    // Atmosphere (104..131); every effect is off at zero.
-    const fog = p.fog, cl = p.clouds, pr = p.precipitation, sf = p.surface;
-    w3(104, fog?.color ?? [0, 0, 0]); u[107] = fog ? Math.max(0, fog.density) : 0;
-    w3(108, cl?.color ?? [0, 0, 0]); u[111] = cl ? Math.max(0, Math.min(1, cl.cover)) : 0;
-    w3(112, pr?.fall ?? [0, -1, 0]); u[115] = pr ? Math.max(0, Math.min(1, pr.density)) : 0;
-    w3(116, pr?.color ?? [0.8, 0.82, 0.86]); u[119] = pr ? (pr.kind === "snow" ? 2 : 1) : 0;
-    w3(120, sf?.coverColor ?? [0.92, 0.94, 0.97]); u[123] = sf ? Math.max(0, Math.min(1, sf.cover)) : 0;
-    u[124] = sf ? Math.max(0, Math.min(1, sf.wet)) : 0;
-    u[125] = fog?.heightFalloff ?? 0;
-    u[126] = cl?.drift[0] ?? 0; u[127] = cl?.drift[1] ?? 0;
-    u[128] = p.waterWind?.[0] ?? 0; u[129] = p.waterWind?.[1] ?? 0;
-    u[130] = p.effectScale ?? 1;
-    u[131] = fog?.distance && fog.distance > 0 ? fog.distance : 0;
-    // Index regions (132..143), as u32.
-    const w = new Uint32Array(u.buffer);
+    // Key light and ambient (each vec3 on a 16-byte boundary; mirrors WGSL).
+    const w3 = (o: number, v: Readonly<Vec3>) => { u[o] = v[0]; u[o + 1] = v[1]; u[o + 2] = v[2]; };
+    w3(32, p.lightColor); w3(36, p.ambientSky); w3(40, p.ambientGround);
+    w3(44, this.occMin); w3(48, this.occMax);
+    w3(52, this.coarseDim);
+    u[56] = this.debugMode;
+    u[57] = this.quality.maxSteps;
+    u[58] = this.quality.shadowSteps;
+    u[59] = this.quality.ao ? 1 : 0;
+    // Optional ground-plane floor (60..71).
+    u[60] = this.floor.enabled ? 1 : 0;
+    u[61] = this.floor.y;
+    w3(64, this.floor.colorA);
+    w3(68, this.floor.colorB);
+    // Atmosphere (72..93); every effect is off at zero.
+    const fog = p.fog, pr = p.precipitation, sf = p.surface;
+    w3(72, fog?.color ?? [0, 0, 0]); u[75] = fog ? Math.max(0, fog.density) : 0;
+    w3(76, pr?.fall ?? [0, -1, 0]); u[79] = pr ? Math.max(0, Math.min(1, pr.density)) : 0;
+    w3(80, pr?.color ?? [0.8, 0.82, 0.86]); u[83] = pr ? (pr.kind === "snow" ? 2 : 1) : 0;
+    w3(84, sf?.coverColor ?? [0.92, 0.94, 0.97]); u[87] = sf ? Math.max(0, Math.min(1, sf.cover)) : 0;
+    u[88] = sf ? Math.max(0, Math.min(1, sf.wet)) : 0;
+    u[89] = fog?.heightFalloff ?? 0;
+    u[90] = p.waterWind?.[0] ?? 0; u[91] = p.waterWind?.[1] ?? 0;
+    u[92] = p.effectScale ?? 1;
+    u[93] = fog?.distance && fog.distance > 0 ? fog.distance : 0;
+    // Index regions (96..107), as u32.
+    const w = this.uniformWords;
     const [tx, ty, tz] = this.bricks.topDim;
-    w[132] = tx; w[133] = ty; w[134] = tz; w[135] = this.instCount;
-    w[136] = this.layout.blocks.off; w[137] = this.layout.cells.off; w[138] = this.layout.list.off; w[139] = this.layout.inst.off;
-    w[140] = this.layout.models.off; w[141] = this.layout.tops.off; w[142] = this.layout.parts.off; w[143] = this.layout.subs.off;
+    w[96] = tx; w[97] = ty; w[98] = tz; w[99] = this.instCount;
+    w[100] = this.layout.blocks.off; w[101] = this.layout.cells.off; w[102] = this.layout.list.off; w[103] = this.layout.inst.off;
+    w[104] = this.layout.models.off; w[105] = this.layout.tops.off; w[106] = this.layout.parts.off; w[107] = this.layout.subs.off;
 
     const { device } = this.gpu;
     device.queue.writeBuffer(this.uniformBuffer, 0, u);
+    // The background's parameters: the frame's own, else the default gradient's colours (or zeros
+    // under a background of the host's).
+    const bg = this.bgData;
+    if (p.background) {
+      const n = Math.min(p.background.length, BACKGROUND_FLOATS);
+      for (let i = 0; i < n; i++) bg[i] = p.background[i];
+      bg.fill(0, n, BACKGROUND_FLOATS);
+    } else if (this.defaultBackground) {
+      gradientBackgroundParams(GRADIENT_BACKGROUND_DEFAULTS.horizon, GRADIENT_BACKGROUND_DEFAULTS.zenith, bg);
+    } else {
+      bg.fill(0, 0, BACKGROUND_FLOATS);
+    }
+    bg[BACKGROUND_FLOATS] = p.time ?? 0;
+    device.queue.writeBuffer(this.bgBuffer, 0, bg);
 
     const view = target?.view ?? this.gpu.context.getCurrentTexture().createView();
     const encoder = device.createCommandEncoder();
@@ -2456,7 +2529,7 @@ export async function createRenderer(gpu: GpuContext, scene: RenderScene, opts: 
   if (opts.onLoad) reportLoad(opts.onLoad, "shaders", "start");
   let code: string;
   try {
-    code = await raymarchShaderCode();
+    code = await raymarchShaderCode(opts.background?.source);
   } finally {
     if (opts.onLoad) reportLoad(opts.onLoad, "shaders", "end");
   }

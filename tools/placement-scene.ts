@@ -113,7 +113,6 @@ export function frame(): FrameParams {
   const z: [number, number, number] = [0, 0, 0];
   return {
     camPos: [128, 60, -40], camRight: [1, 0, 0], camUp: [0, 1, 0], camFwd: [0, 0, 1], tanHalfFov: 0.4,
-    lightDir: [0, 1, 0], lightColor: [1, 1, 1], ambientSky: z, ambientGround: z, sunDir: [0, 1, 0], moonDir: [0, -1, 0],
-    sunColor: z, moonColor: z, skyTop: z, skyHorizon: z, nightFactor: 0, sunIntensity: 1, moonIntensity: 0,
+    lightDir: [0, 1, 0], lightColor: [1, 1, 1], ambientSky: z, ambientGround: z,
   };
 }

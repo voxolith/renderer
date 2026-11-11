@@ -18,7 +18,8 @@ exercises it (examples: orbit, world, instances, rigged, nightwood) in a WebGPU 
 ## Map
 
 - `src/renderer.ts`: `createRenderer` and the `Renderer` class, covering:
-  - uniforms (144 words; the layout is in `shaders/uniforms.wesl`);
+  - uniforms (108 words; the layout is in `shaders/uniforms.wesl`, and verify lays that struct out
+    by WGSL's rules and checks `render` writes every field at its word);
   - the index buffer regions (`REGIONS`: tops, blocks, cells, list, inst, models, parts, subs);
   - models and instances (`addModel`, `setInstances`, and the sub-cell tables built by `src/sublists.ts`);
   - the brick pools: they grow (`growPools`, `reserveBricks`) by `resizePools`, a bigger buffer filled
@@ -67,7 +68,16 @@ exercises it (examples: orbit, world, instances, rigged, nightwood) in a WebGPU 
   - `raymarch.wesl`: the entry points and `shadePixel`, shared by the fragment and compute paths;
   - `trace.wesl`: the primary walk;
   - `grid.wesl`: the index lookups and instance sampling;
-  - `shadow.wesl`, `ao.wesl`, `lights.wesl`, `fog.wesl`, `water.wesl`, `precip.wesl`, `sky.wesl`.
+  - `shadow.wesl`, `ao.wesl`, `lights.wesl`, `fog.wesl`, `water.wesl`, `precip.wesl`;
+  - `background.wesl` (the optional floor, fading to the host's `background()`) and `bg.wesl` (the
+    background's bindings 9-12: the `BG` uniform, two textures, a sampler).
+- `src/background.ts`: backgrounds, headless. The host's module (`RendererOptions.background`) is
+  linked in as `./userbg.wesl`, one linked shader per source (`raymarchShaderCode(source)`); the
+  default is `GRADIENT_BACKGROUND_WESL`, a plain two-colour sky (`gradientBackgroundParams`; without
+  `FrameParams.background` it draws `GRADIENT_BACKGROUND_DEFAULTS`, a host's module gets zeros). The
+  renderer has no sky of its own: skies with a sun, moon, stars and clouds (the classic one included)
+  live in `@voxolith/engine/atmosphere`. `tools/background-fixture.ts` is a module using every
+  binding, for the checks.
 - Entry points: `src/index.ts` (the browser barrel), and `src/core.ts`, `src/vox.ts`,
   `src/ray.ts` (safe in bun and node).
 

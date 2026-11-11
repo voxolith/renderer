@@ -20,50 +20,39 @@ struct Uniforms {
   materialsEnabled : f32, // 29  (0 = flat palette; 1 = per-slot material shading)
   lightCount: f32,        // 30  point lights in use (see lights.wesl)
   _pad2     : f32,        // 31
-  // --- environment/sky block (each vec3 on a 16-byte boundary) ---
-  sunDir       : vec3<f32>, _s0 : f32,  // 32-35
-  moonDir      : vec3<f32>, _s1 : f32,  // 36-39
-  sunColor     : vec3<f32>, _s2 : f32,  // 40-43
-  moonColor    : vec3<f32>, _s3 : f32,  // 44-47
-  skyTop       : vec3<f32>, _s4 : f32,  // 48-51
-  skyHorizon   : vec3<f32>, _s5 : f32,  // 52-55
-  lightColor   : vec3<f32>, _s6 : f32,  // 56-59
-  ambientSky   : vec3<f32>, _s7 : f32,  // 60-63
-  ambientGround: vec3<f32>, _s8 : f32,  // 64-67
-  nightFactor  : f32,                   // 68
-  sunIntensity : f32,                   // 69
-  moonIntensity: f32,                   // 70
-  _s9          : f32,                   // 71
-  _screen0     : vec2<f32>,             // 72,73  (reserved; was screen-space sun)
-  _screen1     : vec2<f32>,             // 74,75
-  occMin       : vec3<f32>, _o0 : f32,  // 76-79  occupied AABB (voxel coords, inclusive)
-  occMax       : vec3<f32>, _o1 : f32,  // 80-83
-  coarseDim    : vec3<f32>, _o2 : f32,  // 84-87  coarse occupancy grid dims
-  debug        : f32,                   // 88     1 = force single-step DDA (no skip)
-  maxSteps     : f32,                   // 89     primary-ray DDA step cap (quality)
-  shadowSteps  : f32,                   // 90     shadow-ray step cap; 0 = shadows off
-  aoEnabled    : f32,                   // 91     1 = face ambient occlusion
+  // --- key light and ambient (each vec3 on a 16-byte boundary) ---
+  // The sky is not here: the background module (RendererOptions.background) draws it from BG
+  // (bg.wesl).
+  lightColor   : vec3<f32>, _s0 : f32,  // 32-35
+  ambientSky   : vec3<f32>, _s1 : f32,  // 36-39
+  ambientGround: vec3<f32>, _s2 : f32,  // 40-43
+  occMin       : vec3<f32>, _o0 : f32,  // 44-47  occupied AABB (voxel coords, inclusive)
+  occMax       : vec3<f32>, _o1 : f32,  // 48-51
+  coarseDim    : vec3<f32>, _o2 : f32,  // 52-55  coarse occupancy grid dims
+  debug        : f32,                   // 56     1 = force single-step DDA (no skip)
+  maxSteps     : f32,                   // 57     primary-ray DDA step cap (quality)
+  shadowSteps  : f32,                   // 58     shadow-ray step cap; 0 = shadows off
+  aoEnabled    : f32,                   // 59     1 = face ambient occlusion
   // --- optional ground-plane floor ---
-  floorParams  : vec2<f32>,             // 92,93  x = enabled (0/1), y = floor Y
-  _f0          : vec2<f32>,             // 94,95  pad
-  floorColorA  : vec3<f32>, _f1 : f32,  // 96-99
-  floorColorB  : vec3<f32>, _f2 : f32,  // 100-103
+  floorParams  : vec2<f32>,             // 60,61  x = enabled (0/1), y = floor Y
+  _f0          : vec2<f32>,             // 62,63  pad
+  floorColorA  : vec3<f32>, _f1 : f32,  // 64-67
+  floorColorB  : vec3<f32>, _f2 : f32,  // 68-71
   // --- atmosphere (all off at zero; see src/atmosphere.ts) ---
-  fogColor     : vec3<f32>, fogDensity : f32,     // 104-107
-  cloudColor   : vec3<f32>, cloudCover : f32,     // 108-111
-  precipFall   : vec3<f32>, precipDensity : f32,  // 112-115  fall velocity, voxels/s
-  precipColor  : vec3<f32>, precipKind : f32,     // 116-119  0 none, 1 rain, 2 snow
-  coverColor   : vec3<f32>, cover : f32,          // 120-123
-  wet          : f32,                             // 124
-  fogFalloff   : f32,                             // 125
-  cloudDrift   : vec2<f32>,                       // 126,127
-  waterWind    : vec2<f32>,                       // 128,129
-  effectScale  : f32,                             // 130  voxels per unit of the effects below (1 = native)
-  viewDistance : f32,                             // 131  fog.distance: rays stop there (0 = off)
+  fogColor     : vec3<f32>, fogDensity : f32,     // 72-75
+  precipFall   : vec3<f32>, precipDensity : f32,  // 76-79  fall velocity, voxels/s
+  precipColor  : vec3<f32>, precipKind : f32,     // 80-83  0 none, 1 rain, 2 snow
+  coverColor   : vec3<f32>, cover : f32,          // 84-87
+  wet          : f32,                             // 88
+  fogFalloff   : f32,                             // 89
+  waterWind    : vec2<f32>,                       // 90,91
+  effectScale  : f32,                             // 92  voxels per unit of the effects' own sizes (1 = native)
+  viewDistance : f32,                             // 93  fog.distance: rays stop there (0 = off)
+  _a0          : vec2<f32>,                       // 94,95  pad
   // --- index regions (u32 word offsets into idx; see renderer.ts) ---
-  topDim       : vec3<u32>, instanceCount : u32,  // 132-135  world top-level dims
-  blocksOff    : u32, cellOff : u32, listOff : u32, instOff : u32, // 136-139
-  modelsOff    : u32, topsOff : u32, partsOff : u32, subOff : u32, // 140-143
+  topDim       : vec3<u32>, instanceCount : u32,  // 96-99  world top-level dims
+  blocksOff    : u32, cellOff : u32, listOff : u32, instOff : u32, // 100-103
+  modelsOff    : u32, topsOff : u32, partsOff : u32, subOff : u32, // 104-107
 };
 
 @group(0) @binding(0) var<uniform> U : Uniforms;

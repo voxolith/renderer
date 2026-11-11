@@ -9,7 +9,7 @@ import package::intersect::intersectBox;
 import package::trace::{traverse, Hit};
 import package::shadow::inShadow;
 import package::ao::faceAO;
-import package::background::background;
+import package::background::{missBackground, pixelFootprint};
 import package::highlight::highlightEdge;
 import package::materials::matOf;
 import package::lights::{pointLighting, pointLightingSplit, lightGlow};
@@ -33,9 +33,9 @@ fn hash31(p : vec3<f32>) -> f32 {
 fn traceLit(ro : vec3<f32>, rd : vec3<f32>) -> vec3<f32> {
   let box = intersectBox(ro, rd);
   let tN = max(box.x, 0.0);
-  if (box.y < tN) { return background(ro, rd, vec2<f32>(0.0)); }
+  if (box.y < tN) { return missBackground(ro, rd, 2.0 * pixelFootprint()); }
   let h = traverse(ro, rd, tN);
-  if (!h.hit) { return background(ro, rd, vec2<f32>(0.0)); }
+  if (!h.hit) { return missBackground(ro, rd, 2.0 * pixelFootprint()); }
   let n = h.normal;
   let L = normalize(U.lightDir);
   let ndl = max(dot(n, L), 0.0);
@@ -52,7 +52,7 @@ fn traceLit(ro : vec3<f32>, rd : vec3<f32>) -> vec3<f32> {
 fn missColor(ro : vec3<f32>, rd : vec3<f32>, uv : vec2<f32>) -> vec3<f32> {
   // With a view distance, lights past it are behind the fog wall.
   let far = select(1e6, U.viewDistance, U.viewDistance > 0.0);
-  let c = applySkyFog(background(ro, rd, uv), ro, rd) + lightGlow(ro, rd, far);
+  let c = applySkyFog(missBackground(ro, rd, pixelFootprint()), ro, rd) + lightGlow(ro, rd, far);
   let pr = precipitation(ro, rd, 1e6);
   return mix(c, pr.rgb, pr.a);
 }
@@ -432,7 +432,7 @@ fn shadeHit(r : Primary, h : Hit, shadow : f32, ao : f32, point : vec3<f32>) -> 
       let w = shadeWater(ro, dir, h.cell, n, h.color, m.att);
       // The reflection is the one bounce this pass allows; skip it when it
       // would barely show, which is most of a surface seen from above.
-      var reflCol = background(w.point, w.reflectDir, vec2<f32>(0.0));
+      var reflCol = missBackground(w.point, w.reflectDir, 2.0 * pixelFootprint());
       if (w.fresnel > 0.06) { reflCol = traceLit(w.point + w.normal * 0.6, w.reflectDir); }
       color = mix(w.under, reflCol, clamp(w.fresnel, 0.0, 1.0)) + w.glint * shadow;
     }

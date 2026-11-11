@@ -12,7 +12,7 @@ import { INST_SCALE_SHIFT, INST_WORDS, packInstance, sampleInstance } from "../s
 import { PLACEMENT_BAKE_VERSION, PlacementBaker, bakePlacement, bindPlacement, normalizePlacement, placementTransferables, type PlacementBake, type PlacementInput, type PlacementInstance, type PlacementModel } from "../src/placement";
 import { ENCODED_MODEL_VERSION, encodeModel, encodedTransferables, placementModelOf, type EncodedModel, type ModelSource } from "../src/encode";
 import { installRawLoader, mockGpu } from "./mock-gpu";
-import type { Instance } from "../src/renderer";
+import type { FrameParams, Instance } from "../src/renderer";
 
 const warn0 = console.warn;
 
@@ -1434,6 +1434,100 @@ console.log("\npipeline warm-up (prepare):");
   const used = mock.drawn[mock.drawn.length - 1];
   ok(syncMade === 1 && asyncMade === 1 && !used.async, `two concurrent prepares compile once; a frame meanwhile compiles synchronously and keeps its pipeline (${syncMade} sync, ${asyncMade} async)`);
   ok(events.join(" | ") === "start compute+instances | start compute+instances | end compute+instances | end compute+instances", "  onLoad reports the async compile from call to ready, beside the synchronous one", events.join(" | "));
+}
+
+console.log("\nbackgrounds (RendererOptions.background, FrameParams.background):");
+{
+  const { raymarchShaderCode } = await import("../src/renderer");
+  const { BACKGROUND_FLOATS, GRADIENT_BACKGROUND_DEFAULTS, GRADIENT_BACKGROUND_WESL, gradientBackgroundParams } = await import("../src/background");
+  const { TEXTURED_BACKGROUND_WESL } = await import("./background-fixture");
+  const plain = raymarchShaderCode(), textured = raymarchShaderCode(TEXTURED_BACKGROUND_WESL);
+  const [a, b] = await Promise.all([plain, textured]);
+  ok(raymarchShaderCode(GRADIENT_BACKGROUND_WESL) === plain && raymarchShaderCode(TEXTURED_BACKGROUND_WESL) === textured && a !== b,
+    "the shader links once per background source (the gradient by default), and two backgrounds give two shaders");
+  ok([a, b].every((c) => /@binding\(9\)/.test(c) && /fn background\(/.test(c)) && /@binding\(10\)/.test(b) && /@binding\(12\)/.test(b),
+    "both link the module's background() and the BG uniform (binding 9); a textured one its textures and sampler");
+  // wesl logs the link error as well; keep the output to the checks.
+  const { withLoggerAsync } = await import("wesl");
+  const broken = "fn background(rd : vec3<f32>) -> vec3<f32> { return nope; }";
+  let bad!: Promise<string>, retry!: Promise<string>, failedLink = false;
+  await withLoggerAsync(() => {}, async () => {
+    bad = raymarchShaderCode(broken);
+    failedLink = await bad.then(() => false, () => true);
+    retry = raymarchShaderCode(broken);
+    await retry.catch(() => {});
+  });
+  ok(failedLink && retry !== bad, "a background that fails to link rejects, and is not cached");
+
+  const mock = mockGpu();
+  const bgBuffers = () => mock.buffers.filter((x) => x.size === (BACKGROUND_FLOATS + 4) * 4 && (x.usage & 64));
+  const r = new Renderer(mock.gpu, placementScene.world(), "", { pipeline: "compute" });
+  const bg = new Float32Array(bgBuffers().at(-1)!.bytes.buffer);
+  const f: FrameParams = { ...placementScene.frame(), time: 3.5 };
+  r.render(f);
+  const { horizon, zenith } = GRADIENT_BACKGROUND_DEFAULTS;
+  const want = [...horizon, 0, ...zenith, 0];
+  ok(want.every((v, i) => bg[i] === Math.fround(v)) && bg.subarray(8, BACKGROUND_FLOATS).every((v) => v === 0) && bg[64] === 3.5,
+    "without FrameParams.background, the default gradient gets its default colours (and the frame time)");
+  ok(gradientBackgroundParams().every((v, i) => v === bg[i]) && gradientBackgroundParams([1, 2, 3], [4, 5, 6])[5] === 5, "  which gradientBackgroundParams() packs, horizon then zenith");
+  r.render({ ...f, background: [1, 2, 3] });
+  ok(bg[0] === 1 && bg[2] === 3 && bg.subarray(3, BACKGROUND_FLOATS).every((v) => v === 0) && bg[64] === 3.5, "FrameParams.background is uploaded as given, zero past its end, with the frame time after it");
+  r.render({ ...f, background: new Float32Array(80).fill(7) });
+  ok(bg.subarray(0, BACKGROUND_FLOATS).every((v) => v === 7) && bg[64] === 3.5, "  and anything past 64 floats is ignored");
+  r.destroy();
+  const r2 = new Renderer(mock.gpu, placementScene.world(), "", { pipeline: "compute", background: { source: TEXTURED_BACKGROUND_WESL } });
+  const bg2 = new Float32Array(bgBuffers().at(-1)!.bytes.buffer);
+  bg2.fill(9);
+  r2.render(f);
+  ok(bg2.subarray(0, BACKGROUND_FLOATS).every((v) => v === 0) && bg2[64] === 3.5, "  a host's background without FrameParams.background gets zeros");
+  r2.destroy();
+}
+
+console.log("\nthe uniform block (uniforms.wesl struct Uniforms, written by render):");
+{
+  // Lay the WGSL struct out by WGSL's rules, then check render writes each field at its word.
+  const src = await Bun.file(new URL("../src/shaders/uniforms.wesl", import.meta.url)).text();
+  const body = src.slice(src.indexOf("struct Uniforms {") + 17, src.indexOf("};"));
+  const types: Record<string, [number, number]> = { "f32": [4, 4], "u32": [4, 4], "vec2<f32>": [8, 8], "vec3<f32>": [16, 12], "vec3<u32>": [16, 12], "vec4<f32>": [16, 16] };
+  const at: Record<string, number> = {};
+  let off = 0, bad = "";
+  for (const m of body.replace(/\/\/.*$/gm, "").matchAll(/(\w+)\s*:\s*([\w<>]+)/g)) {
+    const t = types[m[2]];
+    if (!t) { bad = `${m[1]}: ${m[2]}`; break; }
+    off = Math.ceil(off / t[0]) * t[0];
+    at[m[1]] = off / 4;
+    off += t[1];
+  }
+  const size = Math.ceil(off / 16) * 16;
+  const mock = mockGpu();
+  const r = new Renderer(mock.gpu, placementScene.world(), "", { pipeline: "compute" });
+  const uBuf = mock.buffers.find((x) => x.size === size && (x.usage & 64));
+  ok(!bad && !!uBuf && size === 108 * 4, `the struct lays out to ${size / 4} words, the size of the uniform buffer`, bad);
+  const f: FrameParams = {
+    ...placementScene.frame(), time: 3.5, tanHalfFov: 0.37, lightDir: [0.1, 0.2, 0.3],
+    lightColor: [11, 12, 13], ambientSky: [21, 22, 23], ambientGround: [31, 32, 33],
+    fog: { density: 0.25, color: [41, 42, 43], heightFalloff: 0.5, distance: 900 },
+    precipitation: { kind: "snow", density: 0.75, fall: [51, 52, 53], color: [61, 62, 63] },
+    surface: { wet: 0.125, cover: 0.625, coverColor: [71, 72, 73] },
+    waterWind: [81, 82], effectScale: 5,
+  };
+  r.render(f);
+  const u = new Float32Array(uBuf!.bytes.buffer);
+  const expect: [string, number[]][] = [
+    ["camPos", f.camPos], ["tanHalfFov", [0.37]], ["time", [3.5]], ["lightDir", [0.1, 0.2, 0.3]],
+    ["lightColor", [11, 12, 13]], ["ambientSky", [21, 22, 23]], ["ambientGround", [31, 32, 33]],
+    ["fogColor", [41, 42, 43]], ["fogDensity", [0.25]], ["fogFalloff", [0.5]], ["viewDistance", [900]],
+    ["precipFall", [51, 52, 53]], ["precipDensity", [0.75]], ["precipColor", [61, 62, 63]], ["precipKind", [2]],
+    ["coverColor", [71, 72, 73]], ["cover", [0.625]], ["wet", [0.125]], ["waterWind", [81, 82]], ["effectScale", [5]],
+  ];
+  const off2 = expect.filter(([k, v]) => at[k] === undefined || v.some((x, i) => u[at[k] + i] !== Math.fround(x))).map(([k]) => k);
+  ok(off2.length === 0, "render writes every frame field at its word in the struct", off2.join(", "));
+  const words = new Uint32Array(uBuf!.bytes.buffer);
+  const r_ = r as unknown as { layout: Record<string, { off: number }> };
+  const regions: [string, string][] = [["blocksOff", "blocks"], ["cellOff", "cells"], ["listOff", "list"], ["instOff", "inst"], ["modelsOff", "models"], ["topsOff", "tops"], ["partsOff", "parts"], ["subOff", "subs"]];
+  const offR = regions.filter(([k, g]) => words[at[k]] !== r_.layout[g].off).map(([k]) => k);
+  ok(offR.length === 0 && at.subOff === 107, "  and the index regions' offsets, as u32, ending at word 107", offR.join(", "));
+  r.destroy();
 }
 
 console.log(`\n${failed ? `${failed} of ${checks} checks FAILED` : `ALL ${checks} CHECKS PASSED`}`);
