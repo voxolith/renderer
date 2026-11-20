@@ -8,7 +8,10 @@
 // temporal history stores), clamps that history to the range of the frame's 3x3 samples around the
 // pixel so what no longer belongs there (a disocclusion, a moved light) fades out, and blends the
 // new sample in: more when it landed close to the pixel's centre, all of it where there is no
-// history. This is temporal supersampling as in Brian Karis, "High Quality Temporal Supersampling"
+// history. Under a still camera a pixel keeps a running average instead and then holds, except
+// where the temporal history's change stamps say something moved this frame (an edit, a moving
+// instance, a shadow of either): those pixels are clamped and blended as pixels in motion are, or
+// what moved would trail behind it. This is temporal supersampling as in Brian Karis, "High Quality Temporal Supersampling"
 // (SIGGRAPH 2014, Advances in Real-Time Rendering in Games course): jittered samples, reprojected
 // history, neighbourhood clamping.
 //
@@ -47,6 +50,12 @@ struct Temporal {
 @group(0) @binding(4) var accPrev : texture_2d<f32>;
 @group(0) @binding(5) var accSampler : sampler;
 @group(0) @binding(6) var accOut : texture_storage_2d<rgba16float, write>;
+// The temporal history's change stamps (temporal.wesl `changed`): per brick column (x / 8, z / 8),
+// the number of the frame in which something there last changed (an edit, a moving instance, or
+// the shadow of either).
+@group(0) @binding(7) var changed : texture_2d<u32>;
+// The previous frame's temporal history, as `hist`: what each traced pixel saw then.
+@group(0) @binding(8) var histPrev : texture_2d<u32>;
 
 // The clamp box (the range of the frame's 3x3 samples) is padded by this share of its range on each side.
 const CLAMP_PAD : f32 = 0.25;
@@ -115,6 +124,15 @@ fn historyAt(uv : vec2<f32>) -> vec3<f32> {
     + textureSampleLevel(accPrev, accSampler, vec2<f32>(t3.x, t12.y), 0.0).rgb * d
     + textureSampleLevel(accPrev, accSampler, vec2<f32>(t12.x, t3.y), 0.0).rgb * e;
   return sum / (a + b + m + d + e);
+}
+
+// Whether something changed this frame in the brick column holding the world point `p`
+// (temporal.wesl changedAt).
+fn changedAt(p : vec3<f32>) -> bool {
+  let dims = vec2<i32>(textureDimensions(changed));
+  let q = vec2<i32>(floor(p.xz / 8.0));
+  if (any(q < vec2<i32>(0)) || any(q >= dims)) { return false; }
+  return textureLoad(changed, q, 0).x >= T.frame;
 }
 
 @compute @workgroup_size(8, 8)
@@ -207,7 +225,28 @@ fn resolve(@builtin(global_invocation_id) id : vec3<u32>) {
               if (dot(e, e) < reach * reach) { relit = true; }
             }
           }
-          if (relit) {
+          // Something changed this frame where the pixel looks (a voxel edit, a moving instance,
+          // the shadow of either: the temporal history's change stamps), or where it looked last
+          // frame (what it saw then has moved away, and it now sees whatever was behind). The
+          // average must not hold what was there, nor fade it out over its whole weight: that is
+          // a trail behind everything that moves under a still camera. Such a pixel is resolved as
+          // one in motion is, its history clamped to the frame's samples around it. The stamps are
+          // read at the traced sample's own hit, and at the hit the same traced pixel stored last
+          // frame (the camera has not moved, so its ray is the same but for the jitter).
+          var moved = false;
+          let ruv = ((vec2<f32>(j) + jit) / vec2<f32>(lowDim)) * 2.0 - vec2<f32>(1.0);
+          let rdir = normalize(R.camFwd + R.camRight * (ruv.x * R.aspect * R.tanHalfFov) + R.camUp * (-ruv.y * R.tanHalfFov));
+          if (h.x != 0u) {
+            moved = changedAt(R.camPos + rdir * t);
+          }
+          let hp = textureLoad(histPrev, j, 0);
+          if (!moved && hp.x != 0u) {
+            moved = changedAt(R.camPos + rdir * bitcast<f32>(hp.y));
+          }
+          if (moved) {
+            color = mix(clamp(p.rgb, lo - pad, hi + pad), cur, clamp(0.35 * k, 0.005, 1.0));
+            weight = MOVING_WEIGHT;
+          } else if (relit) {
             let had = min(p.a, RELIT_WEIGHT);
             color = (p.rgb * had + cur * k) / (had + k);
             weight = min(had + k, RELIT_WEIGHT);

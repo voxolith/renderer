@@ -54,6 +54,7 @@ export class TemporalHistory {
   readonly uniform: GPUBuffer;
   private readonly data = new Float32Array(TEMPORAL_FLOATS);
   private readonly changed: GPUTexture;
+  private changedView: GPUTextureView | null = null;
   private readonly stamps: Uint32Array;
   private readonly cols: [number, number];
   /** Rows of `stamps` changed since the last upload: [first, last], or first > last for none. */
@@ -107,6 +108,16 @@ export class TemporalHistory {
   /** After `prepare`: the history texture this frame's kernel writes (hit hash and distance per pixel). */
   written(): GPUTextureView {
     return this.hist!.views[this.frame & 1];
+  }
+
+  /** After `prepare`: the history texture the previous frame wrote (this frame's kernel reads it). */
+  read(): GPUTextureView {
+    return this.hist!.views[1 - (this.frame & 1)];
+  }
+
+  /** The change stamps (temporal.wesl `changed`), which the upscaling resolve pass reads too. */
+  stampsView(): GPUTextureView {
+    return (this.changedView ??= this.changed.createView());
   }
 
   /** After `prepare`: whether this frame reuses the previous one's history (false after a reset). */

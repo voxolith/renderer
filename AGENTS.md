@@ -106,7 +106,8 @@ exercises it (examples: orbit, world, instances, rigged, nightwood) in a WebGPU 
 - **Temporal is opt-in and exact when off.** With `temporal: false` the plain kernels run the
   same arithmetic as before it existed. Anything that changes voxels or instances must reach
   `TemporalHistory.mark` (edits, the moving set) or `reset` (a new static set, a full rebuild),
-  or the history ghosts.
+  or the history ghosts. The upscaling resolve (`resolve.wesl`) reads the same stamps, and the
+  previous history, to stop a still camera's running average where something moved.
 - **Adreno 7xx quirks** (see the comments in `grid.wesl`):
   - index arithmetic is unsigned, and lookups take voxel coordinates, not brick coordinates
     computed elsewhere;

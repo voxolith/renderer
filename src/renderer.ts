@@ -2576,6 +2576,8 @@ export class Renderer {
         { binding: 4, visibility: C, texture: { sampleType: "float" } },
         { binding: 5, visibility: C, sampler: { type: "filtering" } },
         { binding: 6, visibility: C, storageTexture: { access: "write-only", format: "rgba16float" } },
+        { binding: 7, visibility: C, texture: { sampleType: "uint" } },
+        { binding: 8, visibility: C, texture: { sampleType: "uint" } },
       ],
     });
     return {
@@ -2680,6 +2682,8 @@ export class Renderer {
             { binding: 4, resource: acc.views[acc.at] },
             { binding: 5, resource: (this.resolveSampler ??= device.createSampler({ magFilter: "linear", minFilter: "linear" })) },
             { binding: 6, resource: acc.views[out] },
+            { binding: 7, resource: temporal.stampsView() },
+            { binding: 8, resource: temporal.read() },
           ],
         }),
       };
