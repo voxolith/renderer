@@ -72,7 +72,9 @@ fn pixelJitter() -> vec2<f32> {
 // point ratio rgb), packed by packHistory.
 @group(2) @binding(1) var histIn : texture_2d<u32>;
 @group(2) @binding(2) var histOut : texture_storage_2d<rgba32uint, write>;
-// Per brick column (x / 8, z / 8): the number of the frame in which something there last changed.
+// Per brick column (x / 8, z / 8): twice the number of the frame in which something there last
+// changed, plus 1 when voxels or instances in the column itself did (else it is only in reach of
+// the shadow of a change elsewhere; the upscaling resolve tells the two apart).
 @group(2) @binding(3) var changed : texture_2d<u32>;
 
 struct History {
@@ -190,7 +192,7 @@ fn changedAt(cell : vec3<i32>) -> bool {
   let dims = vec2<i32>(textureDimensions(changed));
   let q = vec2<i32>(cell.x >> 3u, cell.z >> 3u);
   if (cell.x < 0 || cell.z < 0 || q.x >= dims.x || q.y >= dims.y) { return false; }
-  return textureLoad(changed, q, 0).x >= T.frame;
+  return (textureLoad(changed, q, 0).x >> 1u) >= T.frame;
 }
 
 // Sample `k` of a face's sequence: the R2 low-discrepancy sequence (Roberts 2018), rotated per face

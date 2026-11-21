@@ -96,7 +96,9 @@ exercises it (examples: orbit, world, instances, rigged, nightwood) in a WebGPU 
   - `BRICK_B` (8) and `TOP_B` (64) (`brick.ts`) match `COARSE_B` and `TOP_B` in `grid.wesl`;
   - `MODEL_WORDS` matches in `renderer.ts` and `grid.wesl`;
   - the uniform word map matches in `renderer.ts` (`render`) and `uniforms.wesl`;
-  - the `Temporal` block and its flag bits match in `temporal.ts` and `temporal.wesl`.
+  - the `Temporal` block and its flag bits match in `temporal.ts` and `temporal.wesl`; the change
+    stamps' encoding (twice the frame, plus the own-change bit) matches in `temporal.ts`,
+    `temporal.wesl` and `resolve.wesl`, which also copies the `Temporal` struct.
 - **Keep the shader small.** SwiftShader's compile time explodes with inlined copies of large
   functions. Keep one call site per big lookup (AO is one loop with one `isSolid`; instance
   sampling is one function). Optional features sit behind pipeline override constants
@@ -107,7 +109,9 @@ exercises it (examples: orbit, world, instances, rigged, nightwood) in a WebGPU 
   same arithmetic as before it existed. Anything that changes voxels or instances must reach
   `TemporalHistory.mark` (edits, the moving set) or `reset` (a new static set, a full rebuild),
   or the history ghosts. The upscaling resolve (`resolve.wesl`) reads the same stamps, and the
-  previous history, to stop a still camera's running average where something moved.
+  previous history, to stop a still camera's running average where something moved. Under
+  camera motion the resolve prefers soft to ghosted: history is dropped by motion per frame
+  (`RESOLVE_MOTION`), at disocclusions and at stamps. Do not widen that to hide softness.
 - **Adreno 7xx quirks** (see the comments in `grid.wesl`):
   - index arithmetic is unsigned, and lookups take voxel coordinates, not brick coordinates
     computed elsewhere;

@@ -8,19 +8,22 @@
 // temporal history stores), clamps that history to the range of the frame's 3x3 samples around the
 // pixel so what no longer belongs there (a disocclusion, a moved light) fades out, and blends the
 // new sample in: more when it landed close to the pixel's centre, all of it where there is no
-// history. Under a still camera a pixel keeps a running average instead and then holds, except
+// history. How much of that history a pixel keeps while the camera moves falls with how far it
+// moved in the frame, to none from a few output pixels on, at a disocclusion (the distance stored
+// last frame disagrees) and where something moved; what is left is this frame alone, interpolated:
+// soft, but with nothing trailing. Under a still camera a pixel keeps a running average instead and then holds, except
 // where the temporal history's change stamps say something moved this frame (an edit, a moving
 // instance, a shadow of either): those pixels are clamped and blended as pixels in motion are, or
-// what moved would trail behind it. This is temporal supersampling as in Brian Karis, "High Quality Temporal Supersampling"
-// (SIGGRAPH 2014, Advances in Real-Time Rendering in Games course): jittered samples, reprojected
+// what moved would trail behind it. This is temporal supersampling as in Brian Karis, "High
+// Quality Temporal Supersampling" (SIGGRAPH 2014, Advances in Real-Time Rendering in Games course): jittered samples, reprojected
 // history, neighbourhood clamping.
 //
 // A pass and a pipeline of its own, never part of the trace kernel: nothing here costs the kernel
 // a register. Self-contained WGSL (no imports), so the renderer compiles it as it is.
 
 struct Resolve {
-  camPos   : vec3<f32>, _0 : f32,          // 0-3    this frame's camera, as in the main uniforms
-  camRight : vec3<f32>, _1 : f32,          // 4-7
+  camPos   : vec3<f32>, motionKeep : f32,  // 0-3    this frame's camera, as in the main uniforms; MOTION_KEEP (below)
+  camRight : vec3<f32>, motionDrop : f32,  // 4-7    MOTION_DROP
   camUp    : vec3<f32>, _2 : f32,          // 8-11
   camFwd   : vec3<f32>, tanHalfFov : f32,  // 12-15
   aspect   : f32, valid : f32, raw : f32, changedCount : f32, // 16-19  the output's aspect; 1 when the accumulated picture can be reused; development view (below); entries of `changed`
@@ -73,6 +76,12 @@ const RELIT_WEIGHT : f32 = 12.0;
 const RELIT_REACH : f32 = 0.7;
 // The weight a moving pixel's history is given, for the running average to start from when it stops.
 const MOVING_WEIGHT : f32 = 2.0;
+// The weight of a pixel that kept no history (fast motion, a disocclusion, something moving
+// there): low, so the first well-placed samples after it comes to rest replace the soft picture.
+const FRESH_WEIGHT : f32 = 0.5;
+// The share of this frame in a pixel where something moved under a still camera (the rest is its
+// history, clamped). Per frame, and high: at a low frame rate a small share is a long trail.
+const MOVED_BLEND : f32 = 0.6;
 
 // Halton radical inverse of `i` in base `b` (as temporal.wesl).
 fn halton(i : u32, b : u32) -> f32 {
@@ -126,13 +135,22 @@ fn historyAt(uv : vec2<f32>) -> vec3<f32> {
   return sum / (a + b + m + d + e);
 }
 
-// Whether something changed this frame in the brick column holding the world point `p`
-// (temporal.wesl changedAt).
-fn changedAt(p : vec3<f32>) -> bool {
+// What changed this frame in the brick column holding the world point `p` (temporal.wesl
+// changedAt): 0 nothing, 1 only light (the shadow of something that changed elsewhere may fall
+// here), 2 voxels or instances (something there was edited or moved).
+fn changedAt(p : vec3<f32>) -> u32 {
   let dims = vec2<i32>(textureDimensions(changed));
   let q = vec2<i32>(floor(p.xz / 8.0));
-  if (any(q < vec2<i32>(0)) || any(q >= dims)) { return false; }
-  return textureLoad(changed, q, 0).x >= T.frame;
+  if (any(q < vec2<i32>(0)) || any(q >= dims)) { return 0u; }
+  let s = textureLoad(changed, q, 0).x;
+  return select(0u, 1u + (s & 1u), (s >> 1u) >= T.frame);
+}
+
+// This frame at the output pixel centre `c` (in traced pixels), interpolated between the traced
+// samples around it, which sit at `jit` in their pixels: the picture of a pixel with no history to
+// go on. Soft, at the traced size, but it shows only what is there now.
+fn frameAt(c : vec2<f32>, jit : vec2<f32>) -> vec3<f32> {
+  return textureSampleLevel(frame, accSampler, (c - jit + vec2<f32>(0.5)) / vec2<f32>(textureDimensions(frame)), 0.0).rgb;
 }
 
 @compute @workgroup_size(8, 8)
@@ -176,9 +194,11 @@ fn resolve(@builtin(global_invocation_id) id : vec3<u32>) {
   // The kernel is as wide as the samples are far apart: 3.0 at half scale, where a traced pixel
   // covers two output pixels each way.
   let k = max(exp(-12.0 * scale.x * scale.x * dot(off, off)), 1e-3);
-  var color = cur;
+  // Without history (the first frame, a cut, a pixel that was off screen): this frame alone,
+  // interpolated, with little weight.
+  var color = frameAt(c, jit);
   // The weight accumulated behind `color`, kept in the picture's alpha.
-  var weight = k;
+  var weight = min(k, FRESH_WEIGHT);
   if (R.valid > 0.5) {
     // Where the pixel's surface was in the previous view: the point its ray reaches at the stored
     // hit distance (far away for the sky).
@@ -233,18 +253,26 @@ fn resolve(@builtin(global_invocation_id) id : vec3<u32>) {
           // one in motion is, its history clamped to the frame's samples around it. The stamps are
           // read at the traced sample's own hit, and at the hit the same traced pixel stored last
           // frame (the camera has not moved, so its ray is the same but for the jitter).
-          var moved = false;
+          var moved = 0u;
           let ruv = ((vec2<f32>(j) + jit) / vec2<f32>(lowDim)) * 2.0 - vec2<f32>(1.0);
           let rdir = normalize(R.camFwd + R.camRight * (ruv.x * R.aspect * R.tanHalfFov) + R.camUp * (-ruv.y * R.tanHalfFov));
           if (h.x != 0u) {
             moved = changedAt(R.camPos + rdir * t);
           }
           let hp = textureLoad(histPrev, j, 0);
-          if (!moved && hp.x != 0u) {
-            moved = changedAt(R.camPos + rdir * bitcast<f32>(hp.y));
+          if (hp.x != 0u) {
+            moved = max(moved, changedAt(R.camPos + rdir * bitcast<f32>(hp.y)));
           }
-          if (moved) {
-            color = mix(clamp(p.rgb, lo - pad, hi + pad), cur, clamp(0.35 * k, 0.005, 1.0));
+          if (moved == 2u) {
+            // Something moved or was edited there: the pixel may show something else now. It
+            // takes most of this frame, interpolated, and starts over.
+            color = mix(clamp(p.rgb, lo - pad, hi + pad), frameAt(c, jit), MOVED_BLEND);
+            weight = FRESH_WEIGHT;
+          } else if (moved == 1u) {
+            // Only the light there may have changed (a shadow passing): the surface is the same.
+            // Its history stands, clamped, and takes this frame's sample by how well it is
+            // placed, so it stays as sharp as the samples allow and follows within a few frames.
+            color = mix(clamp(p.rgb, lo - pad, hi + pad), cur, clamp(k, 0.1, 1.0));
             weight = MOVING_WEIGHT;
           } else if (relit) {
             let had = min(p.a, RELIT_WEIGHT);
@@ -264,9 +292,39 @@ fn resolve(@builtin(global_invocation_id) id : vec3<u32>) {
             weight = MOVING_WEIGHT;
           }
         } else {
+          // The camera moved. How much of the history a pixel keeps falls with how far it moved
+          // since the last frame, in output pixels: all of it up to R.motionKeep, none from
+          // R.motionDrop on. What is left without history is this frame alone, soft, which under
+          // motion is the better picture: history reprojected with a traced sample's depth lands
+          // beside its surface wherever the sample is not the pixel's own (every silhouette, at a
+          // traced fraction of 0.35 most of a tree), the clamp box of 3x3 traced samples is too
+          // wide to notice, and a pixel takes only a small share of each frame, so the misplaced
+          // copies pile up into a trail. Measured per frame, the rule follows the frame rate by
+          // itself: the same turn at 15 frames a second moves four times as far a frame as at 60,
+          // and keeps less.
+          let moved = length(st * vec2<f32>(outDim) - o);
+          var keep = 1.0 - smoothstep(R.motionKeep, R.motionDrop, moved);
+          // And none where the previous frame saw something else there (a disocclusion): the
+          // distance the temporal history stored at the four traced pixels around the reprojected
+          // point must agree with the surface's distance from the previous camera at one of them.
+          let was = length(d);
+          let base = vec2<i32>(floor(st * vec2<f32>(lowDim) - vec2<f32>(0.5)));
+          var seen = false;
+          for (var i = 0; i < 4; i = i + 1) {
+            let q = clamp(base + vec2<i32>(i & 1, i >> 1u), vec2<i32>(0), lowDim - vec2<i32>(1));
+            let hq = textureLoad(histPrev, q, 0);
+            if (hq.x == 0u) {
+              if (h.x == 0u) { seen = true; }
+            } else if (h.x != 0u && abs(bitcast<f32>(hq.y) - was) <= 1.5 + 0.02 * was) {
+              seen = true;
+            }
+          }
+          // Nor where something changed this frame (the change stamps, as for a still camera
+          // above): what moves on its own was not where the camera's motion puts it.
+          if (!seen || (h.x != 0u && changedAt(R.camPos + dir * t) == 2u)) { keep = 0.0; }
           let prev = clamp(historyAt(st), lo - pad, hi + pad);
-          color = mix(prev, cur, clamp(0.35 * k, 0.005, 1.0));
-          weight = MOVING_WEIGHT;
+          color = mix(frameAt(c, jit), mix(prev, cur, clamp(0.35 * k, 0.005, 1.0)), keep);
+          weight = max(MOVING_WEIGHT * keep, FRESH_WEIGHT);
         }
       }
     }

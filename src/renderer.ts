@@ -541,7 +541,12 @@ export interface RenderQuality {
    *
    * A resolve pass then accumulates the frames into a sharp picture at the output size: history
    * reprojected by the stored hit distance, clamped to the 3x3 neighbourhood of the new frame, and
-   * held as a running average where nothing moves. Precipitation smears under it. After Brian
+   * held as a running average where nothing moves. Sharpness is built from frames in which a
+   * surface stays put: a pixel that moves more than a few output pixels in a frame (a fast turn, a
+   * low frame rate), one just uncovered and one where something moves keep no history and show
+   * the traced frame alone, interpolated, so motion is soft at the traced size rather than
+   * trailing, and the picture sharpens again within a few frames of coming to rest.
+   * Precipitation smears under it. After Brian
    * Karis, "High Quality Temporal Supersampling" (SIGGRAPH 2014, Advances in Real-Time Rendering
    * course).
    */
@@ -568,6 +573,13 @@ export interface FloorParams {
   /** The other colour of the checker, linear RGB. */
   colorB: Vec3;
 }
+
+/**
+ * Temporal upscaling's resolve under camera motion: a pixel that moved up to the first number of
+ * output pixels since the last frame keeps its history, one that moved the second or more keeps
+ * none and shows this frame alone (resolve.wesl).
+ */
+const RESOLVE_MOTION: [number, number] = [0.5, 3];
 
 /**
  * The fullscreen voxel raymarcher: one world grid (8-bit palette slots, held
@@ -2650,6 +2662,11 @@ export class Renderer {
     r.set(this.uniformData.subarray(0, 16));
     r[16] = this.uniformData[23];
     r[17] = valid ? 1 : 0;
+    // How far a pixel may move in a frame (output pixels) and keep all of its history, and from
+    // where it keeps none (resolve.wesl). Tuning hook: globalThis.__voxolithTemporal.motion.
+    const motion = (globalThis as { __voxolithTemporal?: { motion?: [number, number] } }).__voxolithTemporal?.motion ?? RESOLVE_MOTION;
+    r[3] = motion[0];
+    r[7] = Math.max(motion[1], motion[0] + 1e-3);
     r[18] = (globalThis as { __voxolithTemporal?: { raw?: number } }).__voxolithTemporal?.raw ?? 0;
     // The lights that changed since the last resolved frame, as they are and as they were
     // (position and range): the resolve keeps surfaces in their reach from holding.

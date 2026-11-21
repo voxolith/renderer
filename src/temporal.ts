@@ -62,7 +62,7 @@ export class TemporalHistory {
   private hist: { tex: [GPUTexture, GPUTexture]; views: [GPUTextureView, GPUTextureView]; groups: [GPUBindGroup, GPUBindGroup]; w: number; h: number } | null = null;
   /** Whether the frame being drawn reuses the previous one's history (set by `prepare`). */
   private reused = false;
-  /** Number of the next frame to render (stamps of changes before it equal it). */
+  /** Number of the next frame to render (a change before it is stamped twice this number, plus 1 where the change itself is, not only its shadow). */
   private frame = 1;
   /** Whether the last frame's history may be reused. */
   private valid = false;
@@ -140,13 +140,15 @@ export class TemporalHistory {
     const [cw, ch] = this.cols;
     const st = this.stamps, f = this.frame;
     // The box's columns, with MARGIN voxels all round (AO reaches one), moved by (dx, dz).
-    const rect = (dx: number, dz: number) => {
+    // `own`: the change itself is in these columns (not only its shadow), the stamp's low bit.
+    const rect = (dx: number, dz: number, own = false) => {
       const c0 = Math.max(0, Math.floor((x0 - MARGIN + dx) / COLUMN)), c1 = Math.min(cw - 1, Math.floor((x1 + MARGIN + dx) / COLUMN));
       const r0 = Math.max(0, Math.floor((z0 - MARGIN + dz) / COLUMN)), r1 = Math.min(ch - 1, Math.floor((z1 + MARGIN + dz) / COLUMN));
       if (c0 > c1 || r0 > r1) return;
       for (let r = r0; r <= r1; r++) {
         for (let i = r * cw + c0, e = r * cw + c1; i <= e; i++) {
-          if (st[i] !== f) { st[i] = f; this.marked++; }
+          if (st[i] >>> 1 !== f) { st[i] = f * 2; this.marked++; }
+          if (own) st[i] |= 1;
         }
       }
       if (r0 < this.dirty[0]) this.dirty[0] = r0;
@@ -159,7 +161,7 @@ export class TemporalHistory {
       const n = Math.ceil(len / COLUMN);
       for (let i = 1; i <= n; i++) rect((dx * i) / n, (dz * i) / n);
     };
-    rect(0, 0);
+    rect(0, 0, true);
     // The key light's shadow of the box's top, on ground down to a brick below its bottom.
     const L = this.keyDir;
     if (L[1] > 0.01) {
