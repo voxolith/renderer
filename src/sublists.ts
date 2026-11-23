@@ -74,6 +74,10 @@ export function subPieces(fwd: ArrayLike<number>, scale: number): number {
  * at most `maxList` each; longer lists are not split) of a world with `brickDim` bricks and
  * `topDim` top cells, `gridMax` voxels on its longest side. `marked`, when given, is called after
  * each instance has been marked (with its index; the marking is nearly all of the build's time).
+ *
+ * It is three steps, which a host can also run apart to spread the marking over workers
+ * (placement.ts does): {@link subListTables} numbers the tables, {@link markSubLists} marks a
+ * range of the instances, {@link fillSubLists} writes the region from the marks of every range.
  */
 export function buildSubLists(
   brickDim: readonly [number, number, number],
@@ -85,13 +89,65 @@ export function buildSubLists(
   marked?: (k: number) => void,
 ): SubLists {
   const cells = topDim[0] * topDim[1] * topDim[2];
-  const [tx, ty] = topDim;
+  const { table, tables } = subListTables(cells, perCell, maxList);
+  return fillSubLists(cells, table, tables, [markSubLists(brickDim, topDim, table, tables, placed, 0, placed.length, gridMax, marked)]);
+}
+
+/**
+ * The tables of a build: per top cell its table's number, or -1 for none (a cell no instance is
+ * in, or one whose list is longer than `maxList`), numbered in `perCell`'s order.
+ */
+export function subListTables(cells: number, perCell: Map<number, { length: number }>, maxList: number): { table: Int32Array; tables: number } {
   const table = new Int32Array(cells).fill(-1);
   let tables = 0;
   for (const [ci, l] of perCell) if (l.length <= maxList) table[ci] = tables++;
+  return { table, tables };
+}
+
+/**
+ * What marking instances `lo` to `hi` (exclusive) found: per slot (table × 64 + sub-cell) how many
+ * of them reach it and which of its 8 bricks, and the slots each instance reaches, in instance
+ * order. The marks of contiguous ranges that together cover a set are what one marking of the
+ * whole set finds, split: an instance is listed once per slot whoever marks it, counts add, masks
+ * OR, and the lists are the instances in order, so joining the ranges in order is the same list.
+ */
+export interface SubListMarks {
+  /** First instance marked. */
+  lo: number;
+  /** One past the last. */
+  hi: number;
+  /** (slot, instance) pairs found. */
+  pairs: number;
+  /** Each pair's slot, instance by instance (its first `pairs` words; it may be longer). */
+  slots: Uint32Array<ArrayBuffer>;
+  /** Per instance of the range, the number of pairs up to and including its own (`hi - lo` words). */
+  ends: Uint32Array<ArrayBuffer>;
+  /** Per slot, the pairs naming it. */
+  counts: Uint32Array<ArrayBuffer>;
+  /** Per slot, the mask of its 8 bricks the range's instances reach. */
+  masks: Uint8Array<ArrayBuffer>;
+}
+
+/**
+ * Mark instances `lo` to `hi` (exclusive) of `placed` into the tables numbered by `table`
+ * ({@link subListTables}); the rest of `placed` is not read. `marked` as in {@link buildSubLists}.
+ */
+export function markSubLists(
+  brickDim: readonly [number, number, number],
+  topDim: readonly [number, number, number],
+  table: Int32Array,
+  tables: number,
+  placed: readonly SubListInstance[],
+  lo: number,
+  hi: number,
+  gridMax: number,
+  marked?: (k: number) => void,
+): SubListMarks {
+  const [tx, ty] = topDim;
   const slots = tables * 64;
-  // (slot, instance) pairs in instance order, each pair once, then a counting sort by slot.
-  let pairSlot: Uint32Array<ArrayBuffer> = new Uint32Array(1 << 16), pairK: Uint32Array<ArrayBuffer> = new Uint32Array(1 << 16), n = 0;
+  // (slot, instance) pairs in instance order, each pair once; fillSubLists sorts them by slot.
+  let pairSlot: Uint32Array<ArrayBuffer> = new Uint32Array(1 << 16), n = 0;
+  const ends = new Uint32Array(hi - lo);
   const counts = new Uint32Array(slots), last = new Int32Array(slots).fill(-1), masks = new Uint8Array(slots);
   const [bx, by, bz] = brickDim;
   const seenK = new Int32Array(256).fill(-1), seenB = new Int32Array(256);
@@ -107,9 +163,8 @@ export function buildSubLists(
     if (last[slot] === k) return;
     last[slot] = k;
     counts[slot]++;
-    if (n === pairSlot.length) { pairSlot = grow(pairSlot, n * 2); pairK = grow(pairK, n * 2); }
-    pairSlot[n] = slot;
-    pairK[n++] = k;
+    if (n === pairSlot.length) pairSlot = grow(pairSlot, n * 2);
+    pairSlot[n++] = slot;
   };
   const mark = (k: number, x0: number, y0: number, z0: number, x1: number, y1: number, z1: number) => {
     const gx0 = Math.max(0, Math.floor(x0 / BRICK_B)), gx1 = Math.min(bx - 1, Math.floor(x1 / BRICK_B));
@@ -121,12 +176,13 @@ export function buildSubLists(
   const maxX = bx * BRICK_B - 1, maxY = by * BRICK_B - 1, maxZ = bz * BRICK_B - 1;
   const fwd = new Float64Array(12);
   if (tables) {
-    for (let k = 0; k < placed.length; k++) {
+    for (let k = lo; k < hi; k++) {
       const p = placed[k];
       if (p.posedBox) {
         // Posed: anywhere in its box.
         const b = p.posedBox;
         mark(k, b[0] - 1, b[1] - 1, b[2] - 1, b[3] + 1, b[4] + 1, b[5] + 1);
+        ends[k - lo] = n;
         if (marked) marked(k);
         continue;
       }
@@ -176,11 +232,36 @@ export function buildSubLists(
               if (seenK[h] !== k || seenB[h] !== bi) markBrick(k, gx, gy, gz);
             }
       }
+      ends[k - lo] = n;
       if (marked) marked(k);
     }
   }
+  return { lo, hi, pairs: n, slots: pairSlot, ends, counts, masks };
+}
+
+/**
+ * Write the region of `cells` top cells from the tables' numbering ({@link subListTables}) and the
+ * marks of every range of the instances, given in instance order (ascending `lo`, each starting
+ * where the one before ended). A stable counting sort of the pairs by slot; the marks are only read.
+ */
+export function fillSubLists(cells: number, table: Int32Array, tables: number, marks: readonly SubListMarks[]): SubLists {
+  const slots = tables * 64;
+  let n = 0;
+  for (const m of marks) n += m.pairs;
+  let counts = marks[0].counts, masks = marks[0].masks;
+  if (marks.length > 1) {
+    counts = new Uint32Array(slots);
+    masks = new Uint8Array(slots);
+    for (const m of marks) {
+      const c = m.counts, k = m.masks;
+      for (let s = 0; s < slots; s++) {
+        counts[s] += c[s];
+        masks[s] |= k[s];
+      }
+    }
+  }
   const data = new Uint32Array(cells + slots + n);
-  const base = new Uint32Array(tables);
+  const base = new Uint32Array(tables), next = new Uint32Array(slots);
   let at = cells;
   for (let t = 0; t < tables; t++) {
     base[t] = at;
@@ -189,11 +270,14 @@ export function buildSubLists(
       const slot = t * 64 + sc, c = counts[slot];
       if (at - base[t] > 0xffff) throw new Error("buildSubLists: a sub-cell table outgrew its 16-bit offsets");
       data[base[t] + sc] = (((at - base[t]) << 16) | (masks[slot] << 8) | c) >>> 0;
-      counts[slot] = at;
+      next[slot] = at;
       at += c;
     }
   }
-  for (let i = 0; i < n; i++) data[counts[pairSlot[i]]++] = pairK[i];
+  for (const m of marks) {
+    const { slots: pairSlot, ends, lo } = m;
+    for (let j = 0, i = 0; j < ends.length; j++) for (const k = lo + j, end = ends[j]; i < end; i++) data[next[pairSlot[i]]++] = k;
+  }
   for (let ci = 0; ci < cells; ci++) if (table[ci] >= 0) data[ci] = base[table[ci]] + 1;
   return { data, cellWords: data.slice(0, cells), stats: { tables, pairs: n } };
 }

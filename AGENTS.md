@@ -34,7 +34,16 @@ exercises it (examples: orbit, world, instances, rigged, nightwood) in a WebGPU 
   them by `PLACEMENT_BAKE_VERSION` and keeps them `normalizePlacement`d (model ids by first
   appearance), then `bindPlacement`s one to the next visit's ids. Bump the version whenever a
   bake's bytes change; verify holds a digest of a fixed scene's bake with the version it was
-  recorded under and fails until both are updated.
+  recorded under and fails until both are updated. The bake also splits over several workers:
+  `splitPlacement` cuts the instances into contiguous ranges balanced by marking work,
+  `bakePlacementShare` (`PlacementBaker.bakeShare`) marks one range and returns its pairs and
+  masks (one share, the range with `pack`, also the records, poses and cell lists), and
+  `mergePlacementShares` joins them, without the models, into `bakePlacement`'s bake byte for
+  byte (verify checks 1, 2, 3 and 7 shares array for array). It is exact because a (sub-cell,
+  instance) pair is deduplicated per instance, counts add, masks OR and the lists are in instance
+  order; every share packs all the instances itself so that all arrive at the same table
+  numbering. `bakePlacement` is the same steps with one range (`subListTables`, `markSubLists`,
+  `fillSubLists` in `sublists.ts`), so a change to the marking changes both alike.
 - `src/encode.ts`: model encoding (`encodeModel`, `EncodedModel`, `ENCODED_MODEL_VERSION`), headless
   and worker-safe: the bricks, part grid, part boxes and occupied sub-cells `addModel` computes,
   against a pool of the model's own; `addModel(src)` is `addEncodedModel(encodeModel(src))`, and

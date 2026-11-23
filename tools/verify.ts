@@ -9,7 +9,7 @@ import { seededRandom } from "../src/random";
 import { makePerf } from "../src/perf";
 import { MOVING_TABLE_WORDS, buildSubLists, movingTable, readSubLists, type SubListInstance } from "../src/sublists";
 import { INST_SCALE_SHIFT, INST_WORDS, packInstance, sampleInstance } from "../src/instance";
-import { PLACEMENT_BAKE_VERSION, PlacementBaker, bakePlacement, bindPlacement, normalizePlacement, placementTransferables, type PlacementBake, type PlacementInput, type PlacementInstance, type PlacementModel } from "../src/placement";
+import { PLACEMENT_BAKE_VERSION, PlacementBaker, bakePlacement, bakePlacementShare, bindPlacement, mergePlacementShares, normalizePlacement, placementShareTransferables, placementTransferables, splitPlacement, type PlacementBake, type PlacementRange, type PlacementShare, type PlacementInput, type PlacementInstance, type PlacementModel } from "../src/placement";
 import { ENCODED_MODEL_VERSION, encodeModel, encodedTransferables, placementModelOf, type EncodedModel, type ModelSource } from "../src/encode";
 import { installRawLoader, mockGpu } from "./mock-gpu";
 import type { FrameParams, Instance } from "../src/renderer";
@@ -370,6 +370,50 @@ console.log("\nsub-cell instance tables:");
     `${unlisted} unlisted, ${unordered} out of order, ${lost} static entries lost, first ${first}`);
 }
 
+/** The first difference between two bakes, array for array (and the header), or "" when they are the same. */
+function bakeDiff(a: PlacementBake, b: PlacementBake): string {
+  const head = (x: PlacementBake) => JSON.stringify({ grid: x.grid, models: x.models, count: x.count, dropped: x.dropped, stats: x.stats });
+  if (head(a) !== head(b)) return `header ${head(a)} vs ${head(b)}`;
+  for (const name of ["inst", "boxes", "parts", "cells", "list", "subs", "subCells"] as const) {
+    const x = a[name], y = b[name];
+    if (x.constructor !== y.constructor || x.length !== y.length) return `${name}: ${x.constructor.name} of ${x.length} vs ${y.constructor.name} of ${y.length}`;
+    const i = x.findIndex((v, j) => v !== y[j]);
+    if (i >= 0) return `${name}[${i}]: ${x[i]} vs ${y[i]}`;
+  }
+  return "";
+}
+
+/**
+ * A bake split over n shares, each through structured cloning with its buffers transferred (as
+ * from a worker) and merged in a shuffled order, against bakePlacement of the same input: the
+ * first difference (or what is wrong with the split), or "" when the merged bake is the same.
+ */
+function splitBakeDiff(input: PlacementInput, model: (key: number) => PlacementModel | undefined, n: number, seen?: { ranges: PlacementRange[]; shares: PlacementShare[] }): string {
+  const ranges = splitPlacement(input, model, n);
+  const count = input.instances.length;
+  if (ranges.length !== n || ranges[0].lo !== 0 || ranges.at(-1)!.hi !== count || ranges.some((r, i) => r.hi < r.lo || r.pack !== (i === 0) || (i > 0 && r.lo !== ranges[i - 1].hi))) return `ranges ${JSON.stringify(ranges)}`;
+  const shares = ranges.map((r) => {
+    const share = bakePlacementShare(structuredClone(input), model, r);
+    const sent = placementShareTransferables(share);
+    const moved = structuredClone(share, { transfer: sent });
+    if (sent.some((b) => b.byteLength !== 0)) throw new Error("a share's buffer was not transferred");
+    return moved;
+  });
+  if (seen) { seen.ranges = ranges; seen.shares = shares; }
+  // Any order: here the odd ones first, then the even ones backwards.
+  const mixed = [...shares.filter((_, i) => i % 2), ...shares.filter((_, i) => i % 2 === 0).reverse()];
+  return bakeDiff(mergePlacementShares(input, mixed), bakePlacement(input, model));
+}
+
+/** {@link splitBakeDiff} for 1, 2, 3 and 7 shares: "" or the first failure. */
+function splitBakeDiffs(input: PlacementInput, model: (key: number) => PlacementModel | undefined): string {
+  for (const n of [1, 2, 3, 7]) {
+    const d = splitBakeDiff(input, model, n);
+    if (d) return `${n} shares: ${d}`;
+  }
+  return "";
+}
+
 console.log("\nplacement bake (the renderer against a mock device):");
 
 // The static set baked off the main thread (placementInput → a worker's PlacementBaker, through
@@ -459,6 +503,77 @@ const placementScene = await import("./placement-scene");
     performance.now = () => 0;
     try { baker.bake(input, { onProgress: () => quiet++ }); } finally { performance.now = now; }
     ok(same && quiet === 2, "  and changes no byte of the bake; a bake quicker than the throttle reports only its first and last call", `same ${same}, ${quiet} calls`);
+  }
+  // The bake split over several workers: contiguous ranges of the instances, balanced by marking
+  // work, each marked apart (bakePlacementShare, here through structured cloning and transfer),
+  // then merged. The merged bake must be bakePlacement's, array for array, for any number of shares.
+  {
+    const lookup = (key: number) => (baker.has(key) ? models.get(key) : undefined);
+    const models = new Map<number, PlacementModel>();
+    for (const id of B.ids.all) { const m = B.r.placementModel(id); if (m) models.set(m.key, m); }
+    const input = structuredClone(B.r.placementInput(staticSet)), input2 = structuredClone(B.r.placementInput(staticSet2));
+    const d1 = splitBakeDiffs(input, lookup), d2 = splitBakeDiffs(input2, lookup);
+    ok(!d1 && !d2, `  split over 1, 2, 3 and 7 shares and merged, it is the same bake array for array (${input.instances.length} and ${input2.instances.length} instances; dense, sparse, posed, shared poses, a cell over the limit)`, d1 || d2);
+    // The ranges: balanced by marking units, not by count. The scene's first 300 trees share one
+    // top cell over the limit, which has no table, but they still count (and mark its neighbours).
+    const seen = { ranges: [] as PlacementRange[], shares: [] as PlacementShare[] };
+    splitBakeDiff(input, lookup, 3, seen);
+    const weight = (r: PlacementRange) => { let u = 0; for (let k = r.lo; k < r.hi; k++) { const p = input.instances[k], m = models.get(input.models[p.model])!; u += p.parts && m.partBoxes ? (Math.ceil(m.size.x / 8) + 2) * (Math.ceil(m.size.y / 8) + 2) * (Math.ceil(m.size.z / 8) + 2) : m.subs.length / 3; } return u; };
+    const w = seen.ranges.map(weight), whole = w.reduce((a, b) => a + b, 0), most = Math.max(...input.instances.map((_, k) => weight({ lo: k, hi: k + 1, pack: false })));
+    const sizes = seen.ranges.map((r) => r.hi - r.lo);
+    ok(w.every((u) => Math.abs(u - whole / 3) <= most) && new Set(sizes).size > 1, `  its ranges are balanced by marking work, each within one instance of a third (${sizes.join(", ")} instances for ${w.join(", ")} units)`);
+    const pairs = seen.shares.reduce((a, sh) => a + sh.slots.length, 0), tables = seen.shares[0].tables;
+    ok(seen.shares.filter((sh) => sh.pack).length === 1 && !!seen.shares[0].pack && pairs === bake1.stats.pairs && tables === bake1.stats.tables && seen.shares.every((sh) => sh.counts.length === tables * 64 && sh.masks.length === tables * 64 && sh.ends.length === sh.hi - sh.lo && (sh.ends.at(-1) ?? 0) === sh.slots.length),
+      `  the first share carries the pack; the shares hold the bake's ${pairs} pairs between them, 4 bytes each`);
+    // Through PlacementBaker, as workers do it, each splitting the input itself and taking its range.
+    const viaBakers = mergePlacementShares(input, [0, 1, 2, 3].map((i) => { const b = baker.bakeShare(structuredClone(input), baker.split(structuredClone(input), 4)[i]); return structuredClone(b, { transfer: placementShareTransferables(b) }); }));
+    ok(!bakeDiff(viaBakers, baker.bake(input)), "  PlacementBaker.split and bakeShare make the same shares", bakeDiff(viaBakers, baker.bake(input)));
+    // Progress per share: 0 to its own total; the marking parts of the shares' totals add up to
+    // the whole bake's marking (each share also counts its own packing of every instance).
+    {
+      const now = performance.now;
+      let clock = 0;
+      performance.now = () => (clock += 10);
+      const runs: [number, number][][] = [];
+      let wholeTotal = 0;
+      try {
+        for (const r of seen.ranges) { const calls: [number, number][] = []; baker.bakeShare(input, r, { onProgress: (d, t) => calls.push([d, t]) }); runs.push(calls); }
+        baker.bake(input, { onProgress: (_d, t) => (wholeTotal = t) });
+      } finally { performance.now = now; }
+      const fine = runs.every((calls) => calls.length >= 2 && calls[0][0] === 0 && calls.at(-1)![0] === calls[0][1] && calls.every(([d, t], i) => t === calls[0][1] && (i === 0 || d >= calls[i - 1][0])));
+      // PACK_UNITS is 256 an instance; the whole bake adds 1/200 of its marking for the fill.
+      const marking = runs.reduce((a, calls) => a + calls[0][1] - input.instances.length * 256, 0);
+      ok(fine && marking > 0 && wholeTotal === input.instances.length * 256 + marking + Math.ceil(marking / 200), `  each share's progress runs from 0 to its own total, and their marking units add up to the bake's (${marking})`, `${fine}, ${marking}, ${wholeTotal}`);
+    }
+    // Degenerate splits: more shares than instances, an empty share baked or left out, an empty input.
+    const few: PlacementInput = { ...input, instances: input.instances.filter((_, k) => k === 310 || k === 420 || k === 505) };
+    const none: PlacementInput = { ...input, instances: [] };
+    const dFew = splitBakeDiff(few, lookup, 7, seen);
+    const empties = seen.ranges.filter((r) => r.lo === r.hi).length;
+    const withoutEmpties = bakeDiff(mergePlacementShares(few, seen.shares.filter((sh) => sh.pack || sh.hi > sh.lo)), bakePlacement(few, lookup));
+    ok(!dFew && empties >= 4 && !withoutEmpties, `  7 shares of 3 instances merge to the same bake, with the ${empties} empty shares or without them`, dFew || withoutEmpties);
+    // One instance that outweighs the rest: it gets a range of its own, the others share what is left.
+    const lopsided = splitPlacement({ ...input, instances: [input.instances[505], input.instances[310], input.instances[505]] }, lookup, 3);
+    const dNone = [1, 3].map((n) => splitBakeDiff(none, lookup, n)).join("");
+    const emptyBake = mergePlacementShares(none, [bakePlacementShare(none, lookup, { lo: 0, hi: 0, pack: true })]);
+    ok(!dNone && emptyBake.count === 0 && emptyBake.subs.length === emptyBake.cells.length && lopsided.every((r) => r.hi >= r.lo) && lopsided.at(-1)!.hi === 3, "  an empty input splits, bakes and merges to the empty bake", dNone);
+    // What the merge refuses.
+    const throws = (g: () => unknown) => { try { g(); return ""; } catch (e) { return String(e); } };
+    splitBakeDiff(input, lookup, 3, seen);
+    const [s0, s1, s2] = seen.shares;
+    const other = bakePlacementShare(input2, lookup, splitPlacement(input2, lookup, 3)[1]);
+    const errs = [
+      throws(() => mergePlacementShares(input, [s0, s2])),
+      throws(() => mergePlacementShares(input, [s0, s1, s1, s2])),
+      throws(() => mergePlacementShares(input, [s1, s2])),
+      throws(() => mergePlacementShares(input, [s0, s1, { ...s2, pack: s0.pack }])),
+      throws(() => mergePlacementShares(input, [s0, other, s2])),
+      throws(() => mergePlacementShares(input2, [s0, s1, s2])),
+      throws(() => bakePlacementShare(input, lookup, { lo: 5, hi: input.instances.length + 1, pack: false })),
+      throws(() => bakePlacementShare(input, () => undefined, seen.ranges[1])),
+    ];
+    ok(errs[0].includes("leave out") && errs[1].includes("overlap") && errs[2].includes("0 shares carry the pack") && errs[3].includes("2 shares carry the pack") && errs[4].includes("instances") && errs[5].includes("instances") && errs[6].includes("not within") && errs[7].includes("not registered"),
+      "  the merge throws on a missing share, a repeated one, no pack or two, and shares of another set; a share throws on a range outside the input or an unregistered model", errs.join(" | "));
   }
   // A bake made before a model changed must not draw the wrong model.
   B.r.removeModel(B.ids.tree);
@@ -594,6 +709,7 @@ console.log("\nplacement bakes across visits (normalizePlacement → bindPlaceme
   for (let k = 0; k < 24; k++) instances.push({ model: k % 3 ? 2 : 3, base: 400, x: 20 + k * 9, y: 30 + (k % 4) * 8, z: 30 + k * 8, rotation: k % 2 ? quarter : undefined, mirror: k % 5 === 0, parts: k % 4 ? poseA : poseB });
   const input: PlacementInput = { grid: { brickDim: [32, 16, 32], topDim: [4, 2, 4], gridMax: 256 }, models: [11, 12, 13, 14], instances };
   const bake = normalizePlacement(bakePlacement(input, (key) => models.find((m) => m.key === key)));
+  const dSplit = splitBakeDiffs(input, (key) => models.find((m) => m.key === key));
   // FNV-1a over the header's JSON and every array's bytes, two lanes for 64 bits.
   let h1 = 0x811c9dc5, h2 = 0x01000193 ^ 0x5bd1e995;
   const eat = (bytes: Uint8Array) => { for (let i = 0; i < bytes.length; i++) { h1 = Math.imul(h1 ^ bytes[i], 0x01000193); h2 = Math.imul(h2 ^ bytes[i], 0x01000193) ^ (h2 >>> 15); } };
@@ -601,6 +717,7 @@ console.log("\nplacement bakes across visits (normalizePlacement → bindPlaceme
   for (const a of [bake.inst, bake.boxes, bake.parts, bake.cells, bake.list, bake.subs, bake.subCells]) eat(new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
   const digest = (h1 >>> 0).toString(16).padStart(8, "0") + (h2 >>> 0).toString(16).padStart(8, "0");
   ok(bake.dropped > 0 && bake.parts.length > 0 && bake.stats.tables > 0, `  the fixed scene has dropped cell entries, ${bake.parts.length} pose words and ${bake.stats.tables} sub-cell tables`);
+  ok(!dSplit, "  split over 1, 2, 3 and 7 shares and merged, it is the same bake", dSplit);
   ok(
     PLACEMENT_BAKE_VERSION === RECORDED.version && digest === RECORDED.digest,
     `  its bake is the one recorded for PLACEMENT_BAKE_VERSION ${RECORDED.version} (digest ${digest})`,
@@ -1315,6 +1432,9 @@ console.log("\nupscaled instances (ModelOptions.scale):");
     const calls: number[][] = [];
     bakePlacement(input, (kk) => models.find((m) => m.key === kk), { onProgress: (d, t) => calls.push([d, t]) });
     ok(calls.length >= 2 && calls[0][0] === 0 && calls.at(-1)![0] === calls[0][1], "  its progress runs from 0 to its total");
+    // Split over shares: turned scaled models are marked as pieces (subPieces), in each share alike.
+    const dSplit = splitBakeDiffs(input, (kk) => models.find((m) => m.key === kk));
+    ok(!dSplit, "  split over 1, 2, 3 and 7 shares and merged, the scaled bake is the same array for array", dSplit);
     // Posing needs scale 1.
     let posed = "";
     try {

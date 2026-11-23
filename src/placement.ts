@@ -9,10 +9,16 @@
 // the bake reads (size, occupied sub-cells, part boxes, joints) is a `PlacementModel`, which a host
 // sends to its worker once per model (`Renderer.placementModel`) rather than with every bake. The
 // result is typed arrays that each own their buffer, so they transfer (`placementTransferables`).
+//
+// Several workers: the marking of the sub-cell tables, nearly all of a bake, splits exactly over
+// contiguous ranges of the instances (see SubListMarks in sublists.ts for why). `splitPlacement`
+// cuts an input into ranges of equal marking work, `bakePlacementShare` marks one range, and
+// `mergePlacementShares` joins the shares into the bake `bakePlacement` makes, byte for byte.
+// `bakePlacement` is the same three steps with one range, without the copies between them.
 
 import { TOP_B } from "./brick";
 import { INST_MODEL, INST_WORDS, maxPoseWords, packInstance, packPose, placement, scaledSize, type PackInstance } from "./instance";
-import { buildSubLists, subPieces, type SubListInstance } from "./sublists";
+import { fillSubLists, markSubLists, subListTables, subPieces, type SubListInstance } from "./sublists";
 
 /** Instances per top cell list; more are dropped (with a console warning when applied). */
 export const MAX_CELL_INSTANCES = 255;
@@ -154,23 +160,10 @@ const FILL_SHARE = 1 / 200;
 /** Least time between progress calls, ms. */
 const PROGRESS_MS = 50;
 
-/**
- * Bake a static instance set: the instance records, the poses of posed instances, the per-cell
- * lists (each 64³ top cell lists at most {@link MAX_CELL_INSTANCES}; the rest are dropped and
- * counted) and the sub-cell tables. Headless and pure: run it on the main thread or in a worker;
- * the result applied with `Renderer.applyPlacement` is exactly what `setInstances` would upload.
- *
- * @param input - From `Renderer.placementInput(list)` (structured-cloned is fine).
- * @param model - The registered model for a key, or undefined when it is not registered.
- * @param opts - Progress reporting ({@link PlacementBakeOptions}).
- * @returns The bake; its arrays each own their buffer.
- */
-export function bakePlacement(input: PlacementInput, model: (key: number) => PlacementModel | undefined, opts?: PlacementBakeOptions): PlacementBake {
-  const { grid, instances } = input;
-  const [tx, ty, tz] = grid.topDim;
-  const cellCount = tx * ty * tz;
+/** Looks up the registered model of a model id of `input`, checked; throws when there is none. */
+function resolver(input: PlacementInput, model: (key: number) => PlacementModel | undefined): (id: number) => PlacementModel {
   const byId: PlacementModel[] = [];
-  const resolve = (id: number): PlacementModel => {
+  return (id) => {
     const known = byId[id];
     if (known) return known;
     const key = input.models[id];
@@ -180,36 +173,52 @@ export function bakePlacement(input: PlacementInput, model: (key: number) => Pla
     if (m.key !== key) throw new Error(`bakePlacement: the registration for key ${key} is model key ${m.key}`);
     return (byId[id] = m);
   };
+}
 
-  const count = instances.length;
-  // Progress: each instance's marking units (its sub-cells, or its box's bricks when posed, as
-  // buildSubLists marks it), summed up front so the total is fixed.
-  const report = opts?.onProgress;
-  let done = 0, total = 0, last = 0;
-  let units: Float64Array | undefined;
-  if (report) {
-    units = new Float64Array(count);
-    let marking = 0;
-    const fwd = new Float64Array(12);
-    for (let k = 0; k < count; k++) {
-      const p = instances[k], m = resolve(p.model);
-      const { x, y, z } = m.size;
-      // A scaled model's sub-cells are marked as pieces when turned (subPieces).
-      const pieces = m.scale && m.scale > 1 ? subPieces(placement(p, scaledSize(m.size, m.scale), fwd).fwd, m.scale) ** 3 : 1;
-      marking += units[k] = p.parts && m.partBoxes ? (Math.ceil(x / 8) + 2) * (Math.ceil(y / 8) + 2) * (Math.ceil(z / 8) + 2) : (m.subs.length / 3) * pieces;
-    }
-    total = count * PACK_UNITS + marking + Math.ceil(marking * FILL_SHARE);
-    report(0, total);
-    last = performance.now();
+/**
+ * The marking units of instances `lo` to `hi` (exclusive), as markSubLists marks them: an
+ * instance's sub-cells (times its pieces, when scaled and turned), or its box's bricks when posed.
+ */
+function markingUnits(instances: readonly PlacementInstance[], resolve: (id: number) => PlacementModel, lo: number, hi: number): { units: Float64Array; marking: number } {
+  const units = new Float64Array(hi - lo);
+  let marking = 0;
+  const fwd = new Float64Array(12);
+  for (let k = lo; k < hi; k++) {
+    const p = instances[k], m = resolve(p.model);
+    const { x, y, z } = m.size;
+    // A scaled model's sub-cells are marked as pieces when turned (subPieces).
+    const pieces = m.scale && m.scale > 1 ? subPieces(placement(p, scaledSize(m.size, m.scale), fwd).fwd, m.scale) ** 3 : 1;
+    marking += units[k - lo] = p.parts && m.partBoxes ? (Math.ceil(x / 8) + 2) * (Math.ceil(y / 8) + 2) * (Math.ceil(z / 8) + 2) : (m.subs.length / 3) * pieces;
   }
-  const tick = (units: number) => {
-    done += units;
-    const now = performance.now();
-    if (now - last >= PROGRESS_MS) {
-      last = now;
-      report!(done, total);
-    }
+  return { units, marking };
+}
+
+/** A throttled progress report: `tick(units)` adds work done, `end()` reports the total. */
+function progress(report: (done: number, total: number) => void, total: number): { tick: (units: number) => void; end: () => void } {
+  let done = 0;
+  report(0, total);
+  let last = performance.now();
+  return {
+    tick: (units) => {
+      done += units;
+      const now = performance.now();
+      if (now - last >= PROGRESS_MS) {
+        last = now;
+        report(done, total);
+      }
+    },
+    end: () => report(total, total),
   };
+}
+
+/**
+ * The part of a bake before the marking: the instance records, boxes and poses, each top cell's
+ * instances (in instance order) and the instances as markSubLists takes them.
+ */
+function packPlacement(input: PlacementInput, resolve: (id: number) => PlacementModel, tick?: (units: number) => void) {
+  const { grid, instances } = input;
+  const [tx, ty, tz] = grid.topDim;
+  const count = instances.length;
   const inst = new Uint32Array(count * INST_WORDS);
   const boxes = new Float64Array(count * 6);
   // Poses: one packed pose per (parts object, part boxes), as the renderer's pose store keys them.
@@ -253,9 +262,13 @@ export function bakePlacement(input: PlacementInput, model: (key: number) => Pla
           if (!l) perCell.set(ci, (l = []));
           l.push(k);
         }
-    if (report) tick(PACK_UNITS);
+    if (tick) tick(PACK_UNITS);
   }
+  return { inst, boxes, parts: parts.slice(0, partLen), perCell, placed };
+}
 
+/** The per-cell words and lists of a bake, from each top cell's instances. */
+function cellLists(perCell: Map<number, number[]>, cellCount: number) {
   const cells = new Uint32Array(cellCount);
   let entries = 0;
   for (const l of perCell.values()) entries += Math.min(MAX_CELL_INSTANCES, l.length);
@@ -267,14 +280,46 @@ export function bakePlacement(input: PlacementInput, model: (key: number) => Pla
     cells[ci] = (at << 8) | n;
     for (let i = 0; i < n; i++) list[at++] = l[i];
   }
-  const built = buildSubLists(grid.brickDim, grid.topDim, perCell, placed, MAX_CELL_INSTANCES, grid.gridMax, units && ((k) => tick(units[k])));
+  return { cells, list, dropped };
+}
+
+/**
+ * Bake a static instance set: the instance records, the poses of posed instances, the per-cell
+ * lists (each 64³ top cell lists at most {@link MAX_CELL_INSTANCES}; the rest are dropped and
+ * counted) and the sub-cell tables. Headless and pure: run it on the main thread or in a worker;
+ * the result applied with `Renderer.applyPlacement` is exactly what `setInstances` would upload.
+ *
+ * To spread the work over several workers, see {@link splitPlacement}.
+ *
+ * @param input - From `Renderer.placementInput(list)` (structured-cloned is fine).
+ * @param model - The registered model for a key, or undefined when it is not registered.
+ * @param opts - Progress reporting ({@link PlacementBakeOptions}).
+ * @returns The bake; its arrays each own their buffer.
+ */
+export function bakePlacement(input: PlacementInput, model: (key: number) => PlacementModel | undefined, opts?: PlacementBakeOptions): PlacementBake {
+  const { grid, instances } = input;
+  const cellCount = grid.topDim[0] * grid.topDim[1] * grid.topDim[2];
+  const resolve = resolver(input, model);
+  const count = instances.length;
+  // Progress: each instance's marking units, summed up front so the total is fixed.
+  let units: Float64Array | undefined, prog: ReturnType<typeof progress> | undefined;
+  if (opts?.onProgress) {
+    const u = markingUnits(instances, resolve, 0, count);
+    units = u.units;
+    prog = progress(opts.onProgress, count * PACK_UNITS + u.marking + Math.ceil(u.marking * FILL_SHARE));
+  }
+  const { inst, boxes, parts, perCell, placed } = packPlacement(input, resolve, prog?.tick);
+  const { cells, list, dropped } = cellLists(perCell, cellCount);
+  const { table, tables } = subListTables(cellCount, perCell, MAX_CELL_INSTANCES);
+  const marks = markSubLists(grid.brickDim, grid.topDim, table, tables, placed, 0, count, grid.gridMax, units && ((k) => prog!.tick(units[k])));
+  const built = fillSubLists(cellCount, table, tables, [marks]);
   const bake: PlacementBake = {
-    grid: { brickDim: [...grid.brickDim], topDim: [...grid.topDim], gridMax: grid.gridMax },
+    grid: copyGrid(grid),
     models: [...input.models],
     count,
     inst,
     boxes,
-    parts: parts.slice(0, partLen),
+    parts,
     cells,
     list,
     subs: built.data as Uint32Array<ArrayBuffer>,
@@ -282,8 +327,219 @@ export function bakePlacement(input: PlacementInput, model: (key: number) => Pla
     dropped,
     stats: built.stats,
   };
-  if (report) report(total, total);
+  prog?.end();
   return bake;
+}
+
+/**
+ * A contiguous range of a static set's instances, for one {@link bakePlacementShare}: one of the
+ * ranges {@link splitPlacement} cuts an input into.
+ */
+export interface PlacementRange {
+  /** The first instance of the range (an index into `PlacementInput.instances`). */
+  lo: number;
+  /** One past its last instance; `lo === hi` is an empty range. */
+  hi: number;
+  /**
+   * Whether this share also returns everything of the bake that is not marking (the instance
+   * records, boxes, poses and cell lists: {@link PlacementShare.pack}). Exactly one share of a
+   * split does; {@link splitPlacement} gives it to the first range.
+   */
+  pack: boolean;
+}
+
+/**
+ * One share of a split bake, from {@link bakePlacementShare}: what marking the instances of its
+ * range found, for {@link mergePlacementShares}. Plain data in typed arrays that each own their
+ * buffer (transfer them with {@link placementShareTransferables}). A share is 4 bytes per
+ * (sub-cell, instance) pair of its range, so the pairs of all shares together are the lists of
+ * the bake's `subs`, plus 320 bytes per sub-cell table of the whole set in every share; the share
+ * with the `pack` also carries the bake's other arrays.
+ */
+export interface PlacementShare {
+  /** The first instance of its range. */
+  lo: number;
+  /** One past the last. */
+  hi: number;
+  /** Instances in the whole set (the input's), which every share of one bake agrees on. */
+  count: number;
+  /** Sub-cell tables in the whole set, which every share of one bake agrees on. */
+  tables: number;
+  /** The slot (table × 64 + sub-cell) of each (sub-cell, instance) pair, instance by instance. */
+  slots: Uint32Array<ArrayBuffer>;
+  /** Per instance of the range, the number of pairs up to and including its own. */
+  ends: Uint32Array<ArrayBuffer>;
+  /** Per slot, the instances of the range that reach it. */
+  counts: Uint32Array<ArrayBuffer>;
+  /** Per slot, the mask of its 8 bricks the range's instances reach. */
+  masks: Uint8Array<ArrayBuffer>;
+  /** The rest of the bake, from the share whose range has `pack` set. */
+  pack?: {
+    /** {@link PlacementBake.inst}. */
+    inst: Uint32Array<ArrayBuffer>;
+    /** {@link PlacementBake.boxes}. */
+    boxes: Float64Array<ArrayBuffer>;
+    /** {@link PlacementBake.parts}. */
+    parts: Uint32Array<ArrayBuffer>;
+    /** {@link PlacementBake.cells}. */
+    cells: Uint32Array<ArrayBuffer>;
+    /** {@link PlacementBake.list}. */
+    list: Uint32Array<ArrayBuffer>;
+    /** {@link PlacementBake.dropped}. */
+    dropped: number;
+    /** The top cell of each sub-cell table, in table order. */
+    tableCells: Uint32Array<ArrayBuffer>;
+  };
+}
+
+/**
+ * Cut a static set into `n` contiguous ranges of instances for {@link bakePlacementShare}, so
+ * that several workers bake it together:
+ *
+ * 1. `splitPlacement(input, model, n)`, anywhere the models are registered. It is deterministic
+ *    and cheap (no marking), so each worker can also call it itself and take its own range.
+ * 2. Each worker, with the same models registered, runs `bakePlacementShare(input, model, range)`
+ *    on one range and posts the share back ({@link placementShareTransferables}).
+ * 3. `mergePlacementShares(input, shares)` joins them, on any thread and without the models, into
+ *    the {@link PlacementBake} that {@link bakePlacement} makes of the same input, byte for byte.
+ *
+ * The ranges are balanced by marking work (an instance's occupied sub-cells, or its box's bricks
+ * when posed), which is nearly all of a bake, not by instance count: one tree can cost a
+ * thousand tufts of grass. They are in order, cover every instance, and the first has `pack`
+ * set. A range can be empty (more ranges than instances, or one instance outweighing a whole
+ * share); an empty range without `pack` need not be baked.
+ *
+ * @param input - From `Renderer.placementInput(list)`.
+ * @param model - The registered model for a key, as for {@link bakePlacement}.
+ * @param n - How many ranges (at least 1; fractions round down).
+ * @returns `n` ranges.
+ */
+export function splitPlacement(input: PlacementInput, model: (key: number) => PlacementModel | undefined, n: number): PlacementRange[] {
+  n = Math.max(1, Math.floor(n) || 1);
+  const count = input.instances.length;
+  const { units, marking } = markingUnits(input.instances, resolver(input, model), 0, count);
+  const ranges: PlacementRange[] = [];
+  let lo = 0, before = 0;
+  for (let i = 1; i <= n; i++) {
+    let hi = lo;
+    if (i === n) hi = count;
+    else if (marking > 0) {
+      // Up to the instance that takes the running total closest to i shares of the whole.
+      const goal = (marking * i) / n;
+      while (hi < count && Math.abs(before + units[hi] - goal) <= Math.abs(before - goal)) before += units[hi++];
+    } else hi = Math.max(lo, Math.floor((count * i) / n));
+    ranges.push({ lo, hi, pack: i === 1 });
+    lo = hi;
+  }
+  return ranges;
+}
+
+/**
+ * Bake one share of a static set: mark the instances of `range` into the sub-cell tables, which
+ * is nearly all of a bake's time, and with `range.pack` also make the rest of the bake. See
+ * {@link splitPlacement} for the whole procedure. Headless and pure, as {@link bakePlacement}.
+ *
+ * Every share packs all the instances first, whatever its range: the tables' numbering comes
+ * from every instance's box, and each share has to arrive at the same one. That is well under
+ * 1% of a single bake, and the reason a share needs every model of the input registered, not
+ * only those of its range.
+ *
+ * Progress (`opts.onProgress`) is per share, in the same units as {@link bakePlacement}'s: add
+ * the shares' `done` and `total` to get the bake's.
+ *
+ * @param input - The whole input, the same for every share.
+ * @param model - The registered model for a key, as for {@link bakePlacement}.
+ * @param range - One of {@link splitPlacement}'s ranges of this input.
+ * @param opts - Progress reporting ({@link PlacementBakeOptions}).
+ * @returns The share; its arrays each own their buffer.
+ */
+export function bakePlacementShare(input: PlacementInput, model: (key: number) => PlacementModel | undefined, range: PlacementRange, opts?: PlacementBakeOptions): PlacementShare {
+  const { grid, instances } = input;
+  const cellCount = grid.topDim[0] * grid.topDim[1] * grid.topDim[2];
+  const count = instances.length;
+  const { lo, hi } = range;
+  if (!Number.isInteger(lo) || !Number.isInteger(hi) || lo < 0 || hi < lo || hi > count) throw new Error(`bakePlacementShare: the range ${lo}..${hi} is not within the input's ${count} instances`);
+  const resolve = resolver(input, model);
+  let units: Float64Array | undefined, prog: ReturnType<typeof progress> | undefined;
+  if (opts?.onProgress) {
+    const u = markingUnits(instances, resolve, lo, hi);
+    units = u.units;
+    prog = progress(opts.onProgress, count * PACK_UNITS + u.marking);
+  }
+  const { inst, boxes, parts, perCell, placed } = packPlacement(input, resolve, prog?.tick);
+  const { table, tables } = subListTables(cellCount, perCell, MAX_CELL_INSTANCES);
+  const marks = markSubLists(grid.brickDim, grid.topDim, table, tables, placed, lo, hi, grid.gridMax, units && ((k) => prog!.tick(units[k - lo])));
+  const share: PlacementShare = { lo, hi, count, tables, slots: marks.slots.slice(0, marks.pairs), ends: marks.ends, counts: marks.counts, masks: marks.masks };
+  if (range.pack) {
+    const tableCells = new Uint32Array(tables);
+    for (let ci = 0; ci < cellCount; ci++) if (table[ci] >= 0) tableCells[table[ci]] = ci;
+    share.pack = { inst, boxes, parts, ...cellLists(perCell, cellCount), tableCells };
+  }
+  prog?.end();
+  return share;
+}
+
+/**
+ * The buffers of a share, for `postMessage(share, placementShareTransferables(share))`. The
+ * sender's arrays are empty afterwards.
+ */
+export function placementShareTransferables(share: PlacementShare): ArrayBuffer[] {
+  const p = share.pack;
+  return [share.slots, share.ends, share.counts, share.masks, ...(p ? [p.inst, p.boxes, p.parts, p.cells, p.list, p.tableCells] : [])].map((a) => a.buffer);
+}
+
+/**
+ * Join the shares of a split bake ({@link splitPlacement}, {@link bakePlacementShare}) into the
+ * bake: byte for byte what {@link bakePlacement} makes of `input`, in every array, `dropped` and
+ * `stats`. It needs no models and does none of the marking or packing, only the last step of a
+ * bake (laying the tables out and sorting the shares' pairs into them, a fraction of a percent
+ * of the marking's time), so it is fine on the main thread.
+ *
+ * The shares may come in any order. Together their ranges must cover every instance of the
+ * input once (empty ones may be left out), and exactly one must carry the `pack`; it throws
+ * otherwise, or when the shares are not of one bake of this input as far as it can tell (the
+ * instance and table counts).
+ *
+ * @param input - The input the shares were baked from.
+ * @param shares - Every share. The bake takes over the `pack`'s arrays (they are not copied).
+ * @returns The bake; its arrays each own their buffer.
+ */
+export function mergePlacementShares(input: PlacementInput, shares: readonly PlacementShare[]): PlacementBake {
+  const { grid } = input;
+  const cellCount = grid.topDim[0] * grid.topDim[1] * grid.topDim[2];
+  const count = input.instances.length;
+  const packed = shares.filter((s) => s.pack);
+  if (packed.length !== 1) throw new Error(`mergePlacementShares: ${packed.length} shares carry the pack; exactly one must (the range with pack set)`);
+  const pack = packed[0].pack!;
+  const tables = pack.tableCells.length;
+  const order = [...shares].sort((a, b) => a.lo - b.lo || a.hi - b.hi);
+  let at = 0;
+  for (const s of order) {
+    if (s.count !== count) throw new Error(`mergePlacementShares: a share is of a set of ${s.count} instances, the input has ${count}`);
+    if (s.tables !== tables || s.counts.length !== tables * 64 || s.masks.length !== tables * 64) throw new Error(`mergePlacementShares: a share has ${s.tables} sub-cell tables, the pack ${tables}; not shares of one bake`);
+    if (s.lo !== at) throw new Error(`mergePlacementShares: the shares ${s.lo > at ? "leave out" : "overlap at"} instances ${Math.min(s.lo, at)}..${Math.max(s.lo, at)}`);
+    if (s.ends.length !== s.hi - s.lo) throw new Error(`mergePlacementShares: the share ${s.lo}..${s.hi} is damaged`);
+    at = s.hi;
+  }
+  if (at !== count) throw new Error(`mergePlacementShares: the shares leave out instances ${at}..${count}`);
+  if (pack.inst.length !== count * INST_WORDS || pack.cells.length !== cellCount) throw new Error("mergePlacementShares: the pack is of another input");
+  const table = new Int32Array(cellCount).fill(-1);
+  for (let t = 0; t < tables; t++) table[pack.tableCells[t]] = t;
+  const built = fillSubLists(cellCount, table, tables, order.map((s) => ({ lo: s.lo, hi: s.hi, pairs: s.slots.length, slots: s.slots, ends: s.ends, counts: s.counts, masks: s.masks })));
+  return {
+    grid: copyGrid(grid),
+    models: [...input.models],
+    count,
+    inst: pack.inst,
+    boxes: pack.boxes,
+    parts: pack.parts,
+    cells: pack.cells,
+    list: pack.list,
+    subs: built.data as Uint32Array<ArrayBuffer>,
+    subCells: built.cellWords as Uint32Array<ArrayBuffer>,
+    dropped: pack.dropped,
+    stats: built.stats,
+  };
 }
 
 /**
@@ -405,6 +661,30 @@ export class PlacementBaker {
    */
   bake(input: PlacementInput, opts?: PlacementBakeOptions): PlacementBake {
     return bakePlacement(input, (key) => this.models.get(key), opts);
+  }
+
+  /**
+   * {@link splitPlacement} against the registered models: `n` ranges of the input's instances,
+   * balanced by marking work, for {@link PlacementBaker.bakeShare} on this and other bakers.
+   *
+   * @param input - From `Renderer.placementInput(list)`.
+   * @param n - How many ranges.
+   */
+  split(input: PlacementInput, n: number): PlacementRange[] {
+    return splitPlacement(input, (key) => this.models.get(key), n);
+  }
+
+  /**
+   * {@link bakePlacementShare} against the registered models: one share of a bake split over
+   * several bakers, each of which needs every model of the input registered. Join the shares
+   * with {@link mergePlacementShares}.
+   *
+   * @param input - The whole input, the same for every share.
+   * @param range - One of the ranges of {@link PlacementBaker.split} (or {@link splitPlacement}).
+   * @param opts - Progress reporting ({@link PlacementBakeOptions}), for this share.
+   */
+  bakeShare(input: PlacementInput, range: PlacementRange, opts?: PlacementBakeOptions): PlacementShare {
+    return bakePlacementShare(input, (key) => this.models.get(key), range, opts);
   }
 }
 

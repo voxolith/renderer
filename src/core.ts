@@ -53,8 +53,8 @@ export { INST_WORDS, PART_WORDS, POSE_HEADER, INST_MIRROR, INST_PARTS, INST_SCAL
 export type { Affine, PackModel, PackInstance, SampleModel } from "./instance";
 
 // The static placement bake, worker-safe: Renderer.placementInput → bakePlacement → Renderer.applyPlacement.
-export { bakePlacement, placementTransferables, normalizePlacement, bindPlacement, PlacementBaker, PLACEMENT_BAKE_VERSION } from "./placement";
-export type { PlacementModel, PlacementGrid, PlacementInstance, PlacementInput, PlacementBake, PlacementBakeOptions } from "./placement";
+export { bakePlacement, placementTransferables, splitPlacement, bakePlacementShare, placementShareTransferables, mergePlacementShares, normalizePlacement, bindPlacement, PlacementBaker, PLACEMENT_BAKE_VERSION } from "./placement";
+export type { PlacementModel, PlacementGrid, PlacementInstance, PlacementInput, PlacementBake, PlacementBakeOptions, PlacementRange, PlacementShare } from "./placement";
 
 // Model encoding, worker-safe: encodeModel → Renderer.addEncodedModel (what Renderer.addModel does in one step).
 export { encodeModel, encodedTransferables, placementModelOf, ENCODED_MODEL_VERSION } from "./encode";
